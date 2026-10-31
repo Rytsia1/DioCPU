@@ -38,6 +38,40 @@ void print_cpu_state(const CPU *cpu) {
            cpu->halted);
 }
 
+void print_memory(const CPU *cpu) {
+    const uint16_t bytes_per_row = 16;
+
+    printf("\n=== Memory Viewer ===\n");
+
+    // Cetak header kolom
+    printf("ADDR  ");
+
+    for (uint16_t column = 0; column < bytes_per_row; column++) {
+        printf("%02X ", column);
+    }
+
+    printf("\n");
+
+    // Cetak seluruh isi memory
+    for (uint16_t address = 0;
+         address < MEMORY_SIZE;
+         address += bytes_per_row) {
+
+        // Cetak alamat awal setiap baris
+        printf("%04X: ", address);
+
+        // Cetak 16 byte dalam hexadecimal
+        for (uint16_t column = 0;
+             column < bytes_per_row;
+             column++) {
+
+            printf("%02X ", cpu->memory[address + column]);
+        }
+
+        printf("\n");
+    }
+}
+
 void print_instruction(const CPU *cpu, uint16_t address) {
     uint8_t opcode = cpu->memory[address];
     uint8_t operand1 = cpu->memory[address + 1];
@@ -558,6 +592,8 @@ int main(void)
 
     printf("Initial CPU State:\n");
     print_cpu_state(&cpu);
+
+    print_memory(&cpu);
 
     printf("\nExecution Trace:\n");
 
