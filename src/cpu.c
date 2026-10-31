@@ -13,13 +13,18 @@ bool cpu_step(CPU *cpu) {
         return false;
     }
 
+    // Validate that the complete instruction fits in memory.
+    if (cpu->pc + INSTRUCTION_SIZE > MEMORY_SIZE) {
+        cpu->halted = true;
+        return false;
+    }
+
     // Fetch
     uint8_t opcode = cpu->memory[cpu->pc];
-
     uint8_t operand1 = cpu->memory[cpu->pc + 1];
     uint8_t operand2 = cpu->memory[cpu->pc + 2];
 
-    // Advance PC before executing the instruction.
+    // Advance PC before execution.
     cpu->pc += INSTRUCTION_SIZE;
 
     // Decode and Execute
@@ -31,7 +36,6 @@ bool cpu_step(CPU *cpu) {
             }
 
             cpu->registers[operand1] = operand2;
-
             cpu->zero_flag = (operand2 == 0);
 
             break;
@@ -51,7 +55,6 @@ bool cpu_step(CPU *cpu) {
                 cpu->carry_flag = (result > 0xFF);
 
                 cpu->registers[operand1] = (uint8_t)result;
-
                 cpu->zero_flag =
                     (cpu->registers[operand1] == 0);
             }
@@ -72,7 +75,6 @@ bool cpu_step(CPU *cpu) {
                 cpu->carry_flag = (a < b);
 
                 cpu->registers[operand1] = a - b;
-
                 cpu->zero_flag =
                     (cpu->registers[operand1] == 0);
             }
@@ -81,6 +83,20 @@ bool cpu_step(CPU *cpu) {
 
         case OP_JMP:
             cpu->pc = operand1;
+            break;
+
+        case OP_JZ:
+            if (cpu->zero_flag) {
+                cpu->pc = operand1;
+            }
+
+            break;
+
+        case OP_JNZ:
+            if (!cpu->zero_flag) {
+                cpu->pc = operand1;
+            }
+
             break;
 
         case OP_HLT:

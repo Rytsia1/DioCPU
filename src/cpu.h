@@ -8,18 +8,19 @@
 #define REGISTER_COUNT 4
 #define INSTRUCTION_SIZE 3
 
-// Instruction opcodes
 #define OP_LOAD 0x01
 #define OP_ADD  0x02
 #define OP_SUB  0x03
 #define OP_JMP  0x04
+#define OP_JZ   0x05
+#define OP_JNZ  0x06
 #define OP_HLT  0xFF
 
 typedef struct {
     uint8_t registers[REGISTER_COUNT];
 
-    uint8_t pc;
-    uint8_t sp;
+    uint16_t pc; // Program Counter
+    uint8_t sp; // Stack Pointer
 
     uint8_t memory[MEMORY_SIZE];
 

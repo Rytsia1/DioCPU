@@ -28,12 +28,12 @@ int main(void) {
     // LOAD R1, 20
     // ADD  R0, R1
     // HLT
-
     uint8_t program[] = {
-        OP_LOAD, 0, 255,
-        OP_LOAD, 1, 1,
-        OP_ADD,  0, 1,
-        OP_HLT,  0, 0
+        OP_LOAD, 0, 3,   // Address 0: LOAD R0, 3
+        OP_LOAD, 1, 1,   // Address 3: LOAD R1, 1
+        OP_SUB,  0, 1,   // Address 6: SUB R0, R1
+        OP_JNZ,  6, 0,   // Address 9: JNZ 6
+        OP_HLT,  0, 0    // Address 12: HLT
     };
 
 for (size_t i = 0; i < sizeof(program); i++) {
