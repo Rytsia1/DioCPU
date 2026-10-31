@@ -65,6 +65,21 @@ static void print_instruction(const CPU *cpu, uint16_t address) {
             printf("JNZ 0x%02X", operand1);
             break;
 
+        case OP_OUT:
+            if (operand1 == OUT_MODE_REGISTER)
+            {
+                printf("OUT R%u", operand2);
+            }
+            else if (operand1 == OUT_MODE_IMMEDIATE)
+            {
+                printf("OUT %u", operand2);
+            }
+            else
+            {
+                printf("OUT INVALID");
+            }
+            break;
+
         case OP_HLT:
             printf("HLT");
             break;
@@ -186,16 +201,21 @@ void read_assembly_file(const char *filename)
 
 int main(void)
 {
-    read_assembly_file("countdown.asm");
-
     CPU cpu;
     cpu_init(&cpu);
 
-    if (!assemble_program(&cpu)) {
-        return 1;
+    uint8_t program[] = {
+        OP_LOAD, 0, 42,                 // LOAD R0, 42
+        OP_OUT, OUT_MODE_REGISTER, 0,    // OUT R0
+        OP_OUT, OUT_MODE_IMMEDIATE, 99,  // OUT 99
+        OP_HLT, 0, 0                     // HLT
+    };
+
+    for (size_t i = 0; i < sizeof(program); i++) {
+        cpu.memory[i] = program[i];
     }
 
-    printf("\n=== Dio-8 Debugger ===\n\n");
+    printf("=== Dio-8 Debugger ===\n\n");
 
     printf("Initial CPU State:\n");
     print_cpu_state(&cpu);

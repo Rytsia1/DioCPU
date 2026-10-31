@@ -1,5 +1,6 @@
 #include "cpu.h"
 
+#include <stdio.h>
 #include <string.h>
 
 void cpu_init(CPU *cpu) {
@@ -98,6 +99,33 @@ bool cpu_step(CPU *cpu) {
             }
 
             break;
+
+        case OP_OUT:
+        {
+            if (operand1 == OUT_MODE_REGISTER)
+            {
+                if (operand2 >= REGISTER_COUNT)
+                {
+                    printf("Error: Invalid register R%u\n", operand2);
+                    cpu->halted = true;
+                    return false;
+                }
+
+                printf("Output: %u\n", cpu->registers[operand2]);
+            }
+            else if (operand1 == OUT_MODE_IMMEDIATE)
+            {
+                printf("Output: %u\n", operand2);
+            }
+            else
+            {
+                printf("Error: Invalid OUT mode %u\n", operand1);
+                cpu->halted = true;
+                return false;
+            }
+
+            break;
+        }
 
         case OP_HLT:
             cpu->halted = true;

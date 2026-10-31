@@ -14,7 +14,11 @@
 #define OP_JMP  0x04
 #define OP_JZ   0x05
 #define OP_JNZ  0x06
+#define OP_OUT  0x07
 #define OP_HLT  0xFF
+
+#define OUT_MODE_REGISTER  0x00
+#define OUT_MODE_IMMEDIATE 0x01
 
 typedef struct {
     uint8_t registers[REGISTER_COUNT];
