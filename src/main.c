@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "cpu.h"
 
@@ -58,29 +59,27 @@ static void print_instruction(const CPU *cpu, uint16_t address) {
     }
 }
 
+void assemble_program(CPU *cpu)
+{
+    uint8_t program[] = {
+        OP_LOAD, 0, 3,    // LOAD R0, 3
+        OP_LOAD, 1, 1,    // LOAD R1, 1
+        OP_SUB,  0, 1,    // LOOP: SUB R0, R1
+        OP_JNZ,  6, 0,    // JNZ LOOP
+        OP_HLT,  0, 0     // HLT
+    };
+
+    for (size_t i = 0; i < sizeof(program); i++) {
+        cpu->memory[i] = program[i];
+    }
+}
+
 int main(void) {
     CPU cpu;
 
     cpu_init(&cpu);
 
-    // Program:
-    //
-    // LOAD R0, 3
-    // LOAD R1, 1
-    // SUB  R0, R1
-    // JNZ  0x06
-    // HLT
-    uint8_t program[] = {
-        OP_LOAD, 0, 3,   // Address 0: LOAD R0, 3
-        OP_LOAD, 1, 1,   // Address 3: LOAD R1, 1
-        OP_SUB,  0, 1,   // Address 6: SUB R0, R1
-        OP_JNZ,  6, 0,   // Address 9: JNZ 6
-        OP_HLT,  0, 0    // Address 12: HLT
-    };
-
-    for (size_t i = 0; i < sizeof(program); i++) {
-        cpu.memory[i] = program[i];
-    }
+    assemble_program(&cpu);
 
     printf("=== Dio-8 Debugger ===\n\n");
 
