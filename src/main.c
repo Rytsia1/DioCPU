@@ -2,25 +2,30 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "cpu.h"
 
-#define MAX_LABELS 16
+#define MAX_LABELS 32
+#define LABEL_NAME_SIZE 32
 
-typedef struct {
-    char name[16];
+typedef struct
+{
+    char name[LABEL_NAME_SIZE];
     uint8_t address;
 } Label;
 
-typedef struct {
+typedef struct
+{
     uint8_t opcode;
     uint8_t operand1;
     uint8_t operand2;
+} AssembledInstruction;
 
-    const char *label;
-} AssemblyInstruction;
-
-static void print_cpu_state(const CPU *cpu) {
+void print_cpu_state(const CPU *cpu) {
     printf("PC: 0x%02X | ", cpu->pc);
 
     for (int i = 0; i < REGISTER_COUNT; i++) {
@@ -33,7 +38,7 @@ static void print_cpu_state(const CPU *cpu) {
            cpu->halted);
 }
 
-static void print_instruction(const CPU *cpu, uint16_t address) {
+void print_instruction(const CPU *cpu, uint16_t address) {
     uint8_t opcode = cpu->memory[address];
     uint8_t operand1 = cpu->memory[address + 1];
     uint8_t operand2 = cpu->memory[address + 2];
@@ -92,12 +97,14 @@ static void print_instruction(const CPU *cpu, uint16_t address) {
 
 int find_label(
     const Label labels[],
-    size_t label_count,
+    int label_count,
     const char *name
 )
 {
-    for (size_t i = 0; i < label_count; i++) {
-        if (strcmp(labels[i].name, name) == 0) {
+    for (int i = 0; i < label_count; i++)
+    {
+        if (strcmp(labels[i].name, name) == 0)
+        {
             return labels[i].address;
         }
     }
@@ -105,117 +112,449 @@ int find_label(
     return -1;
 }
 
-bool assemble_program(CPU *cpu)
+char *trim(char *text)
 {
-    AssemblyInstruction instructions[] = {
-        { OP_LOAD, 0, 3, NULL },      // LOAD R0, 3
-        { OP_LOAD, 1, 1, NULL },      // LOAD R1, 1
-        { OP_SUB,  0, 1, NULL },      // LOOP: SUB R0, R1
-        { OP_JNZ,  0, 0, "LOOP" },    // JNZ LOOP
-        { OP_HLT,  0, 0, NULL }       // HLT
-    };
-
-    Label labels[MAX_LABELS];
-    size_t label_count = 0;
-
-    size_t instruction_count =
-        sizeof(instructions) / sizeof(instructions[0]);
-
-    /*
-     * PASS 1:
-     * Catat alamat label.
-     */
-    uint16_t address = 0;
-
-    for (size_t i = 0; i < instruction_count; i++) {
-        if (i == 2) {
-            strcpy(labels[label_count].name, "LOOP");
-            labels[label_count].address = (uint8_t)address;
-            label_count++;
-        }
-
-        address += INSTRUCTION_SIZE;
+    // Lewati spasi di awal baris
+    while (isspace((unsigned char)*text))
+    {
+        text++;
     }
 
-    /*
-     * PASS 2:
-     * Ubah instruksi menjadi bytecode.
-     */
-    address = 0;
-
-    for (size_t i = 0; i < instruction_count; i++) {
-        uint8_t operand1 = instructions[i].operand1;
-
-        if (instructions[i].label != NULL) {
-            int target = find_label(
-                labels,
-                label_count,
-                instructions[i].label
-            );
-
-            if (target < 0) {
-                printf("Error: label not found: %s\n",
-                       instructions[i].label);
-                return false;
-            }
-
-            operand1 = (uint8_t)target;
-        }
-
-        if (address + INSTRUCTION_SIZE > MEMORY_SIZE) {
-            printf("Error: program is too large.\n");
-            return false;
-        }
-
-        cpu->memory[address] = instructions[i].opcode;
-        cpu->memory[address + 1] = operand1;
-        cpu->memory[address + 2] = instructions[i].operand2;
-
-        address += INSTRUCTION_SIZE;
+    // Jika baris kosong, langsung kembalikan
+    if (*text == '\0')
+    {
+        return text;
     }
 
-    return true;
+    // Cari karakter terakhir yang bukan spasi
+    char *end = text + strlen(text) - 1;
+
+    while (end > text && isspace((unsigned char)*end))
+    {
+        end--;
+    }
+
+    // Akhiri string setelah karakter terakhir
+    *(end + 1) = '\0';
+
+    return text;
 }
 
-void read_assembly_file(const char *filename)
+char *clean_line(char *line)
 {
-    FILE *file = fopen(filename, "r");
+    // Cari awal komentar
+    char *comment = strchr(line, ';');
 
-    if (file == NULL)
+    if (comment != NULL)
     {
-        printf("Error: Cannot open file %s\n", filename);
-        return;
+        *comment = '\0';
     }
 
-    char line[256];
+    // Hapus spasi di awal dan akhir
+    return trim(line);
+}
 
-    printf("=== Reading Assembly File ===\n");
+int first_pass(
+    FILE *file,
+    Label labels[],
+    int *label_count
+)
+{
+    char line[256];
+    int address = 0;
+
+    *label_count = 0;
+
+    rewind(file);
 
     while (fgets(line, sizeof(line), file) != NULL)
     {
-        printf("%s", line);
+        char *cleaned = clean_line(line);
+
+        // Lewati baris kosong dan komentar
+        if (*cleaned == '\0')
+        {
+            continue;
+        }
+
+        // Apakah baris ini merupakan label?
+        char *colon = strchr(cleaned, ':');
+
+        if (colon != NULL)
+        {
+            *colon = '\0';
+
+            char *label_name = trim(cleaned);
+
+            if (*label_name == '\0')
+            {
+                printf("Error: Empty label name\n");
+                return 0;
+            }
+
+            if (strlen(label_name) >= LABEL_NAME_SIZE)
+            {
+                printf("Error: Label name too long: %s\n", label_name);
+                return 0;
+            }
+
+            if (*label_count >= MAX_LABELS)
+            {
+                printf("Error: Too many labels\n");
+                return 0;
+            }
+
+            // Cegah label duplikat
+            if (find_label(labels, *label_count, label_name) >= 0)
+            {
+                printf("Error: Duplicate label: %s\n", label_name);
+                return 0;
+            }
+
+            strcpy(labels[*label_count].name, label_name);
+            labels[*label_count].address = (uint8_t)address;
+
+            (*label_count)++;
+
+            // Label boleh berada pada baris yang sama
+            // dengan instruksi, misalnya LOOP: HLT
+            cleaned = trim(colon + 1);
+
+            if (*cleaned == '\0')
+            {
+                continue;
+            }
+        }
+
+        // Baris ini mengandung instruksi
+        address += INSTRUCTION_SIZE;
+
+        if (address > MEMORY_SIZE)
+        {
+            printf("Error: Program exceeds CPU memory\n");
+            return 0;
+        }
     }
 
-    fclose(file);
+    return 1;
+}
+
+int parse_register(const char *text)
+{
+    if (text[0] != 'R')
+    {
+        return -1;
+    }
+
+    // Pastikan setelah angka register tidak ada karakter lain
+    if (text[1] < '0' || text[1] > '3' || text[2] != '\0')
+    {
+        return -1;
+    }
+
+    return text[1] - '0';
+}
+
+int parse_number(const char *text)
+{
+    char *end;
+    errno = 0;
+
+    long value = strtol(text, &end, 0);
+
+    if (text == end || *end != '\0')
+    {
+        return -1;
+    }
+
+    if (errno == ERANGE || value < 0 || value > UINT8_MAX)
+    {
+        return -1;
+    }
+
+    return (int)value;
+}
+
+int parse_instruction(
+    char *line,
+    AssembledInstruction *instruction,
+    const Label labels[],
+    int label_count
+)
+{
+    char *mnemonic = strtok(line, " \t");
+    char *operand1 = strtok(NULL, " \t,");
+    char *operand2 = strtok(NULL, " \t,");
+
+    if (mnemonic == NULL)
+    {
+        return 0;
+    }
+
+    instruction->opcode = 0;
+    instruction->operand1 = 0;
+    instruction->operand2 = 0;
+
+    if (strcmp(mnemonic, "LOAD") == 0)
+    {
+        if (operand1 == NULL || operand2 == NULL)
+        {
+            return -1;
+        }
+
+        int reg = parse_register(operand1);
+        int value = parse_number(operand2);
+
+        if (reg < 0 || value < 0)
+        {
+            return -1;
+        }
+
+        instruction->opcode = OP_LOAD;
+        instruction->operand1 = (uint8_t)reg;
+        instruction->operand2 = (uint8_t)value;
+    }
+    else if (strcmp(mnemonic, "ADD") == 0)
+    {
+        if (operand1 == NULL || operand2 == NULL)
+        {
+            return -1;
+        }
+
+        int reg1 = parse_register(operand1);
+        int reg2 = parse_register(operand2);
+
+        if (reg1 < 0 || reg2 < 0)
+        {
+            return -1;
+        }
+
+        instruction->opcode = OP_ADD;
+        instruction->operand1 = (uint8_t)reg1;
+        instruction->operand2 = (uint8_t)reg2;
+    }
+    else if (strcmp(mnemonic, "SUB") == 0)
+    {
+        if (operand1 == NULL || operand2 == NULL)
+        {
+            return -1;
+        }
+
+        int reg1 = parse_register(operand1);
+        int reg2 = parse_register(operand2);
+
+        if (reg1 < 0 || reg2 < 0)
+        {
+            return -1;
+        }
+
+        instruction->opcode = OP_SUB;
+        instruction->operand1 = (uint8_t)reg1;
+        instruction->operand2 = (uint8_t)reg2;
+    }
+    else if (strcmp(mnemonic, "OUT") == 0)
+    {
+        if (operand1 == NULL || operand2 != NULL)
+        {
+            return -1;
+        }
+
+        int reg = parse_register(operand1);
+
+        if (reg >= 0)
+        {
+            instruction->opcode = OP_OUT;
+            instruction->operand1 = OUT_MODE_REGISTER;
+            instruction->operand2 = (uint8_t)reg;
+        }
+        else
+        {
+            int value = parse_number(operand1);
+
+            if (value < 0)
+            {
+                return -1;
+            }
+
+            instruction->opcode = OP_OUT;
+            instruction->operand1 = OUT_MODE_IMMEDIATE;
+            instruction->operand2 = (uint8_t)value;
+        }
+    }
+    else if (
+        strcmp(mnemonic, "JMP") == 0 ||
+        strcmp(mnemonic, "JZ") == 0 ||
+        strcmp(mnemonic, "JNZ") == 0
+    )
+    {
+        if (operand1 == NULL || operand2 != NULL)
+        {
+            return -1;
+        }
+
+        int target = find_label(
+            labels,
+            label_count,
+            operand1
+        );
+
+        if (target < 0)
+        {
+            printf("Error: Undefined label: %s\n", operand1);
+            return -1;
+        }
+
+        if (strcmp(mnemonic, "JMP") == 0)
+        {
+            instruction->opcode = OP_JMP;
+        }
+        else if (strcmp(mnemonic, "JZ") == 0)
+        {
+            instruction->opcode = OP_JZ;
+        }
+        else
+        {
+            instruction->opcode = OP_JNZ;
+        }
+
+        instruction->operand1 = (uint8_t)target;
+        instruction->operand2 = 0;
+    }
+    else if (strcmp(mnemonic, "HLT") == 0)
+    {
+        if (operand1 != NULL)
+        {
+            return -1;
+        }
+
+        instruction->opcode = OP_HLT;
+    }
+    else
+    {
+        return -1;
+    }
+
+    return 1;
+}
+
+int second_pass(
+    FILE *file,
+    CPU *cpu,
+    const Label labels[],
+    int label_count
+)
+{
+    char line[256];
+    int address = 0;
+
+    rewind(file);
+
+    while (fgets(line, sizeof(line), file) != NULL)
+    {
+        char *cleaned = clean_line(line);
+
+        if (*cleaned == '\0')
+        {
+            continue;
+        }
+
+        // Hilangkan label jika ada
+        char *colon = strchr(cleaned, ':');
+
+        if (colon != NULL)
+        {
+            *colon = '\0';
+            cleaned = trim(colon + 1);
+
+            // Baris hanya berisi label
+            if (*cleaned == '\0')
+            {
+                continue;
+            }
+        }
+
+        AssembledInstruction instruction;
+
+        int result = parse_instruction(
+            cleaned,
+            &instruction,
+            labels,
+            label_count
+        );
+
+        if (result != 1)
+        {
+            printf(
+                "Assembly error near address 0x%02X\n",
+                address
+            );
+
+            return 0;
+        }
+
+        // Pastikan instruksi tidak melewati batas memori
+        if (address + INSTRUCTION_SIZE > MEMORY_SIZE)
+        {
+            printf("Error: Program exceeds CPU memory\n");
+            return 0;
+        }
+
+        // Simpan machine code ke memori CPU
+        cpu->memory[address] = instruction.opcode;
+        cpu->memory[address + 1] = instruction.operand1;
+        cpu->memory[address + 2] = instruction.operand2;
+
+        printf(
+            "Assembled 0x%02X: %02X %02X %02X\n",
+            address,
+            instruction.opcode,
+            instruction.operand1,
+            instruction.operand2
+        );
+
+        address += INSTRUCTION_SIZE;
+    }
+
+    return 1;
 }
 
 int main(void)
 {
+    FILE *file = fopen("countdown.asm", "r");
+
+    if (file == NULL)
+    {
+        printf("Cannot open countdown.asm\n");
+        return 1;
+    }
+
+    Label labels[MAX_LABELS];
+    int label_count = 0;
+
     CPU cpu;
     cpu_init(&cpu);
 
-    uint8_t program[] = {
-        OP_LOAD, 0, 42,                 // LOAD R0, 42
-        OP_OUT, OUT_MODE_REGISTER, 0,    // OUT R0
-        OP_OUT, OUT_MODE_IMMEDIATE, 99,  // OUT 99
-        OP_HLT, 0, 0                     // HLT
-    };
-
-    for (size_t i = 0; i < sizeof(program); i++) {
-        cpu.memory[i] = program[i];
+    // Pass 1: mencari label
+    if (!first_pass(file, labels, &label_count))
+    {
+        fclose(file);
+        return 1;
     }
 
-    printf("=== Dio-8 Debugger ===\n\n");
+    // Pass 2: menerjemahkan instruksi
+    if (!second_pass(file, &cpu, labels, label_count))
+    {
+        fclose(file);
+        return 1;
+    }
+
+    fclose(file);
+
+    // Reset PC sebelum menjalankan program
+    cpu.pc = 0;
+    cpu.halted = false;
+
+    printf("\n=== Dio-8 Debugger ===\n\n");
 
     printf("Initial CPU State:\n");
     print_cpu_state(&cpu);
