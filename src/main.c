@@ -16,6 +16,47 @@ static void print_cpu_state(const CPU *cpu) {
            cpu->halted);
 }
 
+static void print_instruction(const CPU *cpu, uint16_t address) {
+    uint8_t opcode = cpu->memory[address];
+    uint8_t operand1 = cpu->memory[address + 1];
+    uint8_t operand2 = cpu->memory[address + 2];
+
+    printf("0x%02X: ", address);
+
+    switch (opcode) {
+        case OP_LOAD:
+            printf("LOAD R%u, %u", operand1, operand2);
+            break;
+
+        case OP_ADD:
+            printf("ADD R%u, R%u", operand1, operand2);
+            break;
+
+        case OP_SUB:
+            printf("SUB R%u, R%u", operand1, operand2);
+            break;
+
+        case OP_JMP:
+            printf("JMP 0x%02X", operand1);
+            break;
+
+        case OP_JZ:
+            printf("JZ 0x%02X", operand1);
+            break;
+
+        case OP_JNZ:
+            printf("JNZ 0x%02X", operand1);
+            break;
+
+        case OP_HLT:
+            printf("HLT");
+            break;
+
+        default:
+            printf("UNKNOWN 0x%02X", opcode);
+            break;
+    }
+}
 
 int main(void) {
     CPU cpu;
@@ -24,9 +65,10 @@ int main(void) {
 
     // Program:
     //
-    // LOAD R0, 10
-    // LOAD R1, 20
-    // ADD  R0, R1
+    // LOAD R0, 3
+    // LOAD R1, 1
+    // SUB  R0, R1
+    // JNZ  0x06
     // HLT
     uint8_t program[] = {
         OP_LOAD, 0, 3,   // Address 0: LOAD R0, 3
@@ -36,55 +78,30 @@ int main(void) {
         OP_HLT,  0, 0    // Address 12: HLT
     };
 
-for (size_t i = 0; i < sizeof(program); i++) {
-    cpu.memory[i] = program[i];
-}
-
-printf("=== Dio-8 Debugger ===\n\n");
-
-printf("Initial CPU State:\n");
-print_cpu_state(&cpu);
-
-printf("\nExecution Trace:\n");
-
-while (!cpu.halted) {
-    uint8_t current_pc = cpu.pc;
-    uint8_t opcode = cpu.memory[current_pc];
-
-    printf("\nExecuting instruction at 0x%02X: ", current_pc);
-
-    switch (opcode) {
-        case OP_LOAD:
-            printf("LOAD\n");
-            break;
-
-        case OP_ADD:
-            printf("ADD\n");
-            break;
-
-        case OP_SUB:
-            printf("SUB\n");
-            break;
-
-        case OP_JMP:
-            printf("JMP\n");
-            break;
-
-        case OP_HLT:
-            printf("HLT\n");
-            break;
-
-        default:
-            printf("UNKNOWN\n");
-            break;
+    for (size_t i = 0; i < sizeof(program); i++) {
+        cpu.memory[i] = program[i];
     }
 
-    cpu_step(&cpu);
+    printf("=== Dio-8 Debugger ===\n\n");
 
+    printf("Initial CPU State:\n");
     print_cpu_state(&cpu);
-}
 
-    printf("\nCPU execution finished.\n");  
+    printf("\nExecution Trace:\n");
+
+    while (!cpu.halted) {
+        uint16_t current_pc = cpu.pc;
+
+        printf("\nExecuting: ");
+        print_instruction(&cpu, current_pc);
+        printf("\n");
+
+        cpu_step(&cpu);
+
+        print_cpu_state(&cpu);
+    }
+
+    printf("\nCPU execution finished.\n");
 
     return 0;
 }
