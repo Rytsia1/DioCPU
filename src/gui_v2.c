@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 /* =========================================
    WINDOW CONFIGURATION
@@ -33,15 +34,163 @@
 #define COLOR_CYAN        (Color){70, 195, 245, 255}
 
 /* =========================================
-   GUI STATE
+   GUI STATE & TRACKING
    ========================================= */
 
+#define CHANGE_HIGHLIGHT_DURATION 0.85f
+
 typedef struct {
+
     char status_message[160];
     Color status_color;
+
     bool initialization_failed;
+
+    /* Previous register values */
+    uint16_t previous_registers[CPU_GPR_COUNT];
+
+    /* Values before the latest change */
+    uint16_t old_register_values[CPU_GPR_COUNT];
+
+    /* Register highlight countdown */
+    float register_flash[CPU_GPR_COUNT];
+
+    /* Previous FLAGS */
+    uint16_t previous_flags;
+
+    /* Previous state of each defined flag */
+    bool old_flag_values[4];
+
+    /* Flag highlight countdown */
+    float flag_flash[4];
+
+    bool snapshot_initialized;
+
 } GUIState;
 
+static const uint16_t FLAG_MASKS[4] = {
+    CPU_FLAG_ZF,
+    CPU_FLAG_CF,
+    CPU_FLAG_SF,
+    CPU_FLAG_OF
+};
+
+static void initialize_state_tracking(
+    GUIState *gui,
+    const DioCPU *cpu
+)
+{
+    memcpy(
+        gui->previous_registers,
+        cpu->gpr,
+        sizeof(cpu->gpr)
+    );
+
+    gui->previous_flags = cpu->flags;
+
+    for (unsigned int i = 0; i < CPU_GPR_COUNT; i++) {
+
+        gui->old_register_values[i] = cpu->gpr[i];
+
+        gui->register_flash[i] = 0.0f;
+    }
+
+    for (unsigned int i = 0; i < 4; i++) {
+
+        gui->old_flag_values[i] =
+            (cpu->flags & FLAG_MASKS[i]) != 0;
+
+        gui->flag_flash[i] = 0.0f;
+    }
+
+    gui->snapshot_initialized = true;
+}
+
+static void update_state_tracking(
+    GUIState *gui,
+    const DioCPU *cpu,
+    float delta_time
+)
+{
+    if (!gui->snapshot_initialized) {
+
+        initialize_state_tracking(gui, cpu);
+
+        return;
+    }
+
+
+    /* =====================================
+       REGISTER COMPARISON
+       ===================================== */
+
+    for (unsigned int i = 0;
+         i < CPU_GPR_COUNT;
+         i++) {
+
+        if (gui->register_flash[i] > 0.0f) {
+
+            gui->register_flash[i] -= delta_time;
+
+            if (gui->register_flash[i] < 0.0f) {
+                gui->register_flash[i] = 0.0f;
+            }
+        }
+
+        uint16_t current_value = cpu->gpr[i];
+
+        uint16_t previous_value =
+            gui->previous_registers[i];
+
+
+        if (current_value != previous_value) {
+
+            gui->old_register_values[i] =
+                previous_value;
+
+            gui->previous_registers[i] =
+                current_value;
+
+            gui->register_flash[i] =
+                CHANGE_HIGHLIGHT_DURATION;
+        }
+    }
+
+
+    /* =====================================
+       FLAGS COMPARISON
+       ===================================== */
+
+    for (unsigned int i = 0; i < 4; i++) {
+
+        if (gui->flag_flash[i] > 0.0f) {
+
+            gui->flag_flash[i] -= delta_time;
+
+            if (gui->flag_flash[i] < 0.0f) {
+                gui->flag_flash[i] = 0.0f;
+            }
+        }
+
+        bool current_value =
+            (cpu->flags & FLAG_MASKS[i]) != 0;
+
+        bool previous_value =
+            (gui->previous_flags & FLAG_MASKS[i]) != 0;
+
+
+        if (current_value != previous_value) {
+
+            gui->old_flag_values[i] =
+                previous_value;
+
+            gui->flag_flash[i] =
+                CHANGE_HIGHLIGHT_DURATION;
+        }
+    }
+
+    gui->previous_flags = cpu->flags;
+}
 
 /* =========================================
    BASIC UI COMPONENTS
@@ -79,7 +228,6 @@ static void draw_panel(
         COLOR_ACCENT
     );
 }
-
 
 static void draw_metric_card(
     int x,
@@ -124,7 +272,6 @@ static void draw_metric_card(
     );
 }
 
-
 static bool draw_button(
     Rectangle bounds,
     const char *label
@@ -167,7 +314,6 @@ static bool draw_button(
         IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
 
-
 /* =========================================
    HEADER
    ========================================= */
@@ -197,16 +343,7 @@ static void draw_header(const GUIState *gui)
         14,
         gui->status_color
     );
-
-    DrawText(
-        "GUI DEVELOPMENT",
-        1370,
-        36,
-        12,
-        COLOR_MUTED
-    );
 }
-
 
 /* =========================================
    CPU STATUS
@@ -229,7 +366,6 @@ static Color get_cpu_state_color(CPUState state)
             return COLOR_MUTED;
     }
 }
-
 
 static void draw_cpu_dashboard(const DioCPU *cpu)
 {
@@ -313,12 +449,14 @@ static void draw_cpu_dashboard(const DioCPU *cpu)
     );
 }
 
-
 /* =========================================
    GENERAL PURPOSE REGISTER PANEL
    ========================================= */
 
-static void draw_register_panel(const DioCPU *cpu)
+static void draw_register_panel(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
 {
     draw_panel(
         20,
@@ -338,29 +476,57 @@ static void draw_register_panel(const DioCPU *cpu)
         int x = 38 + column * 183;
         int y = 250 + row * 78;
 
+        bool changed =
+            gui->register_flash[i] > 0.0f;
+
+
+        Color background = changed
+            ? (Color){25, 75, 45, 255}
+            : COLOR_PANEL_ALT;
+
+        Color border = changed
+            ? COLOR_GREEN
+            : COLOR_BORDER;
+
+        Color value_color = changed
+            ? COLOR_GREEN
+            : COLOR_TEXT;
+
+
+        /* Register card */
+
         DrawRectangle(
             x,
             y,
             165,
             62,
-            COLOR_PANEL_ALT
+            background
         );
 
-        DrawRectangleLines(
-            x,
-            y,
-            165,
-            62,
-            COLOR_BORDER
+        DrawRectangleLinesEx(
+            (Rectangle){
+                (float)x,
+                (float)y,
+                165,
+                62
+            },
+            changed ? 2.0f : 1.0f,
+            border
         );
+
+
+        /* Register name */
 
         DrawText(
             TextFormat("R%u", i),
             x + 12,
-            y + 8,
-            14,
+            y + 6,
+            13,
             COLOR_MUTED
         );
+
+
+        /* Current value */
 
         DrawText(
             TextFormat(
@@ -368,10 +534,28 @@ static void draw_register_panel(const DioCPU *cpu)
                 (unsigned int)cpu->gpr[i]
             ),
             x + 12,
-            y + 30,
-            21,
-            COLOR_TEXT
+            y + 25,
+            20,
+            value_color
         );
+
+
+        /* Previous value */
+
+        if (changed) {
+
+            DrawText(
+                TextFormat(
+                    "WAS: %04X",
+                    (unsigned int)
+                    gui->old_register_values[i]
+                ),
+                x + 95,
+                y + 43,
+                9,
+                COLOR_GREEN
+            );
+        }
     }
 
     DrawText(
@@ -383,7 +567,6 @@ static void draw_register_panel(const DioCPU *cpu)
     );
 }
 
-
 /* =========================================
    FLAGS PANEL
    ========================================= */
@@ -393,56 +576,92 @@ static void draw_flag_card(
     int y,
     const char *name,
     const char *description,
-    bool enabled
+    bool enabled,
+    bool changed,
+    bool old_value
 )
 {
     Color state_color = enabled
         ? COLOR_GREEN
         : COLOR_MUTED;
 
+    Color border_color = changed
+        ? COLOR_YELLOW
+        : (enabled ? COLOR_GREEN : COLOR_BORDER);
+
+    Color background = changed
+        ? (Color){65, 55, 25, 255}
+        : COLOR_PANEL_ALT;
+
+
     DrawRectangle(
         x,
         y,
         165,
         90,
-        COLOR_PANEL_ALT
+        background
     );
 
-    DrawRectangleLines(
-        x,
-        y,
-        165,
-        90,
-        enabled ? COLOR_GREEN : COLOR_BORDER
+    DrawRectangleLinesEx(
+        (Rectangle){
+            (float)x,
+            (float)y,
+            165,
+            90
+        },
+        changed ? 2.0f : 1.0f,
+        border_color
     );
+
 
     DrawText(
         name,
         x + 13,
-        y + 10,
+        y + 8,
         20,
-        state_color
+        changed ? COLOR_YELLOW : state_color
     );
+
 
     DrawText(
         enabled ? "SET (1)" : "CLEAR (0)",
         x + 13,
-        y + 38,
+        y + 34,
         13,
         state_color
     );
 
-    DrawText(
-        description,
-        x + 13,
-        y + 65,
-        10,
-        COLOR_MUTED
-    );
+
+    if (changed) {
+
+        DrawText(
+            TextFormat(
+                "CHANGED: %d -> %d",
+                old_value ? 1 : 0,
+                enabled ? 1 : 0
+            ),
+            x + 13,
+            y + 62,
+            10,
+            COLOR_YELLOW
+        );
+
+    } else {
+
+        DrawText(
+            description,
+            x + 13,
+            y + 62,
+            10,
+            COLOR_MUTED
+        );
+    }
 }
 
-
-static void draw_flags_panel(const DioCPU *cpu)
+static void draw_flags_panel(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
 {
     draw_panel(
         810,
@@ -452,35 +671,46 @@ static void draw_flags_panel(const DioCPU *cpu)
         "STATUS FLAGS"
     );
 
+
     draw_flag_card(
         830, 455,
         "ZF",
         "Zero Flag",
-        (cpu->flags & CPU_FLAG_ZF) != 0
+        (cpu->flags & CPU_FLAG_ZF) != 0,
+        gui->flag_flash[0] > 0.0f,
+        gui->old_flag_values[0]
     );
+
 
     draw_flag_card(
         1010, 455,
         "CF",
         "Carry Flag",
-        (cpu->flags & CPU_FLAG_CF) != 0
+        (cpu->flags & CPU_FLAG_CF) != 0,
+        gui->flag_flash[1] > 0.0f,
+        gui->old_flag_values[1]
     );
+
 
     draw_flag_card(
         1190, 455,
         "SF",
         "Sign Flag",
-        (cpu->flags & CPU_FLAG_SF) != 0
+        (cpu->flags & CPU_FLAG_SF) != 0,
+        gui->flag_flash[2] > 0.0f,
+        gui->old_flag_values[2]
     );
+
 
     draw_flag_card(
         1370, 455,
         "OF",
         "Overflow Flag",
-        (cpu->flags & CPU_FLAG_OF) != 0
+        (cpu->flags & CPU_FLAG_OF) != 0,
+        gui->flag_flash[3] > 0.0f,
+        gui->old_flag_values[3]
     );
 }
-
 
 /* =========================================
    CPU INFORMATION PANEL
@@ -543,7 +773,6 @@ static void draw_cpu_information(const DioCPU *cpu)
     );
 }
 
-
 /* =========================================
    MEMORY ARCHITECTURE PANEL
    ========================================= */
@@ -596,7 +825,6 @@ static void draw_memory_card(
         COLOR_MUTED
     );
 }
-
 
 static void draw_architecture_panel(void)
 {
@@ -692,14 +920,13 @@ static void draw_architecture_panel(void)
 
 
     DrawText(
-        "DioCPU V2 | CPU Dashboard | Press F6 to reset CPU",
+        "DioCPU V2 | CPU Dashboard | F2: R1+1 | F3: ZF | F4: CF | F5: SF | F7: OF | F6: Reset",
         40,
         925,
         12,
         COLOR_MUTED
     );
 }
-
 
 /* =========================================
    MAIN
@@ -726,6 +953,8 @@ int main(void)
 
     CPUStatus init_status = cpu_v2_init(&cpu);
 
+    initialize_state_tracking(&gui, &cpu);
+
     if (init_status != CPU_STATUS_OK) {
 
         gui.initialization_failed = true;
@@ -750,73 +979,137 @@ int main(void)
     }
 
 
-    Rectangle reset_button = {
-        1390, 30, 180, 45
-    };
-
-
     while (!WindowShouldClose()) {
 
-        /*
-         * Reset CPU.
-         * Memory contents are preserved.
-         */
+        float delta_time = GetFrameTime();
+
+        BeginDrawing();
+
+        ClearBackground(COLOR_BACKGROUND);
+
+
+        /* Header */
+
+        draw_header(&gui);
+
+
+        /* Reset button */
 
         bool reset_pressed =
             IsKeyPressed(KEY_F6) ||
             draw_button(
-                reset_button,
+                (Rectangle){1390, 30, 180, 45},
                 "RESET CPU"
             );
 
         if (reset_pressed &&
             !gui.initialization_failed) {
 
-            CPUStatus status = cpu_v2_reset(&cpu);
+            cpu_v2_reset(&cpu);
 
-            if (status == CPU_STATUS_OK) {
+            snprintf(
+                gui.status_message,
+                sizeof(gui.status_message),
+                "CPU reset. Memory preserved."
+            );
+
+            gui.status_color = COLOR_GREEN;
+        }
+
+
+        /* Temporary visual testing */
+
+        if (!gui.initialization_failed) {
+
+            if (IsKeyPressed(KEY_F2)) {
+
+                cpu.gpr[1] =
+                    (uint16_t)(cpu.gpr[1] + 1u);
 
                 snprintf(
                     gui.status_message,
                     sizeof(gui.status_message),
-                    "CPU reset successfully. Memory preserved."
+                    "UI TEST: R1 changed directly."
                 );
 
                 gui.status_color = COLOR_GREEN;
+            }
 
-            } else {
+            if (IsKeyPressed(KEY_F3)) {
+
+                cpu.flags ^= CPU_FLAG_ZF;
 
                 snprintf(
                     gui.status_message,
                     sizeof(gui.status_message),
-                    "CPU reset failed."
+                    "UI TEST: ZF toggled."
                 );
 
-                gui.status_color = COLOR_RED;
+                gui.status_color = COLOR_YELLOW;
+            }
+
+            if (IsKeyPressed(KEY_F4)) {
+
+                cpu.flags ^= CPU_FLAG_CF;
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "UI TEST: CF toggled."
+                );
+
+                gui.status_color = COLOR_YELLOW;
+            }
+
+            if (IsKeyPressed(KEY_F5)) {
+
+                cpu.flags ^= CPU_FLAG_SF;
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "UI TEST: SF toggled."
+                );
+
+                gui.status_color = COLOR_YELLOW;
+            }
+
+            if (IsKeyPressed(KEY_F7)) {
+
+                cpu.flags ^= CPU_FLAG_OF;
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "UI TEST: OF toggled."
+                );
+
+                gui.status_color = COLOR_YELLOW;
             }
         }
 
 
-        BeginDrawing();
+        /* Track CPU state changes */
 
-        ClearBackground(COLOR_BACKGROUND);
+        update_state_tracking(
+            &gui,
+            &cpu,
+            delta_time
+        );
 
-        draw_header(&gui);
+
+        /* Draw CPU panels */
 
         draw_cpu_dashboard(&cpu);
 
-        draw_register_panel(&cpu);
+        draw_register_panel(&cpu, &gui);
 
         draw_cpu_information(&cpu);
 
-        draw_flags_panel(&cpu);
+        draw_flags_panel(&cpu, &gui);
 
         draw_architecture_panel();
 
-        draw_button(
-            reset_button,
-            "RESET CPU"
-        );
 
         EndDrawing();
     }
