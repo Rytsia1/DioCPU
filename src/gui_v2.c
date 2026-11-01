@@ -1,6 +1,7 @@
 #include "raylib.h"
 
 #include "cpu_v2.h"
+#include "alu.h"
 #include "assembler.h"
 #include "decoder.h"
 #include "memory.h"
@@ -38,7 +39,7 @@
 #define COLOR_RED         (Color){235, 75, 75, 255}
 #define COLOR_CYAN        (Color){70, 195, 245, 255}
 
-/* Color aliases requested by GUI-V2-3 specification */
+/* Color aliases requested by GUI-V2 specifications */
 #define FETCH_COLOR       COLOR_YELLOW
 #define DECODE_COLOR      COLOR_CYAN
 #define EXECUTE_COLOR     COLOR_GREEN
@@ -57,6 +58,10 @@ typedef enum {
     GUI_PHASE_DECODE,
     GUI_PHASE_EXECUTE
 } GUIPhase;
+
+#define GUI_FETCH    GUI_PHASE_FETCH
+#define GUI_DECODE   GUI_PHASE_DECODE
+#define GUI_EXECUTE  GUI_PHASE_EXECUTE
 
 typedef enum {
     MEMORY_VIEW_INSTRUCTION = 0,
@@ -160,6 +165,40 @@ typedef struct {
 
     bool snapshot_initialized;
 
+
+    /* =========================================
+       ALU VISUALIZATION
+       ========================================= */
+
+    bool alu_preview_valid;
+    bool alu_result_visible;
+    bool alu_instruction_invalid;
+    bool alu_execution_failed;
+
+    bool alu_is_unary;
+    bool alu_is_compare;
+    bool alu_is_division;
+
+    ALUOperation alu_operation;
+    ALUResult alu_preview;
+
+    uint8_t alu_reg_a;
+    uint8_t alu_reg_b;
+
+    uint16_t alu_input_a;
+    uint16_t alu_input_b;
+
+    uint16_t alu_reg_a_before;
+    uint16_t alu_reg_b_before;
+
+    uint16_t alu_reg_a_after;
+    uint16_t alu_reg_b_after;
+
+    uint16_t alu_flags_before;
+    uint16_t alu_flags_after;
+
+    float datapath_animation_time;
+
 } GUIState;
 
 static const uint16_t FLAG_MASKS[4] = {
@@ -168,6 +207,258 @@ static const uint16_t FLAG_MASKS[4] = {
     CPU_FLAG_SF,
     CPU_FLAG_OF
 };
+
+/* =========================================
+   ALU MAPPING & STATUS HELPERS
+   ========================================= */
+
+static bool gui_get_alu_operation(
+    InstructionOpcode opcode,
+    ALUOperation *operation
+)
+{
+    if (operation == NULL) {
+        return false;
+    }
+
+    switch (opcode) {
+
+        case DIOCPU_OP_ADD:
+            *operation = ALU_ADD;
+            return true;
+
+        case DIOCPU_OP_SUB:
+            *operation = ALU_SUB;
+            return true;
+
+        case DIOCPU_OP_MUL:
+            *operation = ALU_MUL;
+            return true;
+
+        case DIOCPU_OP_MULS:
+            *operation = ALU_MULS;
+            return true;
+
+        case DIOCPU_OP_DIV:
+            *operation = ALU_DIV;
+            return true;
+
+        case DIOCPU_OP_DIVS:
+            *operation = ALU_DIVS;
+            return true;
+
+        case DIOCPU_OP_AND:
+            *operation = ALU_AND;
+            return true;
+
+        case DIOCPU_OP_OR:
+            *operation = ALU_OR;
+            return true;
+
+        case DIOCPU_OP_XOR:
+            *operation = ALU_XOR;
+            return true;
+
+        case DIOCPU_OP_NOT:
+            *operation = ALU_NOT;
+            return true;
+
+        case DIOCPU_OP_CMP:
+            *operation = ALU_CMP;
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static const char *gui_alu_operation_name(
+    ALUOperation operation
+)
+{
+    switch (operation) {
+
+        case ALU_ADD:  return "ADD";
+        case ALU_SUB:  return "SUB";
+        case ALU_MUL:  return "MUL";
+        case ALU_MULS: return "MULS";
+        case ALU_DIV:  return "DIV";
+        case ALU_DIVS: return "DIVS";
+        case ALU_AND:  return "AND";
+        case ALU_OR:   return "OR";
+        case ALU_XOR:  return "XOR";
+        case ALU_NOT:  return "NOT";
+        case ALU_CMP:  return "CMP";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *gui_alu_status_string(ALUStatus status)
+{
+    switch (status) {
+
+        case ALU_STATUS_OK:
+            return "OK";
+
+        case ALU_STATUS_DIVIDE_BY_ZERO:
+            return "Divide by zero";
+
+        case ALU_STATUS_ARITHMETIC_OVERFLOW:
+            return "Arithmetic overflow";
+
+        case ALU_STATUS_INVALID_OPERATION:
+            return "Invalid ALU operation";
+
+        default:
+            return "Unknown ALU status";
+    }
+}
+
+static void clear_alu_visualization(GUIState *gui)
+{
+    gui->alu_preview_valid = false;
+    gui->alu_result_visible = false;
+    gui->alu_instruction_invalid = false;
+    gui->alu_execution_failed = false;
+
+    gui->alu_is_unary = false;
+    gui->alu_is_compare = false;
+    gui->alu_is_division = false;
+
+    gui->alu_operation = ALU_ADD;
+    gui->alu_preview = (ALUResult){0};
+
+    gui->alu_reg_a = 0;
+    gui->alu_reg_b = 0;
+
+    gui->alu_input_a = 0;
+    gui->alu_input_b = 0;
+
+    gui->alu_reg_a_before = 0;
+    gui->alu_reg_b_before = 0;
+
+    gui->alu_reg_a_after = 0;
+    gui->alu_reg_b_after = 0;
+
+    gui->alu_flags_before = 0;
+    gui->alu_flags_after = 0;
+}
+
+static void prepare_alu_visualization(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    clear_alu_visualization(gui);
+
+    ALUOperation operation;
+
+    if (!gui_get_alu_operation(
+            gui->decoded.opcode,
+            &operation
+        )) {
+
+        /* Instruksi ini tidak menggunakan ALU. */
+        return;
+    }
+
+    uint8_t reg_a = gui->decoded.reg_a;
+    uint8_t reg_b = gui->decoded.reg_b;
+
+    if (reg_a >= CPU_GPR_COUNT ||
+        reg_b >= CPU_GPR_COUNT) {
+
+        gui->alu_instruction_invalid = true;
+        return;
+    }
+
+    gui->alu_operation = operation;
+
+    gui->alu_reg_a = reg_a;
+    gui->alu_reg_b = reg_b;
+
+    gui->alu_is_unary =
+        gui->decoded.opcode == DIOCPU_OP_NOT;
+
+    gui->alu_is_compare =
+        gui->decoded.opcode == DIOCPU_OP_CMP;
+
+    gui->alu_is_division =
+        gui->decoded.opcode == DIOCPU_OP_DIV ||
+        gui->decoded.opcode == DIOCPU_OP_DIVS;
+
+    /* Ambil operand dari Register File. */
+
+    gui->alu_input_a = cpu->gpr[reg_a];
+
+    gui->alu_input_b = gui->alu_is_unary
+        ? 0
+        : cpu->gpr[reg_b];
+
+    /* Simpan kondisi sebelum eksekusi. */
+
+    gui->alu_reg_a_before = cpu->gpr[reg_a];
+    gui->alu_reg_b_before = cpu->gpr[reg_b];
+
+    gui->alu_flags_before = cpu->flags;
+
+    /*
+     * DIV dan DIVS membutuhkan dua register tujuan
+     * yang berbeda: quotient ke RA dan remainder ke RB.
+     */
+
+    if (gui->alu_is_division && reg_a == reg_b) {
+
+        gui->alu_instruction_invalid = true;
+        gui->alu_preview_valid = true;
+
+        return;
+    }
+
+    /*
+     * Preview hanya untuk visualisasi.
+     * Tidak mengubah GPR atau FLAGS CPU.
+     */
+
+    gui->alu_preview = alu_execute(
+        operation,
+        gui->alu_input_a,
+        gui->alu_input_b,
+        cpu->flags
+    );
+
+    gui->alu_preview_valid = true;
+}
+
+static void complete_alu_visualization(
+    const DioCPU *cpu,
+    GUIState *gui,
+    CPUStatus execution_status
+)
+{
+    if (!gui->alu_preview_valid) {
+        return;
+    }
+
+    gui->alu_result_visible = true;
+
+    gui->alu_execution_failed =
+        execution_status != CPU_STATUS_OK;
+
+    /*
+     * Ambil kondisi aktual setelah cpu_v2_step().
+     */
+
+    gui->alu_reg_a_after =
+        cpu->gpr[gui->alu_reg_a];
+
+    gui->alu_reg_b_after =
+        cpu->gpr[gui->alu_reg_b];
+
+    gui->alu_flags_after = cpu->flags;
+}
 
 /* =========================================
    STATE TRACKING FUNCTIONS
@@ -451,6 +742,8 @@ static void reset_gui_cycle(GUIState *gui)
 
     gui->phase_timer = 0.0f;
 
+    clear_alu_visualization(gui);
+
     snprintf(
         gui->status_message,
         sizeof(gui->status_message),
@@ -469,6 +762,8 @@ static void phase_fetch(
     GUIState *gui
 )
 {
+    clear_alu_visualization(gui);
+
     gui->instruction_pc = cpu->pc;
 
     gui->fetched_opcode = 0;
@@ -584,6 +879,12 @@ static void phase_decode(
         return;
     }
 
+    /*
+     * Prepare ALU preview when instruction uses ALU.
+     */
+
+    prepare_alu_visualization(cpu, gui);
+
 
     /*
      * Capture complete instruction bytes.
@@ -642,6 +943,12 @@ static void phase_execute(
      */
 
     gui->last_cpu_status = cpu_v2_step(cpu);
+
+    complete_alu_visualization(
+        cpu,
+        gui,
+        gui->last_cpu_status
+    );
 
 
     if (cpu->state == CPU_STATE_FAULTED) {
@@ -994,7 +1301,7 @@ static void draw_header(DioCPU *cpu, GUIState *gui)
     );
 
     DrawText(
-        "16-BIT ARCHITECTURE | FETCH-DECODE-EXECUTE VISUALIZER",
+        "16-BIT ARCHITECTURE | ANIMATED DATAPATH & ALU VISUALIZER",
         22,
         52,
         12,
@@ -1142,7 +1449,7 @@ static void draw_cpu_dashboard(const DioCPU *cpu)
 }
 
 /* =========================================
-   STEP 9 — INSTRUCTION CYCLE PANEL
+   INSTRUCTION CYCLE PANEL
    ========================================= */
 
 static void draw_cycle_panel(
@@ -1407,169 +1714,6 @@ static void draw_cycle_panel(
 }
 
 /* =========================================
-   STEP 10 — DATAPATH VISUALIZER
-   ========================================= */
-
-static const char *get_control_description(
-    const GUIState *gui
-)
-{
-    switch (gui->phase) {
-
-        case GUI_PHASE_FETCH:
-            return "Fetching instruction";
-
-        case GUI_PHASE_DECODE:
-            return "Decoding operands";
-
-        case GUI_PHASE_EXECUTE:
-            return "Executing operation";
-
-        default:
-            return "Waiting for instruction";
-    }
-}
-
-static void draw_component(
-    Rectangle bounds,
-    const char *title,
-    const char *subtitle,
-    bool active,
-    Color active_color
-)
-{
-    Color bg = active ? (Color){45, 55, 75, 255} : COLOR_PANEL_ALT;
-    Color border = active ? active_color : COLOR_BORDER;
-
-    DrawRectangleRec(bounds, bg);
-    DrawRectangleLinesEx(bounds, active ? 2.0f : 1.0f, border);
-
-    DrawText(
-        title,
-        (int)bounds.x + 12,
-        (int)bounds.y + 10,
-        15,
-        active ? active_color : COLOR_TEXT
-    );
-
-    DrawText(
-        subtitle,
-        (int)bounds.x + 12,
-        (int)bounds.y + 35,
-        12,
-        COLOR_MUTED
-    );
-}
-
-static void draw_datapath(
-    const DioCPU *cpu,
-    const GUIState *gui
-)
-{
-    draw_panel(
-        430,
-        335,
-        1150,
-        270,
-        "CPU DATAPATH"
-    );
-
-    bool fetching = (gui->phase == GUI_PHASE_FETCH);
-    bool decoding = (gui->phase == GUI_PHASE_DECODE);
-    bool executing = (gui->phase == GUI_PHASE_EXECUTE);
-
-    /* Upper row: PC, Instruction Memory, Instruction Decoder, Control Unit */
-
-    Rectangle pc_box = {455, 385, 200, 65};
-    draw_component(
-        pc_box,
-        "PROGRAM COUNTER",
-        TextFormat("PC: 0x%05X", (unsigned int)cpu->pc),
-        fetching,
-        COLOR_YELLOW
-    );
-
-    Rectangle imem_box = {690, 385, 220, 65};
-    draw_component(
-        imem_box,
-        "INSTRUCTION MEM",
-        TextFormat("Read: 0x%02X", gui->fetched_opcode),
-        fetching,
-        COLOR_YELLOW
-    );
-
-    Rectangle dec_box = {945, 385, 220, 65};
-    draw_component(
-        dec_box,
-        "INSTRUCTION DECODER",
-        decoding ? TextFormat("Len: %u byte(s)", (unsigned int)gui->decoded.length) : "Standby",
-        decoding,
-        COLOR_CYAN
-    );
-
-    Rectangle control_box = {1200, 385, 355, 65};
-    draw_component(
-        control_box,
-        "CONTROL UNIT",
-        get_control_description(gui),
-        decoding || executing,
-        ACCENT_COLOR
-    );
-
-    /* Lower row: Register File, ALU Engine, Data Memory / Stack */
-
-    Rectangle rf_box = {550, 480, 260, 65};
-    draw_component(
-        rf_box,
-        "REGISTER FILE",
-        "16 GPRs (R0-R15)",
-        executing,
-        COLOR_GREEN
-    );
-
-    Rectangle alu_box = {850, 480, 260, 65};
-    draw_component(
-        alu_box,
-        "ALU ENGINE",
-        "Arithmetic & Logic",
-        executing,
-        COLOR_GREEN
-    );
-
-    Rectangle dmem_box = {1150, 480, 260, 65};
-    draw_component(
-        dmem_box,
-        "DATA MEMORY / STACK",
-        TextFormat("MAR: 0x%05X | SP: 0x%05X", (unsigned int)cpu->mar, (unsigned int)cpu->sp),
-        executing,
-        COLOR_ACCENT
-    );
-
-    /* Datapath connecting bus lines */
-
-    Color pc_bus_color = fetching ? COLOR_YELLOW : COLOR_BORDER;
-    DrawLineEx((Vector2){655, 417}, (Vector2){690, 417}, 2.0f, pc_bus_color);
-
-    Color mem_dec_color = (fetching || decoding) ? COLOR_CYAN : COLOR_BORDER;
-    DrawLineEx((Vector2){910, 417}, (Vector2){945, 417}, 2.0f, mem_dec_color);
-
-    Color dec_ctrl_color = decoding ? COLOR_CYAN : COLOR_BORDER;
-    DrawLineEx((Vector2){1165, 417}, (Vector2){1200, 417}, 2.0f, dec_ctrl_color);
-
-    Color exec_bus_color = executing ? COLOR_GREEN : COLOR_BORDER;
-    DrawLineEx((Vector2){810, 512}, (Vector2){850, 512}, 2.0f, exec_bus_color);
-    DrawLineEx((Vector2){1110, 512}, (Vector2){1150, 512}, 2.0f, exec_bus_color);
-
-    DrawText(
-        "ACTIVE BUSES HIGHLIGHT ACCORDING TO CYCLE PHASE (FETCH = YELLOW, DECODE = CYAN, EXECUTE = GREEN)",
-        455,
-        570,
-        12,
-        COLOR_MUTED
-    );
-}
-
-/* =========================================
    PROGRAM / DISASSEMBLY PANEL
    ========================================= */
 
@@ -1679,10 +1823,10 @@ static void draw_register_panel(
 )
 {
     draw_panel(
-        20,
-        620,
+        430,
+        330,
         760,
-        325,
+        275,
         "GENERAL PURPOSE REGISTER FILE"
     );
 
@@ -1693,8 +1837,8 @@ static void draw_register_panel(
         int column = (int)(i % 4);
         int row = (int)(i / 4);
 
-        int x = 38 + column * 183;
-        int y = 660 + row * 66;
+        int x = 448 + column * 183;
+        int y = 370 + row * 56;
 
         bool changed =
             gui->register_flash[i] > 0.0f;
@@ -1715,7 +1859,7 @@ static void draw_register_panel(
             x,
             y,
             165,
-            58,
+            50,
             background
         );
 
@@ -1724,7 +1868,7 @@ static void draw_register_panel(
                 (float)x,
                 (float)y,
                 165,
-                58
+                50
             },
             changed ? 2.0f : 1.0f,
             border
@@ -1732,9 +1876,9 @@ static void draw_register_panel(
 
         DrawText(
             TextFormat("R%u", i),
-            x + 12,
-            y + 6,
-            13,
+            x + 10,
+            y + 4,
+            12,
             COLOR_MUTED
         );
 
@@ -1743,9 +1887,9 @@ static void draw_register_panel(
                 "0x%04X",
                 (unsigned int)cpu->gpr[i]
             ),
-            x + 12,
-            y + 24,
-            19,
+            x + 10,
+            y + 20,
+            17,
             value_color
         );
 
@@ -1756,109 +1900,9 @@ static void draw_register_panel(
                     (unsigned int)gui->old_register_values[i]
                 ),
                 x + 95,
-                y + 38,
+                y + 32,
                 9,
                 COLOR_GREEN
-            );
-        }
-    }
-}
-
-/* =========================================
-   MEMORY PANEL
-   ========================================= */
-
-static void draw_memory_panel(
-    const DioCPU *cpu,
-    GUIState *gui
-)
-{
-    draw_panel(
-        795,
-        620,
-        440,
-        325,
-        "MEMORY VIEWER"
-    );
-
-    /* Tab switcher for memory views */
-    Rectangle tab_instr = {815, 660, 120, 28};
-    Rectangle tab_data  = {945, 660, 120, 28};
-    Rectangle tab_stack = {1075, 660, 120, 28};
-
-    if (draw_button(tab_instr, "INSTR")) {
-        gui->memory_view = MEMORY_VIEW_INSTRUCTION;
-    }
-    if (draw_button(tab_data, "DATA")) {
-        gui->memory_view = MEMORY_VIEW_DATA;
-    }
-    if (draw_button(tab_stack, "STACK")) {
-        gui->memory_view = MEMORY_VIEW_STACK;
-    }
-
-    /* Active tab indicator */
-    Rectangle active_tab = (gui->memory_view == MEMORY_VIEW_INSTRUCTION)
-        ? tab_instr
-        : ((gui->memory_view == MEMORY_VIEW_DATA) ? tab_data : tab_stack);
-
-    DrawRectangleLinesEx(active_tab, 2.0f, COLOR_ACCENT);
-
-    uint32_t view_base = 0;
-    const char *region_name = "";
-
-    if (gui->memory_view == MEMORY_VIEW_INSTRUCTION) {
-        view_base = (cpu->pc >= 16) ? ((cpu->pc - 16) & ~0x0Fu) : 0;
-        region_name = "Instruction Memory (256 KiB)";
-    } else if (gui->memory_view == MEMORY_VIEW_DATA) {
-        view_base = (cpu->mar & ~0x0Fu);
-        region_name = "Data Memory (256 KiB)";
-    } else {
-        view_base = (cpu->sp & ~0x0Fu);
-        region_name = "Stack Region (0x30000-0x3FFFF)";
-    }
-
-    DrawText(region_name, 815, 698, 12, COLOR_MUTED);
-
-    /* Render 6 rows of 8 bytes = 48 bytes */
-    for (int r = 0; r < 6; r++) {
-
-        uint32_t row_addr = view_base + (uint32_t)(r * 8);
-        int y_row = 724 + r * 30;
-
-        DrawText(
-            TextFormat("%05X:", (unsigned int)row_addr),
-            815,
-            y_row,
-            13,
-            COLOR_ACCENT
-        );
-
-        for (int c = 0; c < 8; c++) {
-
-            uint32_t byte_addr = row_addr + (uint32_t)c;
-            uint8_t byte_val = 0;
-
-            if (gui->memory_view == MEMORY_VIEW_INSTRUCTION) {
-                if (byte_addr <= DIOCPU_MEMORY_MAX_ADDRESS) {
-                    byte_val = cpu->memory.instruction[byte_addr];
-                }
-            } else {
-                if (byte_addr <= DIOCPU_MEMORY_MAX_ADDRESS) {
-                    byte_val = cpu->memory.data[byte_addr];
-                }
-            }
-
-            bool is_pc_or_sp = (gui->memory_view == MEMORY_VIEW_INSTRUCTION && byte_addr == cpu->pc) ||
-                               (gui->memory_view == MEMORY_VIEW_STACK && byte_addr == cpu->sp);
-
-            Color byte_color = is_pc_or_sp ? COLOR_YELLOW : ((byte_val != 0) ? COLOR_TEXT : COLOR_MUTED);
-
-            DrawText(
-                TextFormat("%02X", byte_val),
-                885 + c * 38,
-                y_row,
-                13,
-                byte_color
             );
         }
     }
@@ -1915,7 +1959,7 @@ static void draw_flag_card(
         name,
         x + 10,
         y + 6,
-        17,
+        16,
         changed ? COLOR_YELLOW : state_color
     );
 
@@ -1923,7 +1967,7 @@ static void draw_flag_card(
         enabled ? "1" : "0",
         x + width - 20,
         y + 6,
-        17,
+        16,
         state_color
     );
 
@@ -1931,7 +1975,7 @@ static void draw_flag_card(
         DrawText(
             TextFormat("%d -> %d", old_value ? 1 : 0, enabled ? 1 : 0),
             x + 10,
-            y + 36,
+            y + 32,
             11,
             COLOR_YELLOW
         );
@@ -1939,7 +1983,7 @@ static void draw_flag_card(
         DrawText(
             description,
             x + 10,
-            y + 36,
+            y + 32,
             11,
             COLOR_MUTED
         );
@@ -1952,10 +1996,10 @@ static void draw_cpu_information(
 )
 {
     draw_panel(
-        1250,
-        620,
+        1210,
         330,
-        325,
+        370,
+        275,
         "CPU STATUS & FLAGS"
     );
 
@@ -1964,9 +2008,9 @@ static void draw_cpu_information(
             "Instructions executed: %llu",
             (unsigned long long)cpu->instructions_executed
         ),
-        1270,
-        665,
-        14,
+        1230,
+        370,
+        13,
         COLOR_TEXT
     );
 
@@ -1975,9 +2019,9 @@ static void draw_cpu_information(
             "CPU State: %s",
             cpu_v2_state_string(cpu->state)
         ),
-        1270,
-        690,
-        14,
+        1230,
+        392,
+        13,
         get_cpu_state_color(cpu->state)
     );
 
@@ -1986,8 +2030,8 @@ static void draw_cpu_information(
             "Fault: %s",
             cpu_v2_fault_string(cpu->fault)
         ),
-        1270,
-        715,
+        1230,
+        414,
         13,
         cpu->fault == CPU_FAULT_NONE
             ? COLOR_MUTED
@@ -1999,8 +2043,8 @@ static void draw_cpu_information(
             "Fault PC: 0x%05X",
             (unsigned int)cpu->fault_pc
         ),
-        1270,
-        738,
+        1230,
+        434,
         13,
         COLOR_MUTED
     );
@@ -2008,7 +2052,7 @@ static void draw_cpu_information(
     /* Flags 2x2 grid */
 
     draw_flag_card(
-        1270, 770, 140, 60,
+        1230, 460, 160, 52,
         "ZF",
         "Zero Flag",
         (cpu->flags & CPU_FLAG_ZF) != 0,
@@ -2017,7 +2061,7 @@ static void draw_cpu_information(
     );
 
     draw_flag_card(
-        1425, 770, 140, 60,
+        1405, 460, 160, 52,
         "CF",
         "Carry Flag",
         (cpu->flags & CPU_FLAG_CF) != 0,
@@ -2026,7 +2070,7 @@ static void draw_cpu_information(
     );
 
     draw_flag_card(
-        1270, 845, 140, 60,
+        1230, 520, 160, 52,
         "SF",
         "Sign Flag",
         (cpu->flags & CPU_FLAG_SF) != 0,
@@ -2035,7 +2079,7 @@ static void draw_cpu_information(
     );
 
     draw_flag_card(
-        1425, 845, 140, 60,
+        1405, 520, 160, 52,
         "OF",
         "Overflow Flag",
         (cpu->flags & CPU_FLAG_OF) != 0,
@@ -2044,11 +2088,743 @@ static void draw_cpu_information(
     );
 
     DrawText(
-        "FLAGS: ZF | CF | SF | OF",
-        1270,
-        918,
+        "STATUS FLAGS REGISTER (16-BIT)",
+        1230,
+        580,
         11,
         COLOR_MUTED
+    );
+}
+
+/* =========================================
+   STEP 7 — ANIMATED DATAPATH & ALU
+   ========================================= */
+
+static void draw_datapath_node(
+    Rectangle bounds,
+    const char *title,
+    const char *line1,
+    const char *line2,
+    bool active
+)
+{
+    Color background = active
+        ? (Color){35, 65, 82, 255}
+        : COLOR_PANEL_ALT;
+
+    Color border = active
+        ? COLOR_CYAN
+        : COLOR_BORDER;
+
+    DrawRectangleRec(bounds, background);
+
+    DrawRectangleLinesEx(
+        bounds,
+        active ? 2.0f : 1.0f,
+        border
+    );
+
+    DrawText(
+        title,
+        (int)bounds.x + 12,
+        (int)bounds.y + 9,
+        13,
+        active ? COLOR_CYAN : COLOR_ACCENT
+    );
+
+    DrawText(
+        line1,
+        (int)bounds.x + 12,
+        (int)bounds.y + 32,
+        13,
+        COLOR_TEXT
+    );
+
+    DrawText(
+        line2,
+        (int)bounds.x + 12,
+        (int)bounds.y + 52,
+        12,
+        COLOR_MUTED
+    );
+}
+
+static void draw_bus_arrow(
+    float start_x,
+    float end_x,
+    float y,
+    bool active,
+    float progress
+)
+{
+    Color bus_color = active
+        ? COLOR_CYAN
+        : COLOR_BORDER;
+
+    DrawLineEx(
+        (Vector2){start_x, y},
+        (Vector2){end_x - 10.0f, y},
+        active ? 3.0f : 1.5f,
+        bus_color
+    );
+
+    DrawTriangle(
+        (Vector2){end_x, y},
+        (Vector2){end_x - 12.0f, y - 7.0f},
+        (Vector2){end_x - 12.0f, y + 7.0f},
+        bus_color
+    );
+
+    /*
+     * Titik bergerak hanya muncul
+     * pada jalur yang sedang aktif.
+     */
+
+    if (active) {
+
+        float dot_x =
+            start_x +
+            ((end_x - start_x) * progress);
+
+        DrawCircle(
+            (int)dot_x,
+            (int)y,
+            6,
+            COLOR_YELLOW
+        );
+    }
+}
+
+static void format_fetched_bytes(
+    const GUIState *gui,
+    char *output,
+    size_t output_size
+)
+{
+    if (output == NULL || output_size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+
+    if (!gui->fetch_valid ||
+        gui->fetched_byte_count == 0) {
+
+        snprintf(
+            output,
+            output_size,
+            "Waiting for instruction"
+        );
+
+        return;
+    }
+
+    size_t used = 0;
+
+    for (uint8_t i = 0;
+         i < gui->fetched_byte_count;
+         i++) {
+
+        int written = snprintf(
+            output + used,
+            output_size - used,
+            "%02X ",
+            (unsigned int)gui->fetched_bytes[i]
+        );
+
+        if (written < 0 ||
+            (size_t)written >= output_size - used) {
+
+            break;
+        }
+
+        used += (size_t)written;
+    }
+}
+
+static void draw_datapath_visualization(
+    const DioCPU *cpu,
+    const GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        "CPU DATAPATH & ALU VISUALIZATION"
+    );
+
+    bool fetching =
+        gui->phase == GUI_FETCH;
+
+    bool decoding =
+        gui->phase == GUI_DECODE;
+
+    bool executing =
+        gui->phase == GUI_EXECUTE;
+
+    float progress = gui->datapath_animation_time;
+
+    if (progress < 0.0f || progress > 1.0f) {
+        progress = 0.0f;
+    }
+
+    /*
+     * =====================================
+     * TOP ROW: INSTRUCTION FETCH & DECODE
+     * =====================================
+     */
+
+    char pc_text[48];
+    char memory_text[64];
+    char bytes_text[64];
+
+    snprintf(
+        pc_text,
+        sizeof(pc_text),
+        "PC: 0x%05X",
+        (unsigned int)gui->instruction_pc
+    );
+
+    if (gui->fetch_valid) {
+
+        snprintf(
+            memory_text,
+            sizeof(memory_text),
+            "Opcode: 0x%02X",
+            (unsigned int)gui->fetched_opcode
+        );
+
+    } else {
+
+        snprintf(
+            memory_text,
+            sizeof(memory_text),
+            "Waiting for fetch"
+        );
+    }
+
+    format_fetched_bytes(
+        gui,
+        bytes_text,
+        sizeof(bytes_text)
+    );
+
+
+    Rectangle pc_node = {
+        (float)(x + 20),
+        (float)(y + 50),
+        170,
+        72
+    };
+
+    Rectangle memory_node = {
+        (float)(x + 250),
+        (float)(y + 50),
+        220,
+        72
+    };
+
+    Rectangle ir_node = {
+        (float)(x + 545),
+        (float)(y + 50),
+        190,
+        72
+    };
+
+    Rectangle decoder_node = {
+        (float)(x + 800),
+        (float)(y + 50),
+        250,
+        72
+    };
+
+    Rectangle control_node = {
+        (float)(x + 1120),
+        (float)(y + 50),
+        420,
+        72
+    };
+
+
+    draw_datapath_node(
+        pc_node,
+        "PROGRAM COUNTER",
+        pc_text,
+        "Instruction address",
+        fetching
+    );
+
+    draw_datapath_node(
+        memory_node,
+        "INSTRUCTION MEMORY",
+        memory_text,
+        "Read machine code",
+        fetching
+    );
+
+    draw_datapath_node(
+        ir_node,
+        "INSTRUCTION REGISTER",
+        bytes_text,
+        "Fetched instruction bytes",
+        fetching
+    );
+
+    draw_datapath_node(
+        decoder_node,
+        "INSTRUCTION DECODER",
+        gui->decode_status == DECODER_STATUS_OK
+            ? "Instruction decoded"
+            : "Waiting for decode",
+        "Opcode and operands",
+        decoding
+    );
+
+    const char *phase_name = "IDLE";
+
+    if (fetching) {
+        phase_name = "FETCH";
+    } else if (decoding) {
+        phase_name = "DECODE";
+    } else if (executing) {
+        phase_name = "EXECUTE";
+    }
+
+    draw_datapath_node(
+        control_node,
+        "CONTROL UNIT",
+        TextFormat("ACTIVE PHASE: %s", phase_name),
+        gui->alu_preview_valid
+            ? "ALU operation detected"
+            : "No ALU operation detected",
+        fetching || decoding || executing
+    );
+
+
+    /*
+     * Instruction flow arrows.
+     */
+
+    draw_bus_arrow(
+        (float)(x + 192),
+        (float)(x + 242),
+        (float)(y + 86),
+        fetching,
+        progress
+    );
+
+    draw_bus_arrow(
+        (float)(x + 472),
+        (float)(x + 537),
+        (float)(y + 86),
+        fetching,
+        progress
+    );
+
+    draw_bus_arrow(
+        (float)(x + 737),
+        (float)(x + 792),
+        (float)(y + 86),
+        decoding,
+        progress
+    );
+
+    draw_bus_arrow(
+        (float)(x + 1052),
+        (float)(x + 1112),
+        (float)(y + 86),
+        decoding,
+        progress
+    );
+
+
+    /*
+     * =====================================
+     * BOTTOM ROW: REGISTER FILE AND ALU
+     * =====================================
+     */
+
+    char register_a_text[64];
+    char register_b_text[64];
+
+    char alu_line1[100];
+    char alu_line2[100];
+
+    char writeback_line1[100];
+    char writeback_line2[100];
+
+
+    /*
+     * Register File input values.
+     */
+
+    if (gui->alu_preview_valid) {
+
+        snprintf(
+            register_a_text,
+            sizeof(register_a_text),
+            "A: R%u = 0x%04X",
+            (unsigned int)gui->alu_reg_a,
+            (unsigned int)gui->alu_input_a
+        );
+
+        if (gui->alu_is_unary) {
+
+            snprintf(
+                register_b_text,
+                sizeof(register_b_text),
+                "B: Not required"
+            );
+
+        } else {
+
+            snprintf(
+                register_b_text,
+                sizeof(register_b_text),
+                "B: R%u = 0x%04X",
+                (unsigned int)gui->alu_reg_b,
+                (unsigned int)gui->alu_input_b
+            );
+        }
+
+    } else {
+
+        snprintf(
+            register_a_text,
+            sizeof(register_a_text),
+            "Waiting for operands"
+        );
+
+        snprintf(
+            register_b_text,
+            sizeof(register_b_text),
+            "No ALU instruction"
+        );
+    }
+
+
+    /*
+     * ALU information.
+     */
+
+    if (!gui->alu_preview_valid) {
+
+        snprintf(
+            alu_line1,
+            sizeof(alu_line1),
+            "No ALU operation"
+        );
+
+        snprintf(
+            alu_line2,
+            sizeof(alu_line2),
+            "Waiting for instruction"
+        );
+
+    } else if (gui->alu_instruction_invalid) {
+
+        snprintf(
+            alu_line1,
+            sizeof(alu_line1),
+            "Invalid register combination"
+        );
+
+        snprintf(
+            alu_line2,
+            sizeof(alu_line2),
+            "Operation cannot execute"
+        );
+
+    } else {
+
+        snprintf(
+            alu_line1,
+            sizeof(alu_line1),
+            "%s | A=0x%04X B=0x%04X",
+            gui_alu_operation_name(gui->alu_operation),
+            (unsigned int)gui->alu_input_a,
+            (unsigned int)gui->alu_input_b
+        );
+
+        if (!gui->alu_result_visible) {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "Result waiting for EXECUTE"
+            );
+
+        } else if (
+            gui->alu_preview.status != ALU_STATUS_OK
+        ) {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "ALU ERROR: %s",
+                gui_alu_status_string(
+                    gui->alu_preview.status
+                )
+            );
+
+        } else if (gui->alu_execution_failed) {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "CPU did not commit the result"
+            );
+
+        } else {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "RESULT: 0x%04X",
+                (unsigned int)gui->alu_preview.result
+            );
+        }
+    }
+
+
+    /*
+     * Register Writeback information.
+     */
+
+    if (!gui->alu_preview_valid) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "Waiting for ALU result"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "No register writeback"
+        );
+
+    } else if (gui->alu_instruction_invalid) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "Invalid instruction"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "No register changes"
+        );
+
+    } else if (!gui->alu_result_visible) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "Waiting for execution"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "Writeback pending"
+        );
+
+    } else if (gui->alu_execution_failed) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "EXECUTION FAILED"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "Register changes not committed"
+        );
+
+    } else if (gui->alu_is_compare) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "CMP: FLAGS updated"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "No GPR writeback"
+        );
+
+    } else if (gui->alu_is_division) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "R%u = 0x%04X (quotient)",
+            (unsigned int)gui->alu_reg_a,
+            (unsigned int)gui->alu_reg_a_after
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "R%u = 0x%04X (remainder)",
+            (unsigned int)gui->alu_reg_b,
+            (unsigned int)gui->alu_reg_b_after
+        );
+
+    } else {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "R%u: 0x%04X",
+            (unsigned int)gui->alu_reg_a,
+            (unsigned int)gui->alu_reg_a_after
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "Previous: 0x%04X",
+            (unsigned int)gui->alu_reg_a_before
+        );
+    }
+
+
+    Rectangle register_node = {
+        (float)(x + 20),
+        (float)(y + 175),
+        370,
+        95
+    };
+
+    Rectangle alu_node = {
+        (float)(x + 580),
+        (float)(y + 175),
+        380,
+        95
+    };
+
+    Rectangle writeback_node = {
+        (float)(x + 1160),
+        (float)(y + 175),
+        380,
+        95
+    };
+
+
+    draw_datapath_node(
+        register_node,
+        "REGISTER FILE",
+        register_a_text,
+        register_b_text,
+        decoding
+    );
+
+    draw_datapath_node(
+        alu_node,
+        "ARITHMETIC LOGIC UNIT",
+        alu_line1,
+        alu_line2,
+        executing
+    );
+
+    draw_datapath_node(
+        writeback_node,
+        "REGISTER WRITEBACK",
+        writeback_line1,
+        writeback_line2,
+        executing && gui->alu_result_visible
+    );
+
+
+    /*
+     * Register File -> ALU.
+     */
+
+    draw_bus_arrow(
+        (float)(x + 392),
+        (float)(x + 572),
+        (float)(y + 222),
+        decoding && gui->alu_preview_valid,
+        progress
+    );
+
+
+    /*
+     * ALU -> Register Writeback.
+     */
+
+    draw_bus_arrow(
+        (float)(x + 962),
+        (float)(x + 1152),
+        (float)(y + 222),
+        executing &&
+            gui->alu_result_visible &&
+            !gui->alu_execution_failed &&
+            gui->alu_preview.status == ALU_STATUS_OK,
+        progress
+    );
+
+
+    /*
+     * =====================================
+     * FLAGS
+     * =====================================
+     */
+
+    uint16_t displayed_flags =
+        gui->alu_result_visible
+            ? gui->alu_flags_after
+            : (gui->alu_preview_valid
+                ? gui->alu_flags_before
+                : cpu->flags);
+
+    DrawText(
+        TextFormat(
+            "FLAGS: ZF=%u   CF=%u   SF=%u   OF=%u",
+            (displayed_flags & CPU_FLAG_ZF) != 0,
+            (displayed_flags & CPU_FLAG_CF) != 0,
+            (displayed_flags & CPU_FLAG_SF) != 0,
+            (displayed_flags & CPU_FLAG_OF) != 0
+        ),
+        x + 25,
+        y + 295,
+        15,
+        COLOR_YELLOW
+    );
+
+    DrawText(
+        "16-BIT DATA PATH | 18-BIT ADDRESS PATH",
+        x + 1150,
+        y + 295,
+        12,
+        COLOR_MUTED
+    );
+}
+
+static void draw_datapath(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    draw_datapath_visualization(
+        cpu,
+        gui,
+        (Rectangle){20, 620, 1560, 330}
     );
 }
 
@@ -2065,17 +2841,17 @@ static void draw_status_bar(
 
     DrawRectangle(
         20,
-        955,
+        960,
         1560,
-        35,
+        32,
         COLOR_PANEL
     );
 
     DrawRectangleLines(
         20,
-        955,
+        960,
         1560,
-        35,
+        32,
         COLOR_BORDER
     );
 
@@ -2085,7 +2861,7 @@ static void draw_status_bar(
             gui->auto_run ? "Pause" : "Run"
         ),
         35,
-        965,
+        969,
         13,
         COLOR_MUTED
     );
@@ -2100,7 +2876,7 @@ static void draw_status_bar(
             (gui->phase == GUI_PHASE_EXECUTE ? "EXECUTE" : "IDLE"))
         ),
         1100,
-        965,
+        969,
         13,
         gui->auto_run ? COLOR_GREEN : COLOR_CYAN
     );
@@ -2115,7 +2891,7 @@ int main(void)
     InitWindow(
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
-        "DioCPU V2 - Fetch-Decode-Execute Animation Visualizer"
+        "DioCPU V2 - Animated Datapath & ALU Visualizer"
     );
 
     SetTargetFPS(FPS);
@@ -2174,6 +2950,17 @@ int main(void)
     while (!WindowShouldClose()) {
 
         float delta_time = GetFrameTime();
+
+
+        /* =================================
+           ANIMATION TIMER
+           ================================= */
+
+        gui.datapath_animation_time += delta_time * 0.8f;
+
+        while (gui.datapath_animation_time >= 1.0f) {
+            gui.datapath_animation_time -= 1.0f;
+        }
 
 
         /* =================================
@@ -2269,17 +3056,15 @@ int main(void)
 
         draw_cpu_dashboard(&cpu);
 
-        draw_register_panel(&cpu, &gui);
+        draw_program_panel(&cpu, &gui);
 
         draw_cycle_panel(&cpu, &gui);
 
-        draw_datapath(&cpu, &gui);
-
-        draw_program_panel(&cpu, &gui);
-
-        draw_memory_panel(&cpu, &gui);
+        draw_register_panel(&cpu, &gui);
 
         draw_cpu_information(&cpu, &gui);
+
+        draw_datapath(&cpu, &gui);
 
 
         EndDrawing();
