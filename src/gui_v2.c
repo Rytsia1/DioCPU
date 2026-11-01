@@ -5,6 +5,7 @@
 #include "assembler.h"
 #include "decoder.h"
 #include "memory.h"
+#include "stack.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -66,6 +67,30 @@
 
 #define GUI_WORKSPACE_DATAPATH 0
 #define GUI_WORKSPACE_MEMORY   1
+#define GUI_WORKSPACE_STACK    2
+
+#define GUI_STACK_VIEW_WORDS 10
+
+#define GUI_STACK_VIEW_BYTES \
+    (GUI_STACK_VIEW_WORDS * 2u)
+
+#define GUI_STACK_EVENT_DURATION 2.5f
+
+/* =========================================
+   STACK EVENT TYPES
+   ========================================= */
+
+typedef enum {
+
+    GUI_STACK_EVENT_NONE = 0,
+
+    GUI_STACK_EVENT_PUSH,
+    GUI_STACK_EVENT_POP,
+
+    GUI_STACK_EVENT_CALL,
+    GUI_STACK_EVENT_RET
+
+} GUIStackEventType;
 
 /* =========================================
    GUI STATE & TRACKING
@@ -213,6 +238,38 @@ typedef struct {
     uint16_t alu_flags_after;
 
     float datapath_animation_time;
+
+
+    /* =========================================
+       STACK VIEWER
+       ========================================= */
+
+    uint32_t stack_view_base;
+
+    bool stack_follow_sp;
+
+
+    /* =========================================
+       STACK EVENT TRACKING
+       ========================================= */
+
+    GUIStackEventType stack_event_type;
+
+    bool stack_event_pending;
+    bool stack_event_success;
+
+    uint8_t stack_event_register;
+
+    uint32_t stack_event_old_sp;
+    uint32_t stack_event_new_sp;
+
+    uint32_t stack_event_address;
+    uint32_t stack_event_return_address;
+
+    uint16_t stack_event_value;
+    uint16_t stack_event_high_value;
+
+    float stack_event_timer;
 
 } GUIState;
 
@@ -612,6 +669,533 @@ static bool draw_memory_control(
 
     return hovered &&
         IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+/* =========================================
+   STACK VIEWER HELPERS & EVENT TRACKING
+   ========================================= */
+
+static bool gui_stack_sp_valid(uint32_t sp)
+{
+    return
+        sp >= DIOCPU_STACK_BOTTOM &&
+        sp <= DIOCPU_STACK_INITIAL_SP &&
+        (sp % 2u) == 0u;
+}
+
+static bool gui_stack_read_word(
+    const DioCPU *cpu,
+    uint32_t address,
+    uint16_t *value
+)
+{
+    if (cpu == NULL || value == NULL) {
+        return false;
+    }
+
+    if (address < DIOCPU_STACK_BOTTOM ||
+        address + 1u > DIOCPU_STACK_TOP) {
+
+        return false;
+    }
+
+    uint8_t low =
+        cpu->memory.data[address];
+
+    uint8_t high =
+        cpu->memory.data[address + 1u];
+
+    *value =
+        (uint16_t)low |
+        ((uint16_t)high << 8u);
+
+    return true;
+}
+
+static uint32_t gui_stack_used_bytes(
+    const DioCPU *cpu
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return 0;
+    }
+
+    return DIOCPU_STACK_INITIAL_SP - cpu->sp;
+}
+
+static uint32_t gui_stack_free_bytes(
+    const DioCPU *cpu
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return 0;
+    }
+
+    return cpu->sp - DIOCPU_STACK_BOTTOM;
+}
+
+static uint32_t gui_stack_used_words(
+    const DioCPU *cpu
+)
+{
+    return gui_stack_used_bytes(cpu) / 2u;
+}
+
+static uint32_t gui_stack_capacity_words(void)
+{
+    return (
+        DIOCPU_STACK_INITIAL_SP -
+        DIOCPU_STACK_BOTTOM
+    ) / 2u;
+}
+
+static void gui_stack_follow_pointer(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return;
+    }
+
+    gui->stack_follow_sp = true;
+
+    gui->stack_view_base = cpu->sp;
+}
+
+static void gui_stack_view_older(
+    GUIState *gui
+)
+{
+    gui->stack_follow_sp = false;
+
+    uint32_t maximum =
+        DIOCPU_STACK_INITIAL_SP;
+
+    if (gui->stack_view_base <=
+        maximum - GUI_STACK_VIEW_BYTES) {
+
+        gui->stack_view_base += GUI_STACK_VIEW_BYTES;
+
+    } else {
+
+        gui->stack_view_base = maximum;
+    }
+
+    gui->stack_view_base -=
+        gui->stack_view_base % 2u;
+}
+
+static void gui_stack_view_newer(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return;
+    }
+
+    gui->stack_follow_sp = false;
+
+    if (gui->stack_view_base <=
+        cpu->sp + GUI_STACK_VIEW_BYTES) {
+
+        gui->stack_view_base = cpu->sp;
+
+    } else {
+
+        gui->stack_view_base -= GUI_STACK_VIEW_BYTES;
+    }
+
+    gui->stack_view_base -=
+        gui->stack_view_base % 2u;
+}
+
+static void prepare_stack_event(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    InstructionOpcode opcode = gui->decoded.opcode;
+
+    GUIStackEventType event_type =
+        GUI_STACK_EVENT_NONE;
+
+    switch (opcode) {
+
+        case DIOCPU_OP_PUSH:
+            event_type = GUI_STACK_EVENT_PUSH;
+            break;
+
+        case DIOCPU_OP_POP:
+            event_type = GUI_STACK_EVENT_POP;
+            break;
+
+        case DIOCPU_OP_CALL:
+            event_type = GUI_STACK_EVENT_CALL;
+            break;
+
+        case DIOCPU_OP_RET:
+            event_type = GUI_STACK_EVENT_RET;
+            break;
+
+        default:
+            gui->stack_event_pending = false;
+            return;
+    }
+
+    gui->stack_event_type = event_type;
+
+    gui->stack_event_pending = true;
+
+    gui->stack_event_success = false;
+
+    gui->stack_event_old_sp = cpu->sp;
+    gui->stack_event_new_sp = cpu->sp;
+
+    gui->stack_event_register = gui->decoded.reg_a;
+
+    gui->stack_event_address = cpu->sp;
+
+    gui->stack_event_value = 0;
+    gui->stack_event_high_value = 0;
+
+    gui->stack_event_return_address = 0;
+
+    /*
+     * PUSH
+     */
+
+    if (opcode == DIOCPU_OP_PUSH) {
+
+        gui->stack_event_address =
+            cpu->sp >= DIOCPU_STACK_BOTTOM + 2u
+                ? cpu->sp - 2u
+                : cpu->sp;
+
+        if (gui->decoded.reg_a < CPU_GPR_COUNT) {
+
+            gui->stack_event_value =
+                cpu->gpr[gui->decoded.reg_a];
+        }
+    }
+
+    /*
+     * POP
+     */
+
+    else if (opcode == DIOCPU_OP_POP) {
+
+        gui->stack_event_address = cpu->sp;
+
+        (void)gui_stack_read_word(
+            cpu,
+            cpu->sp,
+            &gui->stack_event_value
+        );
+    }
+
+    /*
+     * CALL
+     */
+
+    else if (opcode == DIOCPU_OP_CALL) {
+
+        gui->stack_event_address =
+            cpu->sp >= DIOCPU_STACK_BOTTOM + 4u
+                ? cpu->sp - 4u
+                : cpu->sp;
+
+        gui->stack_event_return_address =
+            gui->decoded.next_pc;
+
+        gui->stack_event_value =
+            (uint16_t)(
+                gui->stack_event_return_address & 0xFFFFu
+            );
+
+        gui->stack_event_high_value =
+            (uint16_t)(
+                gui->stack_event_return_address >> 16u
+            );
+    }
+
+    /*
+     * RET
+     */
+
+    else if (opcode == DIOCPU_OP_RET) {
+
+        gui->stack_event_address = cpu->sp;
+
+        (void)gui_stack_read_word(
+            cpu,
+            cpu->sp,
+            &gui->stack_event_value
+        );
+
+        (void)gui_stack_read_word(
+            cpu,
+            cpu->sp + 2u,
+            &gui->stack_event_high_value
+        );
+
+        gui->stack_event_return_address =
+            (uint32_t)gui->stack_event_value |
+            ((uint32_t)gui->stack_event_high_value << 16u);
+    }
+}
+
+static void complete_stack_event(
+    const DioCPU *cpu,
+    GUIState *gui,
+    CPUStatus execution_status
+)
+{
+    if (!gui->stack_event_pending) {
+        return;
+    }
+
+    gui->stack_event_pending = false;
+
+    gui->stack_event_new_sp = cpu->sp;
+
+    gui->stack_event_success =
+        execution_status == CPU_STATUS_OK &&
+        cpu->sp != gui->stack_event_old_sp;
+
+    gui->stack_event_timer =
+        GUI_STACK_EVENT_DURATION;
+
+    /*
+     * Setelah operasi stack berhasil,
+     * ikuti posisi SP terbaru.
+     */
+
+    gui->stack_follow_sp = true;
+
+    gui->stack_view_base = cpu->sp;
+}
+
+static void clear_stack_event(GUIState *gui)
+{
+    gui->stack_event_type = GUI_STACK_EVENT_NONE;
+
+    gui->stack_event_pending = false;
+
+    gui->stack_event_success = false;
+
+    gui->stack_event_timer = 0.0f;
+
+    gui->stack_event_old_sp = 0;
+    gui->stack_event_new_sp = 0;
+
+    gui->stack_event_address = 0;
+    gui->stack_event_return_address = 0;
+
+    gui->stack_event_value = 0;
+    gui->stack_event_high_value = 0;
+
+    gui->stack_event_register = 0;
+}
+
+static bool draw_stack_control(
+    Rectangle bounds,
+    const char *label,
+    bool active
+)
+{
+    Vector2 mouse = GetMousePosition();
+
+    bool hovered = CheckCollisionPointRec(
+        mouse,
+        bounds
+    );
+
+    Color background = active
+        ? (Color){35, 75, 95, 255}
+        : (hovered
+            ? (Color){55, 85, 110, 255}
+            : COLOR_PANEL_ALT);
+
+    Color border =
+        active || hovered
+            ? COLOR_CYAN
+            : COLOR_BORDER;
+
+    DrawRectangleRec(
+        bounds,
+        background
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        active ? 2.0f : 1.0f,
+        border
+    );
+
+    int text_width = MeasureText(label, 12);
+
+    DrawText(
+        label,
+        (int)(
+            bounds.x +
+            (bounds.width - text_width) / 2.0f
+        ),
+        (int)(
+            bounds.y +
+            (bounds.height - 12.0f) / 2.0f
+        ),
+        12,
+        COLOR_TEXT
+    );
+
+    return hovered &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+static const char *gui_stack_event_name(
+    GUIStackEventType event
+)
+{
+    switch (event) {
+
+        case GUI_STACK_EVENT_PUSH:
+            return "PUSH";
+
+        case GUI_STACK_EVENT_POP:
+            return "POP";
+
+        case GUI_STACK_EVENT_CALL:
+            return "CALL";
+
+        case GUI_STACK_EVENT_RET:
+            return "RET";
+
+        default:
+            return "NONE";
+    }
+}
+
+static void draw_stack_event_information(
+    const GUIState *gui,
+    int x,
+    int y
+)
+{
+    if (gui->stack_event_type == GUI_STACK_EVENT_NONE) {
+
+        DrawText(
+            "Waiting for stack instruction...",
+            x,
+            y,
+            13,
+            COLOR_MUTED
+        );
+
+        return;
+    }
+
+    Color event_color = gui->stack_event_success
+        ? COLOR_GREEN
+        : COLOR_RED;
+
+    const char *result_text =
+        gui->stack_event_success
+            ? "COMMITTED"
+            : "FAILED";
+
+    DrawText(
+        TextFormat(
+            "LAST EVENT: %s",
+            gui_stack_event_name(gui->stack_event_type)
+        ),
+        x,
+        y,
+        13,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        result_text,
+        x + 300,
+        y,
+        13,
+        event_color
+    );
+
+    switch (gui->stack_event_type) {
+
+        case GUI_STACK_EVENT_PUSH:
+
+            DrawText(
+                TextFormat(
+                    "R%u = 0x%04X -> [0x%05X]",
+                    (unsigned int)gui->stack_event_register,
+                    (unsigned int)gui->stack_event_value,
+                    (unsigned int)gui->stack_event_address
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        case GUI_STACK_EVENT_POP:
+
+            DrawText(
+                TextFormat(
+                    "[0x%05X] = 0x%04X -> R%u",
+                    (unsigned int)gui->stack_event_address,
+                    (unsigned int)gui->stack_event_value,
+                    (unsigned int)gui->stack_event_register
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        case GUI_STACK_EVENT_CALL:
+
+            DrawText(
+                TextFormat(
+                    "Return PC 0x%05X saved at 0x%05X - 0x%05X",
+                    (unsigned int)gui->stack_event_return_address,
+                    (unsigned int)gui->stack_event_address,
+                    (unsigned int)(gui->stack_event_address + 3u)
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        case GUI_STACK_EVENT_RET:
+
+            DrawText(
+                TextFormat(
+                    "Return address loaded: 0x%05X from 0x%05X",
+                    (unsigned int)gui->stack_event_return_address,
+                    (unsigned int)gui->stack_event_address
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        default:
+            break;
+    }
 }
 
 /* =========================================
@@ -1098,7 +1682,15 @@ static void phase_execute(
      * Execute instruction through actual CPU engine.
      */
 
+    prepare_stack_event(cpu, gui);
+
     gui->last_cpu_status = cpu_v2_step(cpu);
+
+    complete_stack_event(
+        cpu,
+        gui,
+        gui->last_cpu_status
+    );
 
     complete_alu_visualization(
         cpu,
@@ -1309,6 +1901,8 @@ static void load_assembly_program(DioCPU *cpu, GUIState *gui)
     gui->program_size = result.code_size;
     reset_gui_cycle(gui);
     initialize_state_tracking(gui, cpu);
+    clear_stack_event(gui);
+    gui_stack_follow_pointer(cpu, gui);
 
     snprintf(
         gui->status_message,
@@ -1499,6 +2093,8 @@ static void draw_header(DioCPU *cpu, GUIState *gui)
     if (draw_button(reset_btn, "RESET (F6)")) {
         cpu_v2_reset(cpu);
         reset_gui_cycle(gui);
+        clear_stack_event(gui);
+        gui_stack_follow_pointer(cpu, gui);
     }
 
     Rectangle load_btn = {1450, 20, 130, 42};
@@ -3432,6 +4028,508 @@ static void draw_memory_viewer(
 }
 
 /* =========================================
+   STACK VIEWER
+   ========================================= */
+
+static void draw_stack_viewer(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    bool sp_valid = gui_stack_sp_valid(cpu->sp);
+
+    /*
+     * Follow SP automatically when enabled.
+     */
+
+    if (gui->stack_follow_sp && sp_valid) {
+
+        gui->stack_view_base = cpu->sp;
+    }
+
+    /*
+     * Ensure page alignment.
+     */
+
+    gui->stack_view_base -=
+        gui->stack_view_base % 2u;
+
+    /*
+     * Clamp view base to stack bounds.
+     */
+
+    if (sp_valid) {
+
+        if (gui->stack_view_base < cpu->sp) {
+            gui->stack_view_base = cpu->sp;
+        }
+
+        if (
+            gui->stack_view_base >
+            DIOCPU_STACK_INITIAL_SP
+        ) {
+
+            gui->stack_view_base =
+                DIOCPU_STACK_INITIAL_SP;
+        }
+    }
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        "STACK MEMORY VIEWER"
+    );
+
+    /*
+     * =====================================
+     * CONTROLS
+     * =====================================
+     */
+
+    if (draw_stack_control(
+            (Rectangle){
+                (float)(x + 1050),
+                (float)(y + 9),
+                130,
+                30
+            },
+            "FOLLOW SP",
+            gui->stack_follow_sp
+        )) {
+
+        gui_stack_follow_pointer(cpu, gui);
+    }
+
+    if (draw_stack_control(
+            (Rectangle){
+                (float)(x + 1190),
+                (float)(y + 9),
+                90,
+                30
+            },
+            "OLDER >",
+            false
+        )) {
+
+        gui_stack_view_older(gui);
+    }
+
+    if (draw_stack_control(
+            (Rectangle){
+                (float)(x + 1290),
+                (float)(y + 9),
+                90,
+                30
+            },
+            "< NEWER",
+            false
+        )) {
+
+        gui_stack_view_newer(cpu, gui);
+    }
+
+    /*
+     * =====================================
+     * STACK STATISTICS
+     * =====================================
+     */
+
+    if (sp_valid) {
+
+        uint32_t used_bytes =
+            gui_stack_used_bytes(cpu);
+
+        uint32_t free_bytes =
+            gui_stack_free_bytes(cpu);
+
+        uint32_t used_words =
+            gui_stack_used_words(cpu);
+
+        uint32_t capacity_words =
+            gui_stack_capacity_words();
+
+        DrawText(
+            TextFormat(
+                "SP: 0x%05X",
+                (unsigned int)cpu->sp
+            ),
+            x + 22,
+            y + 49,
+            14,
+            COLOR_YELLOW
+        );
+
+        DrawText(
+            TextFormat(
+                "USED: %u / %u WORDS",
+                (unsigned int)used_words,
+                (unsigned int)capacity_words
+            ),
+            x + 245,
+            y + 49,
+            13,
+            COLOR_TEXT
+        );
+
+        DrawText(
+            TextFormat(
+                "USED BYTES: %u",
+                (unsigned int)used_bytes
+            ),
+            x + 570,
+            y + 49,
+            13,
+            COLOR_CYAN
+        );
+
+        DrawText(
+            TextFormat(
+                "FREE BYTES: %u",
+                (unsigned int)free_bytes
+            ),
+            x + 790,
+            y + 49,
+            13,
+            COLOR_GREEN
+        );
+
+    } else {
+
+        DrawText(
+            "INVALID STACK POINTER",
+            x + 22,
+            y + 49,
+            14,
+            COLOR_RED
+        );
+    }
+
+    /*
+     * =====================================
+     * EVENT INFORMATION
+     * =====================================
+     */
+
+    draw_stack_event_information(
+        gui,
+        x + 22,
+        y + 78
+    );
+
+    /*
+     * =====================================
+     * STACK TABLE HEADERS
+     * =====================================
+     */
+
+    int table_y = y + 130;
+
+    DrawText(
+        "ADDRESS",
+        x + 22,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "LOW BYTE",
+        x + 180,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "HIGH BYTE",
+        x + 320,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "16-BIT VALUE",
+        x + 500,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "STACK STATUS",
+        x + 690,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    /*
+     * =====================================
+     * STACK ROWS
+     * =====================================
+     */
+
+    for (unsigned int i = 0;
+         i < GUI_STACK_VIEW_WORDS;
+         i++) {
+
+        uint32_t address =
+            gui->stack_view_base + i * 2u;
+
+        int row_y =
+            table_y + 18 + (int)i * 17;
+
+        if (address + 1u > DIOCPU_STACK_TOP) {
+            break;
+        }
+
+        uint8_t low =
+            cpu->memory.data[address];
+
+        uint8_t high =
+            cpu->memory.data[address + 1u];
+
+        uint16_t value =
+            (uint16_t)low |
+            ((uint16_t)high << 8u);
+
+        bool active =
+            sp_valid &&
+            address >= cpu->sp &&
+            address + 1u < DIOCPU_STACK_INITIAL_SP;
+
+        bool is_top =
+            active && address == cpu->sp;
+
+        bool event_address =
+            gui->stack_event_timer > 0.0f &&
+            address == gui->stack_event_address;
+
+        bool event_high_address =
+            gui->stack_event_timer > 0.0f &&
+            gui->stack_event_type == GUI_STACK_EVENT_CALL &&
+            address == gui->stack_event_address + 2u;
+
+        Color background = is_top
+            ? (Color){65, 55, 25, 255}
+            : ((active)
+                ? COLOR_PANEL_ALT
+                : COLOR_PANEL);
+
+        Color border = is_top
+            ? COLOR_YELLOW
+            : (event_address || event_high_address
+                ? COLOR_CYAN
+                : COLOR_BORDER);
+
+        DrawRectangle(
+            x + 20,
+            row_y,
+            950,
+            15,
+            background
+        );
+
+        DrawRectangleLines(
+            x + 20,
+            row_y,
+            950,
+            15,
+            border
+        );
+
+        /*
+         * ADDRESS
+         */
+
+        DrawText(
+            TextFormat(
+                "0x%05X",
+                (unsigned int)address
+            ),
+            x + 22,
+            row_y + 2,
+            11,
+            COLOR_CYAN
+        );
+
+        /*
+         * LOW BYTE
+         */
+
+        DrawText(
+            TextFormat(
+                "%02X",
+                (unsigned int)low
+            ),
+            x + 190,
+            row_y + 2,
+            11,
+            COLOR_TEXT
+        );
+
+        /*
+         * HIGH BYTE
+         */
+
+        DrawText(
+            TextFormat(
+                "%02X",
+                (unsigned int)high
+            ),
+            x + 335,
+            row_y + 2,
+            11,
+            COLOR_TEXT
+        );
+
+        /*
+         * 16-BIT WORD
+         */
+
+        DrawText(
+            TextFormat(
+                "0x%04X",
+                (unsigned int)value
+            ),
+            x + 515,
+            row_y + 2,
+            11,
+            COLOR_YELLOW
+        );
+
+        /*
+         * STATUS
+         */
+
+        const char *status = "INACTIVE";
+
+        Color status_color = COLOR_MUTED;
+
+        if (is_top) {
+
+            status = "TOP OF STACK";
+            status_color = COLOR_YELLOW;
+
+        } else if (active) {
+
+            status = "ACTIVE";
+            status_color = COLOR_GREEN;
+        }
+
+        if (event_address) {
+
+            if (gui->stack_event_type == GUI_STACK_EVENT_PUSH) {
+                status = "PUSHED";
+                status_color = COLOR_GREEN;
+            }
+
+            if (gui->stack_event_type == GUI_STACK_EVENT_CALL) {
+                status = "RETURN LOW";
+                status_color = COLOR_CYAN;
+            }
+        }
+
+        if (event_high_address) {
+
+            status = "RETURN HIGH";
+            status_color = COLOR_CYAN;
+        }
+
+        DrawText(
+            status,
+            x + 690,
+            row_y + 2,
+            11,
+            status_color
+        );
+    }
+
+    /*
+     * =====================================
+     * EMPTY STACK MESSAGE / INFO BOX
+     * =====================================
+     */
+
+    if (sp_valid && cpu->sp == DIOCPU_STACK_INITIAL_SP) {
+
+        DrawText(
+            "STACK IS EMPTY",
+            x + 1000,
+            y + 165,
+            18,
+            COLOR_MUTED
+        );
+
+        DrawText(
+            "Initial SP is at 0x3FFFE.\nPushing 16-bit values decrements SP by 2.\nCalling subroutines pushes 32-bit return address (4 bytes).",
+            x + 1000,
+            y + 195,
+            12,
+            COLOR_MUTED
+        );
+
+    } else if (sp_valid) {
+
+        DrawText(
+            "STACK MEMORY REGION",
+            x + 1000,
+            y + 140,
+            14,
+            COLOR_CYAN
+        );
+
+        DrawText(
+            TextFormat("Current SP: 0x%05X\nInitial SP: 0x%05X\nStack Bottom: 0x%05X",
+                (unsigned int)cpu->sp,
+                (unsigned int)DIOCPU_STACK_INITIAL_SP,
+                (unsigned int)DIOCPU_STACK_BOTTOM),
+            x + 1000,
+            y + 165,
+            12,
+            COLOR_TEXT
+        );
+
+        DrawText(
+            "Stack grows downwards towards lower addresses.\nLow byte is stored at address N, high byte at N+1.",
+            x + 1000,
+            y + 225,
+            12,
+            COLOR_MUTED
+        );
+    }
+
+    /*
+     * =====================================
+     * FOOTER
+     * =====================================
+     */
+
+    DrawText(
+        "STACK GROWS DOWNWARD | 16-BIT PUSH/POP | 32-BIT CALL/RET",
+        x + 22,
+        y + 316,
+        12,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "F7: NEXT WORKSPACE",
+        x + 1320,
+        y + 316,
+        11,
+        COLOR_ACCENT
+    );
+}
+
+/* =========================================
    STATUS BAR (FOOTER)
    ========================================= */
 
@@ -3462,7 +4560,8 @@ static void draw_status_bar(
         TextFormat(
             "SHORTCUTS: F5: %s | F8: Step Phase | F10: Step Instr | F7: %s | F6: Reset CPU",
             gui->auto_run ? "Pause" : "Run",
-            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "Memory View" : "Datapath View"
+            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "Memory View" :
+            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "Stack View" : "Datapath View")
         ),
         35,
         969,
@@ -3473,7 +4572,8 @@ static void draw_status_bar(
     DrawText(
         TextFormat(
             "WORKSPACE: %s | ANIMATION: %s | PHASE: %s",
-            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "DATAPATH" : "MEMORY",
+            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "DATAPATH" :
+            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "MEMORY" : "STACK"),
             gui->auto_run ? "RUNNING" : "PAUSED",
             gui->phase == GUI_PHASE_FETCH ? "FETCH" :
             (gui->phase == GUI_PHASE_DECODE ? "DECODE" :
@@ -3482,7 +4582,9 @@ static void draw_status_bar(
         1050,
         969,
         13,
-        gui->workspace_view == GUI_WORKSPACE_MEMORY ? COLOR_CYAN : (gui->auto_run ? COLOR_GREEN : COLOR_YELLOW)
+        gui->workspace_view == GUI_WORKSPACE_MEMORY ? COLOR_CYAN :
+        (gui->workspace_view == GUI_WORKSPACE_STACK ? COLOR_YELLOW :
+        (gui->auto_run ? COLOR_GREEN : COLOR_YELLOW))
     );
 }
 
@@ -3540,6 +4642,12 @@ int main(void)
 
     gui.memory_base = 0;
 
+    gui.stack_follow_sp = true;
+
+    gui.stack_view_base = cpu.sp;
+
+    gui.stack_event_type = GUI_STACK_EVENT_NONE;
+
     gui.phase_interval = 0.35f;
 
     snprintf(
@@ -3559,6 +4667,16 @@ int main(void)
 
         float delta_time = GetFrameTime();
 
+        if (gui.stack_event_timer > 0.0f) {
+
+            gui.stack_event_timer -= delta_time;
+
+            if (gui.stack_event_timer <= 0.0f) {
+
+                clear_stack_event(&gui);
+            }
+        }
+
 
         /* =================================
            ANIMATION TIMER
@@ -3577,11 +4695,29 @@ int main(void)
 
         if (IsKeyPressed(KEY_F7)) {
 
-            if (gui.workspace_view == GUI_WORKSPACE_DATAPATH) {
+            gui.workspace_view =
+                (gui.workspace_view + 1) % 3;
 
-                gui.workspace_view = GUI_WORKSPACE_MEMORY;
+            if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_DATAPATH
+            ) {
 
-                memory_go_to_cpu_pointer(&cpu, &gui);
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Datapath Viewer opened."
+                );
+
+            } else if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_MEMORY
+            ) {
+
+                memory_go_to_cpu_pointer(
+                    &cpu,
+                    &gui
+                );
 
                 snprintf(
                     gui.status_message,
@@ -3589,14 +4725,20 @@ int main(void)
                     "Memory Viewer opened."
                 );
 
-            } else {
+            } else if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_STACK
+            ) {
 
-                gui.workspace_view = GUI_WORKSPACE_DATAPATH;
+                gui_stack_follow_pointer(
+                    &cpu,
+                    &gui
+                );
 
                 snprintf(
                     gui.status_message,
                     sizeof(gui.status_message),
-                    "Datapath Viewer opened."
+                    "Stack Viewer opened."
                 );
             }
 
@@ -3641,6 +4783,40 @@ int main(void)
 
 
         /* =================================
+           STACK NAVIGATION SHORTCUTS
+           ================================= */
+
+        if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_STACK
+        ) {
+
+            if (IsKeyPressed(KEY_HOME)) {
+
+                gui_stack_follow_pointer(
+                    &cpu,
+                    &gui
+                );
+            }
+
+            if (IsKeyPressed(KEY_PAGE_UP)) {
+
+                gui_stack_view_older(
+                    &gui
+                );
+            }
+
+            if (IsKeyPressed(KEY_PAGE_DOWN)) {
+
+                gui_stack_view_newer(
+                    &cpu,
+                    &gui
+                );
+            }
+        }
+
+
+        /* =================================
            KEYBOARD SHORTCUTS
            ================================= */
 
@@ -3673,6 +4849,13 @@ int main(void)
             cpu_v2_reset(&cpu);
 
             reset_gui_cycle(&gui);
+
+            clear_stack_event(&gui);
+
+            gui_stack_follow_pointer(
+                &cpu,
+                &gui
+            );
         }
 
 
@@ -3741,7 +4924,20 @@ int main(void)
 
         draw_cpu_information(&cpu, &gui);
 
-        if (gui.workspace_view == GUI_WORKSPACE_MEMORY) {
+        if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_DATAPATH
+        ) {
+
+            draw_datapath(
+                &cpu,
+                &gui
+            );
+
+        } else if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_MEMORY
+        ) {
 
             draw_memory_viewer(
                 &cpu,
@@ -3749,9 +4945,16 @@ int main(void)
                 (Rectangle){20, 620, 1560, 335}
             );
 
-        } else {
+        } else if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_STACK
+        ) {
 
-            draw_datapath(&cpu, &gui);
+            draw_stack_viewer(
+                &cpu,
+                &gui,
+                (Rectangle){20, 620, 1560, 335}
+            );
         }
 
 
