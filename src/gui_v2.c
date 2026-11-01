@@ -3,6 +3,7 @@
 #include "cpu_v2.h"
 #include "alu.h"
 #include "assembler.h"
+#include "debugger.h"
 #include "decoder.h"
 #include "memory.h"
 #include "stack.h"
@@ -68,6 +69,17 @@
 #define GUI_WORKSPACE_DATAPATH 0
 #define GUI_WORKSPACE_MEMORY   1
 #define GUI_WORKSPACE_STACK    2
+#define GUI_WORKSPACE_ASSEMBLY 3
+
+#define GUI_SOURCE_CAPACITY 32768u
+
+#define GUI_SOURCE_VISIBLE_ROWS 8
+
+#define GUI_DISASSEMBLY_VISIBLE_ROWS 8
+
+#define GUI_DISASSEMBLY_MAX_ROWS 1024u
+
+#define GUI_DISASSEMBLY_LINE_LENGTH 128u
 
 #define GUI_STACK_VIEW_WORDS 10
 
@@ -91,6 +103,18 @@ typedef enum {
     GUI_STACK_EVENT_RET
 
 } GUIStackEventType;
+
+/* =========================================
+   DISASSEMBLY ROW CACHE
+   ========================================= */
+
+typedef struct {
+
+    uint32_t address;
+
+    char text[GUI_DISASSEMBLY_LINE_LENGTH];
+
+} GUIDisassemblyRow;
 
 /* =========================================
    GUI STATE & TRACKING
@@ -271,7 +295,63 @@ typedef struct {
 
     float stack_event_timer;
 
+
+    /* =========================================
+       ASSEMBLY SOURCE
+       ========================================= */
+
+    char source_text[GUI_SOURCE_CAPACITY];
+
+    size_t source_length;
+
+    uint32_t source_line_count;
+
+    bool source_loaded;
+
+
+    /* =========================================
+       ASSEMBLY RESULT
+       ========================================= */
+
+    bool assembly_valid;
+
+    bool last_assembly_succeeded;
+
+    AssemblerStatus assembly_status;
+
+    uint32_t assembly_error_line;
+
+    uint32_t assembled_code_size;
+
+    uint32_t assembled_instruction_count;
+
+
+    /* =========================================
+       DISASSEMBLY
+       ========================================= */
+
+    DebuggerStatus debugger_status;
+
+    uint32_t disassembly_count;
+
+    uint32_t disassembly_scroll;
+
+    bool disassembly_follow_pc;
+
+    bool disassembly_truncated;
+
+
+    /* =========================================
+       SOURCE NAVIGATION
+       ========================================= */
+
+    uint32_t source_scroll;
+
 } GUIState;
+
+static GUIDisassemblyRow gui_disassembly_rows[
+    GUI_DISASSEMBLY_MAX_ROWS
+];
 
 static const uint16_t FLAG_MASKS[4] = {
     CPU_FLAG_ZF,
@@ -1832,86 +1912,421 @@ static void execute_one_instruction(
 }
 
 /* =========================================
-   LOAD ASSEMBLY PROGRAM
+   ASSEMBLY FILE LOADER & DISASSEMBLER
    ========================================= */
 
-static void load_assembly_program(DioCPU *cpu, GUIState *gui)
+static bool gui_read_assembly_file(
+    const char *path,
+    char *buffer,
+    size_t capacity,
+    size_t *bytes_read
+)
 {
-    FILE *fp = fopen(gui->source_path, "rb");
-    if (!fp) {
+    if (
+        path == NULL ||
+        buffer == NULL ||
+        capacity == 0 ||
+        bytes_read == NULL
+    ) {
+        return false;
+    }
+
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL) {
+        return false;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    long file_size = ftell(file);
+
+    if (
+        file_size < 0 ||
+        (unsigned long)file_size >= capacity
+    ) {
+        fclose(file);
+        return false;
+    }
+
+    rewind(file);
+
+    size_t count = fread(
+        buffer,
+        1,
+        (size_t)file_size,
+        file
+    );
+
+    bool read_error =
+        ferror(file) ||
+        count != (size_t)file_size;
+
+    fclose(file);
+
+    if (read_error) {
+        return false;
+    }
+
+    /*
+     * Reject embedded null bytes.
+     * Assembly source is expected to be text.
+     */
+
+    if (memchr(buffer, '\0', count) != NULL) {
+        return false;
+    }
+
+    buffer[count] = '\0';
+
+    *bytes_read = count;
+
+    return true;
+}
+
+static uint32_t gui_count_source_lines(
+    const char *source
+)
+{
+    if (source == NULL || *source == '\0') {
+        return 0;
+    }
+
+    uint32_t count = 1;
+
+    for (const char *p = source; *p; p++) {
+
+        if (*p == '\n') {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static bool gui_build_disassembly(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    gui->disassembly_count = 0;
+
+    gui->disassembly_scroll = 0;
+
+    gui->disassembly_truncated = false;
+
+    FILE *temporary_file = tmpfile();
+
+    if (temporary_file == NULL) {
+
+        gui->debugger_status =
+            DEBUGGER_STATUS_OUTPUT_ERROR;
+
+        return false;
+    }
+
+    DebuggerResult debugger_result = {0};
+
+    DebuggerStatus status = debugger_disassemble(
+        &cpu->memory,
+        0,
+        gui->assembled_code_size,
+        temporary_file,
+        &debugger_result
+    );
+
+    gui->debugger_status = status;
+
+    if (status != DEBUGGER_STATUS_OK) {
+
+        fclose(temporary_file);
+
+        return false;
+    }
+
+    rewind(temporary_file);
+
+    char line[GUI_DISASSEMBLY_LINE_LENGTH];
+
+    uint32_t stored_rows = 0;
+
+    while (
+        fgets(
+            line,
+            sizeof(line),
+            temporary_file
+        ) != NULL
+    ) {
+
+        if (
+            stored_rows >=
+            GUI_DISASSEMBLY_MAX_ROWS
+        ) {
+            gui->disassembly_truncated = true;
+            break;
+        }
+
+        unsigned int address = 0;
+
+        if (sscanf(line, "%5x:", &address) != 1) {
+            continue;
+        }
+
+        /*
+         * Remove newline from debugger output.
+         */
+
+        line[strcspn(line, "\r\n")] = '\0';
+
+        gui_disassembly_rows[stored_rows].address =
+            (uint32_t)address;
+
+        snprintf(
+            gui_disassembly_rows[stored_rows].text,
+            sizeof(gui_disassembly_rows[stored_rows].text),
+            "%s",
+            line
+        );
+
+        stored_rows++;
+    }
+
+    if (ferror(temporary_file)) {
+
+        fclose(temporary_file);
+
+        gui->debugger_status =
+            DEBUGGER_STATUS_OUTPUT_ERROR;
+
+        gui->disassembly_count = 0;
+
+        return false;
+    }
+
+    fclose(temporary_file);
+
+    gui->disassembly_count = stored_rows;
+
+    if (
+        debugger_result.instruction_count >
+        stored_rows
+    ) {
+
+        gui->disassembly_truncated = true;
+    }
+
+    return true;
+}
+
+static bool gui_load_assembly_program(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (
+        cpu == NULL ||
+        gui == NULL ||
+        gui->source_path[0] == '\0'
+    ) {
         snprintf(
             gui->status_message,
             sizeof(gui->status_message),
-            "Could not open source file: %.140s",
-            gui->source_path
+            "Please enter an Assembly file path."
         );
+
         gui->status_color = COLOR_RED;
-        return;
+
+        return false;
     }
 
-    fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    /*
+     * Read into temporary buffer first.
+     * This preserves the previous source
+     * if reading fails.
+     */
 
-    if (fsize < 0 || fsize > 65536) {
-        fclose(fp);
+    char candidate_source[GUI_SOURCE_CAPACITY];
+
+    size_t candidate_length = 0;
+
+    if (!gui_read_assembly_file(
+            gui->source_path,
+            candidate_source,
+            sizeof(candidate_source),
+            &candidate_length
+        )) {
+
+        gui->last_assembly_succeeded = false;
+
+        gui->assembly_error_line = 0;
+
         snprintf(
             gui->status_message,
             sizeof(gui->status_message),
-            "File size invalid or too large."
+            "Could not read Assembly file."
         );
+
         gui->status_color = COLOR_RED;
-        return;
+
+        return false;
     }
 
-    char *source = (char *)malloc((size_t)fsize + 1);
-    if (!source) {
-        fclose(fp);
-        snprintf(
-            gui->status_message,
-            sizeof(gui->status_message),
-            "Memory allocation failed."
-        );
-        gui->status_color = COLOR_RED;
-        return;
-    }
+    /*
+     * Update displayed source.
+     */
 
-    size_t read_bytes = fread(source, 1, (size_t)fsize, fp);
-    source[read_bytes] = '\0';
-    fclose(fp);
+    memcpy(
+        gui->source_text,
+        candidate_source,
+        candidate_length + 1u
+    );
 
-    cpu_v2_reset(cpu);
+    gui->source_length = candidate_length;
 
-    AssemblerResult result = {0};
-    AssemblerStatus status = assembler_assemble(source, &cpu->memory, &result);
-    free(source);
+    gui->source_line_count =
+        gui_count_source_lines(gui->source_text);
+
+    gui->source_loaded = true;
+
+    gui->source_scroll = 0;
+
+    /*
+     * Assemble the source.
+     */
+
+    AssemblerResult assembler_result = {0};
+
+    AssemblerStatus status = assembler_assemble(
+        gui->source_text,
+        &cpu->memory,
+        &assembler_result
+    );
+
+    gui->assembly_status = status;
+
+    gui->assembly_error_line =
+        assembler_result.error_line;
+
+    gui->last_assembly_succeeded =
+        status == ASSEMBLER_STATUS_OK;
+
+    /*
+     * Assembly failure:
+     * The previous machine code remains intact.
+     */
 
     if (status != ASSEMBLER_STATUS_OK) {
+
         snprintf(
             gui->status_message,
             sizeof(gui->status_message),
-            "Assemble error line %u: %s",
-            (unsigned int)result.error_line,
+            "Assembly error at line %u: %s",
+            (unsigned int)assembler_result.error_line,
             assembler_status_string(status)
         );
+
         gui->status_color = COLOR_RED;
-        return;
+
+        return false;
     }
 
-    gui->program_size = result.code_size;
+    /*
+     * Assembly succeeded.
+     */
+
+    gui->assembled_code_size =
+        assembler_result.code_size;
+
+    gui->assembled_instruction_count =
+        assembler_result.instruction_count;
+
+    gui->assembly_valid = true;
+
+    /*
+     * Reset CPU registers and PC.
+     *
+     * cpu_v2_reset() preserves Memory.
+     */
+
+    CPUStatus reset_status = cpu_v2_reset(cpu);
+
+    if (reset_status != CPU_STATUS_OK) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "CPU reset failed after assembly."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return false;
+    }
+
+    /*
+     * Reset GUI execution state.
+     */
+
     reset_gui_cycle(gui);
-    initialize_state_tracking(gui, cpu);
+
+    clear_alu_visualization(gui);
+
     clear_stack_event(gui);
+
+    initialize_state_tracking(gui, cpu);
+
     gui_stack_follow_pointer(cpu, gui);
+
+    /*
+     * Prepare disassembly cache.
+     */
+
+    bool disassembly_ok =
+        gui_build_disassembly(cpu, gui);
+
+    gui->disassembly_follow_pc = true;
+
+    gui->disassembly_scroll = 0;
+
+    /*
+     * Open Assembly workspace.
+     */
+
+    gui->workspace_view =
+        GUI_WORKSPACE_ASSEMBLY;
+
+    if (!disassembly_ok) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "Assembly loaded, but disassembly failed."
+        );
+
+        gui->status_color = COLOR_YELLOW;
+
+        return true;
+    }
 
     snprintf(
         gui->status_message,
         sizeof(gui->status_message),
-        "Program loaded: %u bytes (%u instructions). Ready.",
-        (unsigned int)result.code_size,
-        (unsigned int)result.instruction_count
+        "Assembly successful: %u instructions, %u bytes.",
+        (unsigned int)gui->assembled_instruction_count,
+        (unsigned int)gui->assembled_code_size
     );
+
     gui->status_color = COLOR_GREEN;
+
+    return true;
+}
+
+static void load_assembly_program(DioCPU *cpu, GUIState *gui)
+{
+    (void)gui_load_assembly_program(cpu, gui);
 }
 
 /* =========================================
@@ -4530,6 +4945,623 @@ static void draw_stack_viewer(
 }
 
 /* =========================================
+   ASSEMBLY WORKSPACE COMPONENTS
+   ========================================= */
+
+static void update_assembly_path_input(
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    Vector2 mouse = GetMousePosition();
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+
+        gui->path_focused =
+            CheckCollisionPointRec(mouse, bounds);
+    }
+
+    if (!gui->path_focused) {
+        return;
+    }
+
+    /*
+     * Type printable ASCII characters.
+     */
+
+    int character = GetCharPressed();
+
+    while (character > 0) {
+
+        size_t length = strlen(gui->source_path);
+
+        if (
+            character >= 32 &&
+            character <= 126 &&
+            length + 1 < sizeof(gui->source_path)
+        ) {
+
+            gui->source_path[length] =
+                (char)character;
+
+            gui->source_path[length + 1] = '\0';
+        }
+
+        character = GetCharPressed();
+    }
+
+    /*
+     * Backspace.
+     */
+
+    if (IsKeyPressed(KEY_BACKSPACE)) {
+
+        size_t length = strlen(gui->source_path);
+
+        if (length > 0) {
+
+            gui->source_path[length - 1] = '\0';
+        }
+    }
+}
+
+static void draw_source_listing(
+    const GUIState *gui,
+    Rectangle bounds
+)
+{
+    DrawRectangleRec(
+        bounds,
+        COLOR_PANEL_ALT
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        1.0f,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        "ASSEMBLY SOURCE",
+        (int)bounds.x + 12,
+        (int)bounds.y + 8,
+        14,
+        COLOR_ACCENT
+    );
+
+    if (!gui->source_loaded) {
+
+        DrawText(
+            "Load an .asm file to display source code.",
+            (int)bounds.x + 15,
+            (int)bounds.y + 45,
+            13,
+            COLOR_MUTED
+        );
+
+        return;
+    }
+
+    const char *cursor = gui->source_text;
+
+    uint32_t line_number = 1;
+
+    uint32_t first_line =
+        gui->source_scroll + 1u;
+
+    uint32_t last_line =
+        first_line + GUI_SOURCE_VISIBLE_ROWS - 1u;
+
+    int row = 0;
+
+    while (cursor != NULL && *cursor != '\0') {
+
+        const char *line_start = cursor;
+
+        const char *newline = strchr(cursor, '\n');
+
+        size_t length = newline
+            ? (size_t)(newline - line_start)
+            : strlen(line_start);
+
+        if (
+            length > 0 &&
+            line_start[length - 1] == '\r'
+        ) {
+
+            length--;
+        }
+
+        if (line_number >= first_line &&
+            line_number <= last_line) {
+
+            int line_y =
+                (int)bounds.y + 34 + row * 20;
+
+            bool error_line =
+                !gui->last_assembly_succeeded &&
+                gui->assembly_error_line == line_number;
+
+            if (error_line) {
+
+                DrawRectangle(
+                    (int)bounds.x + 5,
+                    line_y - 2,
+                    (int)bounds.width - 10,
+                    19,
+                    (Color){75, 30, 35, 255}
+                );
+            }
+
+            DrawText(
+                TextFormat("%03u", (unsigned int)line_number),
+                (int)bounds.x + 12,
+                line_y,
+                11,
+                error_line ? COLOR_RED : COLOR_MUTED
+            );
+
+            char line_text[120];
+
+            size_t copy_length = length;
+
+            if (copy_length >= sizeof(line_text)) {
+                copy_length = sizeof(line_text) - 1u;
+            }
+
+            memcpy(
+                line_text,
+                line_start,
+                copy_length
+            );
+
+            line_text[copy_length] = '\0';
+
+            DrawText(
+                line_text,
+                (int)bounds.x + 55,
+                line_y,
+                12,
+                error_line ? COLOR_RED : COLOR_TEXT
+            );
+
+            row++;
+        }
+
+        if (row >= (int)GUI_SOURCE_VISIBLE_ROWS) {
+            break;
+        }
+
+        if (newline == NULL) {
+            break;
+        }
+
+        cursor = newline + 1;
+
+        line_number++;
+    }
+
+    DrawText(
+        TextFormat(
+            "LINES: %u",
+            (unsigned int)gui->source_line_count
+        ),
+        (int)bounds.x + 12,
+        (int)(bounds.y + bounds.height - 22),
+        10,
+        COLOR_MUTED
+    );
+}
+
+static void draw_disassembly_listing(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    DrawRectangleRec(
+        bounds,
+        COLOR_PANEL_ALT
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        1.0f,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        gui->last_assembly_succeeded
+            ? "MACHINE CODE & DISASSEMBLY"
+            : "LAST SUCCESSFUL MACHINE CODE",
+        (int)bounds.x + 12,
+        (int)bounds.y + 8,
+        14,
+        COLOR_ACCENT
+    );
+
+    if (!gui->assembly_valid) {
+
+        DrawText(
+            "No assembled program available.",
+            (int)bounds.x + 15,
+            (int)bounds.y + 45,
+            13,
+            COLOR_MUTED
+        );
+
+        return;
+    }
+
+    /*
+     * Find current PC in disassembly.
+     */
+
+    if (gui->disassembly_follow_pc) {
+
+        for (
+            uint32_t i = 0;
+            i < gui->disassembly_count;
+            i++
+        ) {
+
+            if (
+                gui_disassembly_rows[i].address ==
+                cpu->pc
+            ) {
+
+                if (i < gui->disassembly_scroll) {
+
+                    gui->disassembly_scroll = i;
+
+                } else if (
+                    i >=
+                    gui->disassembly_scroll +
+                    GUI_DISASSEMBLY_VISIBLE_ROWS
+                ) {
+
+                    gui->disassembly_scroll =
+                        i - GUI_DISASSEMBLY_VISIBLE_ROWS + 1u;
+                }
+
+                break;
+            }
+        }
+    }
+
+    /*
+     * Draw visible disassembly rows.
+     */
+
+    uint32_t end =
+        gui->disassembly_scroll +
+        GUI_DISASSEMBLY_VISIBLE_ROWS;
+
+    if (end > gui->disassembly_count) {
+        end = gui->disassembly_count;
+    }
+
+    int row = 0;
+
+    for (
+        uint32_t i = gui->disassembly_scroll;
+        i < end;
+        i++
+    ) {
+
+        const GUIDisassemblyRow *entry =
+            &gui_disassembly_rows[i];
+
+        int line_y =
+            (int)bounds.y + 34 + row * 20;
+
+        bool current_instruction =
+            entry->address == cpu->pc;
+
+        Color background = current_instruction
+            ? (Color){75, 60, 25, 255}
+            : COLOR_PANEL_ALT;
+
+        Color text_color = current_instruction
+            ? COLOR_YELLOW
+            : COLOR_TEXT;
+
+        DrawRectangle(
+            (int)bounds.x + 5,
+            line_y - 2,
+            (int)bounds.width - 10,
+            19,
+            background
+        );
+
+        DrawText(
+            entry->text,
+            (int)bounds.x + 12,
+            line_y,
+            11,
+            text_color
+        );
+
+        row++;
+    }
+
+    if (gui->disassembly_count == 0) {
+
+        DrawText(
+            "No instructions to display.",
+            (int)bounds.x + 15,
+            (int)bounds.y + 45,
+            13,
+            COLOR_MUTED
+        );
+    }
+
+    DrawText(
+        TextFormat(
+            "INSTRUCTIONS: %u | PC: 0x%05X",
+            (unsigned int)gui->disassembly_count,
+            (unsigned int)cpu->pc
+        ),
+        (int)bounds.x + 12,
+        (int)(bounds.y + bounds.height - 22),
+        10,
+        COLOR_MUTED
+    );
+
+    if (gui->disassembly_truncated) {
+
+        DrawText(
+            "DISPLAY LIMIT: 1024 ROWS",
+            (int)bounds.x + 500,
+            (int)(bounds.y + bounds.height - 22),
+            10,
+            COLOR_YELLOW
+        );
+    }
+}
+
+static void draw_assembly_workspace(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        "ASSEMBLY LOADER & DISASSEMBLY WORKSPACE"
+    );
+
+    /*
+     * =====================================
+     * PATH INPUT
+     * =====================================
+     */
+
+    Rectangle path_bounds = {
+        (float)(x + 20),
+        (float)(y + 45),
+        1080,
+        35
+    };
+
+    update_assembly_path_input(
+        gui,
+        path_bounds
+    );
+
+    DrawRectangleRec(
+        path_bounds,
+        gui->path_focused
+            ? (Color){40, 55, 75, 255}
+            : COLOR_PANEL_ALT
+    );
+
+    DrawRectangleLinesEx(
+        path_bounds,
+        gui->path_focused ? 2.0f : 1.0f,
+        gui->path_focused
+            ? COLOR_CYAN
+            : COLOR_BORDER
+    );
+
+    DrawText(
+        gui->source_path,
+        (int)path_bounds.x + 10,
+        (int)path_bounds.y + 10,
+        13,
+        COLOR_TEXT
+    );
+
+    if (gui->path_focused) {
+
+        DrawText(
+            "_",
+            (int)path_bounds.x +
+                12 +
+                MeasureText(gui->source_path, 13),
+            (int)path_bounds.y + 10,
+            13,
+            COLOR_CYAN
+        );
+    }
+
+    /*
+     * LOAD BUTTON
+     */
+
+    if (draw_button(
+            (Rectangle){
+                (float)(x + 1120),
+                (float)(y + 43),
+                150,
+                40
+            },
+            "LOAD ASSEMBLY"
+        )) {
+
+        gui_load_assembly_program(
+            (DioCPU *)cpu,
+            gui
+        );
+    }
+
+    /*
+     * FOLLOW PC CONTROL
+     */
+
+    if (draw_button(
+            (Rectangle){
+                (float)(x + 1290),
+                (float)(y + 43),
+                235,
+                40
+            },
+            gui->disassembly_follow_pc
+                ? "FOLLOW PC: ON"
+                : "FOLLOW PC: OFF"
+        )) {
+
+        gui->disassembly_follow_pc =
+            !gui->disassembly_follow_pc;
+    }
+
+    /*
+     * ENTER can load the file too.
+     */
+
+    if (
+        gui->path_focused &&
+        IsKeyPressed(KEY_ENTER)
+    ) {
+
+        gui->path_focused = false;
+
+        gui_load_assembly_program(
+            (DioCPU *)cpu,
+            gui
+        );
+    }
+
+    /*
+     * =====================================
+     * SOURCE AND DISASSEMBLY PANELS
+     * =====================================
+     */
+
+    Rectangle source_bounds = {
+        (float)(x + 20),
+        (float)(y + 90),
+        730,
+        230
+    };
+
+    Rectangle disassembly_bounds = {
+        (float)(x + 770),
+        (float)(y + 90),
+        770,
+        230
+    };
+
+    draw_source_listing(
+        gui,
+        source_bounds
+    );
+
+    draw_disassembly_listing(
+        cpu,
+        gui,
+        disassembly_bounds
+    );
+
+    /*
+     * =====================================
+     * SCROLL CONTROLS
+     * =====================================
+     */
+
+    if (IsKeyPressed(KEY_PAGE_UP)) {
+
+        if (gui->source_scroll > 0) {
+            gui->source_scroll =
+                gui->source_scroll > GUI_SOURCE_VISIBLE_ROWS
+                    ? gui->source_scroll - GUI_SOURCE_VISIBLE_ROWS
+                    : 0;
+        }
+
+        gui->disassembly_scroll =
+            gui->disassembly_scroll > GUI_DISASSEMBLY_VISIBLE_ROWS
+                ? gui->disassembly_scroll -
+                    GUI_DISASSEMBLY_VISIBLE_ROWS
+                : 0;
+    }
+
+    if (IsKeyPressed(KEY_PAGE_DOWN)) {
+
+        if (
+            gui->source_scroll +
+            GUI_SOURCE_VISIBLE_ROWS <
+            gui->source_line_count
+        ) {
+
+            gui->source_scroll +=
+                GUI_SOURCE_VISIBLE_ROWS;
+        }
+
+        if (
+            gui->disassembly_scroll +
+            GUI_DISASSEMBLY_VISIBLE_ROWS <
+            gui->disassembly_count
+        ) {
+
+            gui->disassembly_scroll +=
+                GUI_DISASSEMBLY_VISIBLE_ROWS;
+        }
+    }
+
+    /*
+     * =====================================
+     * PROGRAM INFORMATION
+     * =====================================
+     */
+
+    DrawText(
+        TextFormat(
+            "CODE SIZE: %u BYTES",
+            (unsigned int)gui->assembled_code_size
+        ),
+        x + 22,
+        y + 326,
+        11,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        TextFormat(
+            "INSTRUCTION COUNT: %u",
+            (unsigned int)gui->assembled_instruction_count
+        ),
+        x + 260,
+        y + 326,
+        11,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        "F7: NEXT WORKSPACE | PAGE UP/DOWN: SCROLL",
+        x + 950,
+        y + 326,
+        11,
+        COLOR_MUTED
+    );
+}
+
+/* =========================================
    STATUS BAR (FOOTER)
    ========================================= */
 
@@ -4561,7 +5593,8 @@ static void draw_status_bar(
             "SHORTCUTS: F5: %s | F8: Step Phase | F10: Step Instr | F7: %s | F6: Reset CPU",
             gui->auto_run ? "Pause" : "Run",
             gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "Memory View" :
-            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "Stack View" : "Datapath View")
+            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "Stack View" :
+            (gui->workspace_view == GUI_WORKSPACE_STACK ? "Assembly View" : "Datapath View"))
         ),
         35,
         969,
@@ -4573,7 +5606,8 @@ static void draw_status_bar(
         TextFormat(
             "WORKSPACE: %s | ANIMATION: %s | PHASE: %s",
             gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "DATAPATH" :
-            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "MEMORY" : "STACK"),
+            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "MEMORY" :
+            (gui->workspace_view == GUI_WORKSPACE_STACK ? "STACK" : "ASSEMBLY")),
             gui->auto_run ? "RUNNING" : "PAUSED",
             gui->phase == GUI_PHASE_FETCH ? "FETCH" :
             (gui->phase == GUI_PHASE_DECODE ? "DECODE" :
@@ -4584,7 +5618,8 @@ static void draw_status_bar(
         13,
         gui->workspace_view == GUI_WORKSPACE_MEMORY ? COLOR_CYAN :
         (gui->workspace_view == GUI_WORKSPACE_STACK ? COLOR_YELLOW :
-        (gui->auto_run ? COLOR_GREEN : COLOR_YELLOW))
+        (gui->workspace_view == GUI_WORKSPACE_ASSEMBLY ? COLOR_GREEN :
+        (gui->auto_run ? COLOR_GREEN : COLOR_YELLOW)))
     );
 }
 
@@ -4636,7 +5671,7 @@ int main(void)
         );
     }
 
-    gui.workspace_view = GUI_WORKSPACE_DATAPATH;
+    gui.workspace_view = GUI_WORKSPACE_ASSEMBLY;
 
     gui.memory_view = GUI_MEMORY_VIEW_INSTRUCTION;
 
@@ -4648,19 +5683,27 @@ int main(void)
 
     gui.stack_event_type = GUI_STACK_EVENT_NONE;
 
+    gui.disassembly_follow_pc = true;
+
+    gui.source_scroll = 0;
+
+    gui.disassembly_scroll = 0;
+
+    gui.disassembly_count = 0;
+
     gui.phase_interval = 0.35f;
 
     snprintf(
         gui.source_path,
         sizeof(gui.source_path),
-        "examples/gui_v2_cycle.asm"
+        "programs/gui_v2_test.asm"
     );
 
     reset_gui_cycle(&gui);
 
     initialize_state_tracking(&gui, &cpu);
 
-    load_assembly_program(&cpu, &gui);
+    gui_load_assembly_program(&cpu, &gui);
 
 
     while (!WindowShouldClose()) {
@@ -4696,7 +5739,7 @@ int main(void)
         if (IsKeyPressed(KEY_F7)) {
 
             gui.workspace_view =
-                (gui.workspace_view + 1) % 3;
+                (gui.workspace_view + 1) % 4;
 
             if (
                 gui.workspace_view ==
@@ -4739,6 +5782,17 @@ int main(void)
                     gui.status_message,
                     sizeof(gui.status_message),
                     "Stack Viewer opened."
+                );
+
+            } else if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_ASSEMBLY
+            ) {
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Assembly Viewer opened."
                 );
             }
 
@@ -4951,6 +6005,17 @@ int main(void)
         ) {
 
             draw_stack_viewer(
+                &cpu,
+                &gui,
+                (Rectangle){20, 620, 1560, 335}
+            );
+
+        } else if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_ASSEMBLY
+        ) {
+
+            draw_assembly_workspace(
                 &cpu,
                 &gui,
                 (Rectangle){20, 620, 1560, 335}
