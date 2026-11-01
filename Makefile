@@ -8,7 +8,7 @@ cli: dio_cpu.exe
 
 gui: dio8_gui.exe
 
-test: tests_cpu.exe tests_alu.exe
+test: tests_cpu.exe tests_alu.exe tests_memory.exe
 
 dio_cpu.exe: src/main.c src/cpu.c src/assembler.c
 	$(CC) -Wall -Wextra -Wpedantic -I./src -o $@ $^
@@ -22,7 +22,13 @@ tests_cpu.exe: tests/tests_cpu.c src/cpu.c
 tests_alu.exe: tests/tests_alu.c src/alu.c src/alu.h
 	$(CC) $(CFLAGS) -o $@ tests/tests_alu.c src/alu.c
 
-clean:
-	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe test_v2_cpu_state.exe *.o
+tests_memory.exe: tests/tests_memory.c src/memory.c src/memory.h
+	$(CC) $(CFLAGS) -o $@ tests/tests_memory.c src/memory.c
 
-.PHONY: all cli gui test clean
+memory-test: tests_memory.exe
+	./tests_memory.exe
+
+clean:
+	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe test_v2_cpu_state.exe *.o
+
+.PHONY: all cli gui test clean memory-test
