@@ -1,6 +1,6 @@
-# DioCPU V2 — 16-Bit Architecture & Interactive Simulator
+# DioCPU — 16-Bit Architecture & Interactive Simulator
 
-DioCPU V2 is a 16-bit Harvard architecture computer system implemented in portable C11 with an interactive, animated visual simulator built using Raylib.
+DioCPU is a custom 16-bit Harvard architecture computer system implemented in portable C11 with an interactive, animated visual simulator built using Raylib.
 
 ---
 
@@ -41,7 +41,7 @@ DioCPU V2 is a 16-bit Harvard architecture computer system implemented in portab
 
 ---
 
-## 3. DioCPU V2 GUI Architecture
+## 3. Interactive GUI Architecture
 
 The interactive visual simulator provides an educational, real-time window into the CPU internals with 4 swappable workspaces:
 
@@ -86,7 +86,7 @@ The interactive visual simulator provides an educational, real-time window into 
 The visual animation system simulates **instruction-level phases** (`FETCH`, `DECODE`, `EXECUTE`):
 1. **FETCH**: Reads opcode and operand bytes from Instruction Memory at `PC`.
 2. **DECODE**: Decodes instruction type, fetches register inputs, and prepares ALU/Stack preview.
-3. **EXECUTE**: Commits operations to the core execution engine (`cpu_v2_step()`), writes back results, and updates flags.
+3. **EXECUTE**: Commits operations to the core execution engine (`cpu_step()`), writes back results, and updates flags.
 
 > [!NOTE]
 > The GUI is designed as an instruction-level phase visualizer rather than a cycle-accurate hardware micro-operation engine. This design guarantees consistent, deterministic execution while providing maximum educational clarity.
@@ -100,23 +100,23 @@ The visual animation system simulates **instruction-level phases** (`FETCH`, `DE
 - Raylib library (`-lraylib`)
 - MSYS2 UCRT64 / MinGW-w64 on Windows
 
-### Build Everything
+### Build All Executables & Run Tests
 ```bash
 make all
 ```
 
-### Run DioCPU V2 CLI
+### Run DioCPU CLI
 ```bash
-# Assemble and run an assembly file
-./diocpu_v2.exe programs/gui_v2_fibonacci.asm
+# Assemble and run an assembly program
+./diocpu.exe programs/fibonacci.asm
 ```
 
-### Run DioCPU V2 Interactive GUI
+### Run DioCPU Interactive GUI
 ```bash
-./diocpu_v2_gui.exe
+./diocpu_gui.exe
 ```
 
-### Run All Unit and Integration Tests
+### Run Automated Test Suites
 ```bash
 make test
 ```
@@ -125,12 +125,12 @@ make test
 
 ## 7. Example Programs (`programs/`)
 
-- [`programs/gui_v2_test.asm`](programs/gui_v2_test.asm): Default program demonstrating LOADI, STORE, LOAD, and ADD.
-- [`programs/gui_v2_fibonacci.asm`](programs/gui_v2_fibonacci.asm): Computes Fibonacci sequence and writes results into Data Memory.
-- [`programs/gui_v2_subroutine.asm`](programs/gui_v2_subroutine.asm): Demonstrates nested subroutines, stack push/pop, and call/ret.
-- [`programs/gui_v2_math.asm`](programs/gui_v2_math.asm): Full ALU and FLAGS demonstration (Zero, Carry, Sign, Overflow).
-- [`programs/gui_v2_fault_demo.asm`](programs/gui_v2_fault_demo.asm): Demonstrates Divide-by-Zero fault detection and automatic safe auto-stop.
-- [`programs/gui_v2_error.asm`](programs/gui_v2_error.asm): Demonstrates assembler error line detection.
+- [`programs/test.asm`](programs/test.asm): Default program demonstrating LOADI, STORE, LOAD, and ADD.
+- [`programs/fibonacci.asm`](programs/fibonacci.asm): Computes Fibonacci sequence and writes results into Data Memory.
+- [`programs/subroutine.asm`](programs/subroutine.asm): Demonstrates nested subroutines, stack push/pop, and call/ret.
+- [`programs/math.asm`](programs/math.asm): Full ALU and FLAGS demonstration (Zero, Carry, Sign, Overflow).
+- [`programs/fault_demo.asm`](programs/fault_demo.asm): Demonstrates Divide-by-Zero fault detection and automatic safe auto-stop.
+- [`programs/error_demo.asm`](programs/error_demo.asm): Demonstrates assembler error line detection.
 
 ---
 

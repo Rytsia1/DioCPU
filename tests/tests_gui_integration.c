@@ -2,7 +2,7 @@
 #include <string.h>
 
 #define main raylib_gui_v2_main
-#include "gui_v2.c"
+#include "gui.c"
 #undef main
 
 #define CHECK(condition)                                               \
@@ -28,7 +28,7 @@ static GUIState test_gui;
 
 static void setup_test_gui(void)
 {
-    cpu_v2_init(&test_cpu);
+    cpu_init(&test_cpu);
     memset(&test_gui, 0, sizeof(test_gui));
     test_gui.auto_run = false;
     test_gui.phase_timer = 0.0f;
@@ -84,7 +84,7 @@ static int test_gui_assembly_loading_and_disassembly_sync(void)
     setup_test_gui();
 
     /* Load valid test program */
-    snprintf(test_gui.source_path, sizeof(test_gui.source_path), "programs/gui_v2_test.asm");
+    snprintf(test_gui.source_path, sizeof(test_gui.source_path), "programs/test.asm");
     CHECK(gui_load_assembly_program(&test_cpu, &test_gui) == true);
 
     CHECK(test_gui.assembly_valid == true);
@@ -100,7 +100,7 @@ static int test_gui_assembly_loading_and_disassembly_sync(void)
     CHECK(gui_disassembly_rows[0].address == 0x00000);
 
     /* Load invalid program and verify error handling */
-    snprintf(test_gui.source_path, sizeof(test_gui.source_path), "programs/gui_v2_error.asm");
+    snprintf(test_gui.source_path, sizeof(test_gui.source_path), "programs/error_demo.asm");
     CHECK(gui_load_assembly_program(&test_cpu, &test_gui) == false);
     CHECK(test_gui.last_assembly_succeeded == false);
     CHECK(test_gui.assembly_error_line == 2);
@@ -444,7 +444,7 @@ int main(void)
 {
     unsigned int passed = 0;
 
-    printf("=== Running DioCPU GUI V2 Integration Test Suite ===\n\n");
+    printf("=== Running DioCPU GUI Integration Test Suite ===\n\n");
 
     RUN_TEST(test_gui_init_and_reset);
     RUN_TEST(test_gui_assembly_loading_and_disassembly_sync);
@@ -455,7 +455,7 @@ int main(void)
     RUN_TEST(test_gui_controller_lifecycle);
     RUN_TEST(test_gui_fault_handling_and_auto_stop);
 
-    printf("\nGUI V2 Integration Tests: %u passed.\n", passed);
+    printf("\nGUI Integration Tests: %u passed.\n", passed);
 
     return 0;
 }

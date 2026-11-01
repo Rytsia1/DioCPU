@@ -1,391 +1,329 @@
-#include <stdio.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <assert.h>
-
 #include "cpu.h"
 
-static int total_tests = 0;
-static int passed_tests = 0;
-static int failed_tests = 0;
+#include "assembler.h"
+#include "memory.h"
+#include "stack.h"
 
-#define ASSERT_TRUE(condition) do { \
-    if (!(condition)) { \
-        printf("FAILED (line %d: %s)\n", __LINE__, #condition); \
-        failed_tests++; \
-        return; \
-    } \
-} while (0)
+#include <stdio.h>
 
-#define ASSERT_EQ(a, b) do { \
-    if ((a) != (b)) { \
-        printf("FAILED (line %d: %s == %s [%u != %u])\n", __LINE__, #a, #b, (unsigned)(a), (unsigned)(b)); \
-        failed_tests++; \
-        return; \
-    } \
-} while (0)
+#define CHECK(condition)                                      \
+    do {                                                      \
+        if (!(condition)) {                                   \
+            fprintf(stderr, "FAILED: %s:%d: %s\n",             \
+                    __FILE__, __LINE__, #condition);          \
+            return 0;                                         \
+        }                                                     \
+    } while (0)
 
-#define RUN_TEST(fn) do { \
-    total_tests++; \
-    int prev_failed = failed_tests; \
-    fn(); \
-    if (failed_tests == prev_failed) { \
-        passed_tests++; \
-    } \
-} while (0)
 
-static void test_cpu_init(void) {
-    CPU cpu;
-    cpu_init(&cpu);
+static DioCPU cpu;
 
-    for (int i = 0; i < REGISTER_COUNT; i++) {
-        ASSERT_EQ(cpu.registers[i], 0);
-    }
-    ASSERT_EQ(cpu.pc, 0);
-    ASSERT_EQ(cpu.sp, MEMORY_SIZE - 1);
-    ASSERT_TRUE(!cpu.zero_flag);
-    ASSERT_TRUE(!cpu.carry_flag);
-    ASSERT_TRUE(!cpu.halted);
-}
 
-static void test_load_basic(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_LOAD;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 42;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.registers[0], 42);
-    ASSERT_EQ(cpu.pc, 3);
-}
-
-static void test_load_zero_flag_set(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_LOAD;
-    cpu.memory[1] = 1;
-    cpu.memory[2] = 0;
-
-    cpu_step(&cpu);
-    ASSERT_TRUE(cpu.zero_flag);
-}
-
-static void test_load_zero_flag_cleared(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.zero_flag = true;
-    cpu.memory[0] = OP_LOAD;
-    cpu.memory[1] = 2;
-    cpu.memory[2] = 10;
-
-    cpu_step(&cpu);
-    ASSERT_TRUE(!cpu.zero_flag);
-}
-
-static void test_load_invalid_register(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_LOAD;
-    cpu.memory[1] = REGISTER_COUNT;
-    cpu.memory[2] = 10;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(!ok);
-    ASSERT_TRUE(cpu.halted);
-}
-
-static void test_add_basic(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 15;
-    cpu.registers[1] = 25;
-    cpu.memory[0] = OP_ADD;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 1;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.registers[0], 40);
-    ASSERT_TRUE(!cpu.carry_flag);
-    ASSERT_TRUE(!cpu.zero_flag);
-}
-
-static void test_add_zero_flag(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 0;
-    cpu.registers[1] = 0;
-    cpu.memory[0] = OP_ADD;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 1;
-
-    cpu_step(&cpu);
-    ASSERT_EQ(cpu.registers[0], 0);
-    ASSERT_TRUE(cpu.zero_flag);
-}
-
-static void test_add_carry_flag(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 200;
-    cpu.registers[1] = 100;
-    cpu.memory[0] = OP_ADD;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 1;
-
-    cpu_step(&cpu);
-    ASSERT_EQ(cpu.registers[0], (uint8_t)(200 + 100));
-    ASSERT_TRUE(cpu.carry_flag);
-    ASSERT_TRUE(!cpu.zero_flag);
-}
-
-static void test_add_invalid_register(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_ADD;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = REGISTER_COUNT;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(!ok);
-    ASSERT_TRUE(cpu.halted);
-}
-
-static void test_sub_basic(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 50;
-    cpu.registers[1] = 20;
-    cpu.memory[0] = OP_SUB;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 1;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.registers[0], 30);
-    ASSERT_TRUE(!cpu.carry_flag);
-    ASSERT_TRUE(!cpu.zero_flag);
-}
-
-static void test_sub_zero_flag(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 25;
-    cpu.registers[1] = 25;
-    cpu.memory[0] = OP_SUB;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 1;
-
-    cpu_step(&cpu);
-    ASSERT_EQ(cpu.registers[0], 0);
-    ASSERT_TRUE(cpu.zero_flag);
-    ASSERT_TRUE(!cpu.carry_flag);
-}
-
-static void test_sub_carry_flag_borrow(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 10;
-    cpu.registers[1] = 20;
-    cpu.memory[0] = OP_SUB;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 1;
-
-    cpu_step(&cpu);
-    ASSERT_EQ(cpu.registers[0], (uint8_t)(10 - 20));
-    ASSERT_TRUE(cpu.carry_flag);
-}
-
-static void test_sub_invalid_register(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_SUB;
-    cpu.memory[1] = REGISTER_COUNT;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(!ok);
-    ASSERT_TRUE(cpu.halted);
-}
-
-static void test_jmp(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_JMP;
-    cpu.memory[1] = 0x12;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.pc, 0x12);
-}
-
-static void test_jz_taken(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.zero_flag = true;
-    cpu.memory[0] = OP_JZ;
-    cpu.memory[1] = 0x15;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.pc, 0x15);
-}
-
-static void test_jz_not_taken(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.zero_flag = false;
-    cpu.memory[0] = OP_JZ;
-    cpu.memory[1] = 0x15;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.pc, 3);
-}
-
-static void test_jnz_taken(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.zero_flag = false;
-    cpu.memory[0] = OP_JNZ;
-    cpu.memory[1] = 0x18;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.pc, 0x18);
-}
-
-static void test_jnz_not_taken(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.zero_flag = true;
-    cpu.memory[0] = OP_JNZ;
-    cpu.memory[1] = 0x18;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(cpu.pc, 3);
-}
-
-static void test_out_register(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.registers[0] = 77;
-    cpu.memory[0] = OP_OUT;
-    cpu.memory[1] = OUT_MODE_REGISTER;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_TRUE(!cpu.halted);
-}
-
-static void test_out_immediate(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_OUT;
-    cpu.memory[1] = OUT_MODE_IMMEDIATE;
-    cpu.memory[2] = 88;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(ok);
-    ASSERT_TRUE(!cpu.halted);
-}
-
-static void test_out_invalid_mode(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_OUT;
-    cpu.memory[1] = 0x05;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(!ok);
-    ASSERT_TRUE(cpu.halted);
-}
-
-static void test_out_invalid_register(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_OUT;
-    cpu.memory[1] = OUT_MODE_REGISTER;
-    cpu.memory[2] = REGISTER_COUNT;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(!ok);
-    ASSERT_TRUE(cpu.halted);
-}
-
-static void test_hlt(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    cpu.memory[0] = OP_HLT;
-    cpu.memory[1] = 0;
-    cpu.memory[2] = 0;
-
-    bool ok = cpu_step(&cpu);
-    ASSERT_TRUE(!ok);
-    ASSERT_TRUE(cpu.halted);
-}
-
-static void test_cpu_run(void) {
-    CPU cpu;
-    cpu_init(&cpu);
-    uint8_t program[] = {
-        OP_LOAD, 0, 3,
-        OP_LOAD, 1, 1,
-        OP_SUB,  0, 1,
-        OP_JNZ,  6, 0,
-        OP_HLT,  0, 0
-    };
-    for (size_t i = 0; i < sizeof(program); i++) {
-        cpu.memory[i] = program[i];
+static int prepare_cpu(const char *source)
+{
+    if (cpu_init(&cpu) != CPU_STATUS_OK) {
+        return 0;
     }
 
-    cpu_run(&cpu);
-    ASSERT_TRUE(cpu.halted);
-    ASSERT_EQ(cpu.registers[0], 0);
-    ASSERT_EQ(cpu.registers[1], 1);
-    ASSERT_TRUE(cpu.zero_flag);
+    AssemblerResult result;
+
+    if (assembler_assemble(
+            source,
+            &cpu.memory,
+            &result
+        ) != ASSEMBLER_STATUS_OK) {
+
+        fprintf(
+            stderr,
+            "Assembly error at line %u: %s\n",
+            (unsigned int)result.error_line,
+            assembler_status_string(result.status)
+        );
+
+        return 0;
+    }
+
+    return cpu_reset(&cpu) == CPU_STATUS_OK;
 }
 
-int main(void) {
-    printf("=== Running Dio-8 CPU Unit Tests ===\n\n");
+static int test_full_integration(void)
+{
+    const char *program =
+        "LOADI R1, 10\n"
+        "LOADI R2, 20\n"
+        "ADD R1, R2\n"
+        "LOADI R3, 0x0100\n"
+        "STORE R1, [0x0100]\n"
+        "LOAD R4, [0x0100]\n"
+        "CMP R4, R1\n"
+        "JZ EQUAL\n"
+        "LOADI R5, 0\n"
+        "JMP FINISH\n"
+        "EQUAL:\n"
+        "CALL DOUBLE\n"
+        "PUSH R1\n"
+        "POP R6\n"
+        "FINISH:\n"
+        "HLT\n"
+        "DOUBLE:\n"
+        "LOADI R7, 2\n"
+        "MUL R1, R7\n"
+        "RET\n";
 
-    RUN_TEST(test_cpu_init);
-    RUN_TEST(test_load_basic);
-    RUN_TEST(test_load_zero_flag_set);
-    RUN_TEST(test_load_zero_flag_cleared);
-    RUN_TEST(test_load_invalid_register);
-    RUN_TEST(test_add_basic);
-    RUN_TEST(test_add_zero_flag);
-    RUN_TEST(test_add_carry_flag);
-    RUN_TEST(test_add_invalid_register);
-    RUN_TEST(test_sub_basic);
-    RUN_TEST(test_sub_zero_flag);
-    RUN_TEST(test_sub_carry_flag_borrow);
-    RUN_TEST(test_sub_invalid_register);
-    RUN_TEST(test_jmp);
-    RUN_TEST(test_jz_taken);
-    RUN_TEST(test_jz_not_taken);
-    RUN_TEST(test_jnz_taken);
-    RUN_TEST(test_jnz_not_taken);
-    RUN_TEST(test_out_register);
-    RUN_TEST(test_out_immediate);
-    RUN_TEST(test_out_invalid_mode);
-    RUN_TEST(test_out_invalid_register);
-    RUN_TEST(test_hlt);
-    RUN_TEST(test_cpu_run);
+    CHECK(prepare_cpu(program));
 
-    printf("\nResult: %d tests, %d failed, %d passed\n",
-           total_tests, failed_tests, passed_tests);
+    uint64_t steps = 0;
 
-    return (failed_tests == 0) ? 0 : 1;
+    CPUStatus status = cpu_run(
+        &cpu,
+        100,
+        &steps
+    );
+
+    CHECK(status == CPU_STATUS_HALTED);
+
+    CHECK(cpu.state == CPU_STATE_HALTED);
+
+    CHECK(cpu.gpr[1] == 60);
+    CHECK(cpu.gpr[2] == 20);
+    CHECK(cpu.gpr[3] == 0x0100);
+    CHECK(cpu.gpr[4] == 30);
+    CHECK(cpu.gpr[5] == 0);
+    CHECK(cpu.gpr[6] == 60);
+    CHECK(cpu.gpr[7] == 2);
+
+    CHECK(cpu.sp == DIOCPU_STACK_INITIAL_SP);
+
+    CHECK((cpu.flags & CPU_FLAG_ZF) == 0);
+
+    CHECK(steps == 15 || steps == 14);
+
+    uint16_t memory_value = 0;
+
+    CHECK(
+        memory_data_read16(
+            &cpu.memory,
+            0x0100,
+            &memory_value
+        ) == MEMORY_STATUS_OK
+    );
+
+    CHECK(memory_value == 30);
+
+    return 1;
+}
+
+static int test_call_ret(void)
+{
+    const char *program =
+        "CALL FUNCTION\n"
+        "HLT\n"
+        "FUNCTION:\n"
+        "LOADI R7, 0xBEEF\n"
+        "RET\n";
+
+    CHECK(prepare_cpu(program));
+
+    uint64_t steps = 0;
+
+    CHECK(
+        cpu_run(&cpu, 20, &steps) ==
+        CPU_STATUS_HALTED
+    );
+
+    CHECK(cpu.gpr[7] == 0xBEEF);
+
+    CHECK(cpu.pc == 5);
+
+    CHECK(cpu.sp == DIOCPU_STACK_INITIAL_SP);
+
+    CHECK(steps == 4);
+
+    return 1;
+}
+
+static int test_division(void)
+{
+    const char *program =
+        "LOADI R1, 20\n"
+        "LOADI R2, 6\n"
+        "DIV R1, R2\n"
+        "HLT\n";
+
+    CHECK(prepare_cpu(program));
+
+    uint64_t steps = 0;
+
+    CHECK(
+        cpu_run(&cpu, 20, &steps) ==
+        CPU_STATUS_HALTED
+    );
+
+    CHECK(cpu.gpr[1] == 3);
+    CHECK(cpu.gpr[2] == 2);
+
+    return 1;
+}
+
+static int test_divide_by_zero_fault(void)
+{
+    const char *program =
+        "LOADI R1, 0\n"
+        "LOADI R2, 0\n"
+        "ADD R1, R2\n"
+        "LOADI R3, 10\n"
+        "LOADI R4, 0\n"
+        "DIV R3, R4\n";
+
+    CHECK(prepare_cpu(program));
+
+    uint64_t steps = 0;
+
+    CHECK(
+        cpu_run(&cpu, 20, &steps) ==
+        CPU_STATUS_FAULTED
+    );
+
+    CHECK(cpu.state == CPU_STATE_FAULTED);
+
+    CHECK(cpu.fault == CPU_FAULT_DIVIDE_BY_ZERO);
+
+    CHECK(cpu.fault_pc == 18);
+    CHECK(cpu.pc == 18);
+
+    CHECK(cpu.gpr[3] == 10);
+    CHECK(cpu.gpr[4] == 0);
+
+    CHECK((cpu.flags & CPU_FLAG_ZF) != 0);
+
+    CHECK(steps == 5);
+
+    return 1;
+}
+
+static int test_stack_memory_protection(void)
+{
+    const char *program =
+        "LOADI R1, 0x1234\n"
+        "STORE R1, [0x30000]\n";
+
+    CHECK(prepare_cpu(program));
+
+    uint64_t steps = 0;
+
+    CHECK(
+        cpu_run(&cpu, 10, &steps) ==
+        CPU_STATUS_FAULTED
+    );
+
+    CHECK(
+        cpu.fault == CPU_FAULT_MEMORY_ACCESS_FAULT
+    );
+
+    CHECK(cpu.pc == 4);
+
+    CHECK(cpu.sp == DIOCPU_STACK_INITIAL_SP);
+
+    CHECK(cpu.memory.data[DIOCPU_STACK_BOTTOM] == 0);
+
+    return 1;
+}
+
+static int test_stack_underflow(void)
+{
+    const char *program =
+        "POP R1\n";
+
+    CHECK(prepare_cpu(program));
+
+    cpu.gpr[1] = 0xABCD;
+
+    CHECK(cpu_step(&cpu) == CPU_STATUS_FAULTED);
+
+    CHECK(cpu.fault == CPU_FAULT_STACK_UNDERFLOW);
+
+    CHECK(cpu.pc == 0);
+
+    CHECK(cpu.sp == DIOCPU_STACK_INITIAL_SP);
+
+    CHECK(cpu.gpr[1] == 0xABCD);
+
+    return 1;
+}
+
+static int test_invalid_opcode(void)
+{
+    CHECK(cpu_init(&cpu) == CPU_STATUS_OK);
+
+    CHECK(
+        memory_instruction_write8(
+            &cpu.memory,
+            0,
+            0xFF
+        ) == MEMORY_STATUS_OK
+    );
+
+    CHECK(cpu_step(&cpu) == CPU_STATUS_FAULTED);
+
+    CHECK(cpu.fault == CPU_FAULT_INVALID_OPCODE);
+
+    CHECK(cpu.pc == 0);
+
+    CHECK(cpu.state == CPU_STATE_FAULTED);
+
+    return 1;
+}
+
+static int test_instruction_limit(void)
+{
+    const char *program =
+        "LOOP:\n"
+        "JMP LOOP\n";
+
+    CHECK(prepare_cpu(program));
+
+    uint64_t steps = 0;
+
+    CHECK(
+        cpu_run(&cpu, 3, &steps) ==
+        CPU_STATUS_STEP_LIMIT_REACHED
+    );
+
+    CHECK(steps == 3);
+
+    CHECK(cpu.pc == 0);
+
+    CHECK(cpu.state == CPU_STATE_RUNNING);
+
+    CHECK(cpu.instructions_executed == 3);
+
+    return 1;
+}
+
+#define RUN_TEST(test_function)                         \
+    do {                                                \
+        if (!test_function()) {                         \
+            return 1;                                   \
+        }                                               \
+        printf("[PASS] %s\n", #test_function);          \
+        passed++;                                       \
+    } while (0)
+
+
+int main(void)
+{
+    unsigned int passed = 0;
+
+    RUN_TEST(test_full_integration);
+    RUN_TEST(test_call_ret);
+    RUN_TEST(test_division);
+    RUN_TEST(test_divide_by_zero_fault);
+    RUN_TEST(test_stack_memory_protection);
+    RUN_TEST(test_stack_underflow);
+    RUN_TEST(test_invalid_opcode);
+    RUN_TEST(test_instruction_limit);
+
+    printf("\nCPU V2 tests: %u passed.\n", passed);
+
+    return 0;
 }

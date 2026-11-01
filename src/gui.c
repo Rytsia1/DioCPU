@@ -1,1487 +1,6506 @@
 #include "raylib.h"
+
 #include "cpu.h"
-#include "assembler_dio8.h"
+#include "alu.h"
+#include "assembler.h"
+#include "debugger.h"
+#include "decoder.h"
+#include "memory.h"
+#include "stack.h"
 
 #include <stdio.h>
-#include <string.h>
+#include <stdint.h>
 #include <stdbool.h>
-#include <math.h>
+#include <string.h>
+#include <stdlib.h>
 
-#define SCREEN_WIDTH 1280
-#define SCREEN_HEIGHT 800
-#define MAX_INPUT_CHARS 128
+/* =========================================
+   WINDOW CONFIGURATION
+   ========================================= */
 
-// Warna antarmuka
-#define COLOR_BG        (Color){20, 24, 32, 255}
-#define COLOR_PANEL     (Color){32, 38, 50, 255}
-#define COLOR_BORDER    (Color){55, 68, 86, 255}
-#define COLOR_ACCENT    (Color){70, 170, 230, 255}
-#define COLOR_TEXT      (Color){230, 235, 245, 255}
-#define COLOR_MUTED     (Color){135, 148, 168, 255}
-#define COLOR_HIGHLIGHT (Color){45, 100, 130, 255}
+#define SCREEN_WIDTH 1600
+#define SCREEN_HEIGHT 1000
 
-// Warna siklus instruksi (Fetch - Decode - Execute)
-#define COLOR_FETCH     (Color){245, 185, 55, 255}   // Emas / Kuning hangat
-#define COLOR_DECODE    (Color){70, 195, 245, 255}   // Biru muda / Cyan
-#define COLOR_EXECUTE   (Color){60, 220, 130, 255}   // Hijau zamrud
+#define FPS 60
 
-// Enum fase siklus instruksi
+/* =========================================
+   COLOR PALETTE
+   ========================================= */
+
+#define COLOR_BACKGROUND  (Color){18, 22, 30, 255}
+#define COLOR_PANEL       (Color){30, 36, 47, 255}
+#define COLOR_PANEL_ALT   (Color){38, 45, 58, 255}
+#define COLOR_BORDER      (Color){60, 72, 90, 255}
+
+#define COLOR_TEXT        (Color){230, 235, 245, 255}
+#define COLOR_MUTED       (Color){135, 148, 168, 255}
+#define COLOR_ACCENT      (Color){75, 175, 235, 255}
+
+#define COLOR_GREEN       (Color){60, 220, 130, 255}
+#define COLOR_YELLOW      (Color){245, 185, 55, 255}
+#define COLOR_RED         (Color){235, 75, 75, 255}
+#define COLOR_CYAN        (Color){70, 195, 245, 255}
+
+/* Color aliases requested by GUI-V2 specifications */
+#define FETCH_COLOR       COLOR_YELLOW
+#define DECODE_COLOR      COLOR_CYAN
+#define EXECUTE_COLOR     COLOR_GREEN
+#define FAULT_COLOR       COLOR_RED
+#define PANEL_BG          COLOR_PANEL
+#define TEXT_COLOR        COLOR_TEXT
+#define ACCENT_COLOR      COLOR_ACCENT
+
+/* =========================================
+   MEMORY VIEWER CONFIGURATION
+   ========================================= */
+
+#define GUI_MEMORY_BYTES_PER_ROW 16
+#define GUI_MEMORY_ROWS 8
+
+#define GUI_MEMORY_PAGE_SIZE \
+    (GUI_MEMORY_BYTES_PER_ROW * GUI_MEMORY_ROWS)
+
+#define GUI_MEMORY_MAX_BASE \
+    (DIOCPU_MEMORY_SIZE - GUI_MEMORY_PAGE_SIZE)
+
+#define GUI_MEMORY_VIEW_INSTRUCTION 0
+#define GUI_MEMORY_VIEW_DATA        1
+
+#define GUI_WORKSPACE_DATAPATH 0
+#define GUI_WORKSPACE_MEMORY   1
+#define GUI_WORKSPACE_STACK    2
+#define GUI_WORKSPACE_ASSEMBLY 3
+
+#define GUI_SOURCE_CAPACITY 32768u
+
+#define GUI_SOURCE_VISIBLE_ROWS 8
+
+#define GUI_DISASSEMBLY_VISIBLE_ROWS 8
+
+#define GUI_DISASSEMBLY_MAX_ROWS 1024u
+
+#define GUI_DISASSEMBLY_LINE_LENGTH 128u
+
+#define GUI_STACK_VIEW_WORDS 10
+
+#define GUI_STACK_VIEW_BYTES \
+    (GUI_STACK_VIEW_WORDS * 2u)
+
+#define GUI_STACK_EVENT_DURATION 2.5f
+
+#define GUI_DEFAULT_PHASE_INTERVAL 0.35f
+
+#define GUI_MIN_PHASE_INTERVAL 0.05f
+#define GUI_MAX_PHASE_INTERVAL 2.00f
+
+/* =========================================
+   COMMAND TYPES
+   ========================================= */
+
 typedef enum {
-    PHASE_IDLE,
-    PHASE_FETCH,
-    PHASE_DECODE,
-    PHASE_EXECUTE
-} CyclePhase;
 
-// Enum mode langkah (Langkah per fase atau langkah per instruksi penuh)
+    GUI_COMMAND_NONE = 0,
+
+    GUI_COMMAND_RUN_PAUSE,
+
+    GUI_COMMAND_STEP_PHASE,
+
+    GUI_COMMAND_STEP_INSTRUCTION,
+
+    GUI_COMMAND_RESET
+
+} GUICommand;
+
+/* =========================================
+   STACK EVENT TYPES
+   ========================================= */
+
 typedef enum {
-    STEP_MODE_PHASE,
-    STEP_MODE_INSTRUCTION
-} StepMode;
 
-// Enum tampilan tab panel kanan (Datapath vs Memory Hex)
-typedef enum {
-    VIEW_DATAPATH,
-    VIEW_MEMORY
-} RightPanelView;
+    GUI_STACK_EVENT_NONE = 0,
 
-// Sinyal kontrol CPU (Control Signals)
+    GUI_STACK_EVENT_PUSH,
+    GUI_STACK_EVENT_POP,
+
+    GUI_STACK_EVENT_CALL,
+    GUI_STACK_EVENT_RET
+
+} GUIStackEventType;
+
+/* =========================================
+   DISASSEMBLY ROW CACHE
+   ========================================= */
+
 typedef struct {
-    bool reg_write;
-    bool alu_src_imm;
-    const char *alu_op;
-    bool branch;
-    bool branch_taken;
-    bool is_out;
-    bool is_halt;
-} ControlSignals;
 
-// Struktur penyimpan status siklus instruksi & datapath
+    uint32_t address;
+
+    char text[GUI_DISASSEMBLY_LINE_LENGTH];
+
+} GUIDisassemblyRow;
+
+/* =========================================
+   GUI STATE & TRACKING
+   ========================================= */
+
+typedef enum {
+    GUI_PHASE_IDLE = 0,
+    GUI_PHASE_FETCH,
+    GUI_PHASE_DECODE,
+    GUI_PHASE_EXECUTE
+} GUIPhase;
+
+#define GUI_FETCH    GUI_PHASE_FETCH
+#define GUI_DECODE   GUI_PHASE_DECODE
+#define GUI_EXECUTE  GUI_PHASE_EXECUTE
+
+#define CHANGE_HIGHLIGHT_DURATION 0.85f
+
+#define GUI_MAX_INSTRUCTION_BYTES 5
+
 typedef struct {
-    CyclePhase phase;
-    uint16_t fetch_pc;
-    uint8_t opcode;
-    uint8_t operand1;
-    uint8_t operand2;
-    char disasm_text[64];
-    char decode_desc[128];
-    char execute_desc[128];
-    int modified_reg;   // Register tujuan (-1 jika tidak ada)
-    int source_reg;     // Register sumber (-1 jika tidak ada)
-    ControlSignals ctrl;
 
-    // Nilai ALU
-    uint8_t alu_in_a;
-    uint8_t alu_in_b;
-    uint8_t alu_result;
-    bool alu_active;
-} InstructionCycleState;
+    /* =================================
+       GENERAL GUI INFORMATION
+       ================================= */
 
-// Reset siklus ke status awal
-static void reset_cycle(InstructionCycleState *cycle)
-{
-    cycle->phase = PHASE_IDLE;
-    cycle->fetch_pc = 0;
-    cycle->opcode = 0;
-    cycle->operand1 = 0;
-    cycle->operand2 = 0;
-    cycle->disasm_text[0] = '\0';
-    snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "Menunggu instruksi...");
-    snprintf(cycle->execute_desc, sizeof(cycle->execute_desc), "Belum dieksekusi.");
-    cycle->modified_reg = -1;
-    cycle->source_reg = -1;
+    char status_message[180];
 
-    cycle->ctrl.reg_write = false;
-    cycle->ctrl.alu_src_imm = false;
-    cycle->ctrl.alu_op = "NONE";
-    cycle->ctrl.branch = false;
-    cycle->ctrl.branch_taken = false;
-    cycle->ctrl.is_out = false;
-    cycle->ctrl.is_halt = false;
+    Color status_color;
 
-    cycle->alu_in_a = 0;
-    cycle->alu_in_b = 0;
-    cycle->alu_result = 0;
-    cycle->alu_active = false;
-}
+    bool initialization_failed;
 
-// Analisis instruksi untuk fase DECODE dan pembangkit sinyal kontrol
-static void decode_instruction(
-    uint8_t opcode,
-    uint8_t op1,
-    uint8_t op2,
-    const CPU *cpu,
-    InstructionCycleState *cycle
+
+    /* =================================
+       EXECUTION PHASE
+       ================================= */
+
+    GUIPhase phase;
+
+    uint32_t instruction_pc;
+
+    uint8_t fetched_opcode;
+
+    uint8_t fetched_bytes[GUI_MAX_INSTRUCTION_BYTES];
+
+    uint8_t fetched_byte_count;
+
+    bool fetch_valid;
+
+    DecodedInstruction decoded;
+
+    DecoderStatus decode_status;
+
+    CPUStatus last_cpu_status;
+
+
+    /* =================================
+       AUTOMATIC EXECUTION
+       ================================= */
+
+    bool auto_run;
+
+    float phase_timer;
+
+    float phase_interval;
+
+
+    /* =================================
+       WORKSPACE & MEMORY VIEWER
+       ================================= */
+
+    int workspace_view;
+
+    uint32_t memory_base;
+
+    int memory_view;
+
+    uint32_t program_size;
+
+    uint32_t program_list_start;
+
+
+    /* =================================
+       ASSEMBLY INPUT
+       ================================= */
+
+    char source_path[256];
+
+    bool path_focused;
+
+
+    /* =================================
+       REGISTER CHANGE TRACKING
+       ================================= */
+
+    uint16_t previous_registers[CPU_GPR_COUNT];
+
+    uint16_t old_register_values[CPU_GPR_COUNT];
+
+    float register_flash[CPU_GPR_COUNT];
+
+
+    /* =================================
+       FLAGS CHANGE TRACKING
+       ================================= */
+
+    uint16_t previous_flags;
+
+    bool old_flag_values[4];
+
+    float flag_flash[4];
+
+    bool snapshot_initialized;
+
+
+    /* =========================================
+       ALU VISUALIZATION
+       ========================================= */
+
+    bool alu_preview_valid;
+    bool alu_result_visible;
+    bool alu_instruction_invalid;
+    bool alu_execution_failed;
+
+    bool alu_is_unary;
+    bool alu_is_compare;
+    bool alu_is_division;
+
+    ALUOperation alu_operation;
+    ALUResult alu_preview;
+
+    uint8_t alu_reg_a;
+    uint8_t alu_reg_b;
+
+    uint16_t alu_input_a;
+    uint16_t alu_input_b;
+
+    uint16_t alu_reg_a_before;
+    uint16_t alu_reg_b_before;
+
+    uint16_t alu_reg_a_after;
+    uint16_t alu_reg_b_after;
+
+    uint16_t alu_flags_before;
+    uint16_t alu_flags_after;
+
+    float datapath_animation_time;
+
+
+    /* =========================================
+       STACK VIEWER
+       ========================================= */
+
+    uint32_t stack_view_base;
+
+    bool stack_follow_sp;
+
+
+    /* =========================================
+       STACK EVENT TRACKING
+       ========================================= */
+
+    GUIStackEventType stack_event_type;
+
+    bool stack_event_pending;
+    bool stack_event_success;
+
+    uint8_t stack_event_register;
+
+    uint32_t stack_event_old_sp;
+    uint32_t stack_event_new_sp;
+
+    uint32_t stack_event_address;
+    uint32_t stack_event_return_address;
+
+    uint16_t stack_event_value;
+    uint16_t stack_event_high_value;
+
+    float stack_event_timer;
+
+
+    /* =========================================
+       ASSEMBLY SOURCE
+       ========================================= */
+
+    char source_text[GUI_SOURCE_CAPACITY];
+
+    size_t source_length;
+
+    uint32_t source_line_count;
+
+    bool source_loaded;
+
+
+    /* =========================================
+       ASSEMBLY RESULT
+       ========================================= */
+
+    bool assembly_valid;
+
+    bool last_assembly_succeeded;
+
+    AssemblerStatus assembly_status;
+
+    uint32_t assembly_error_line;
+
+    uint32_t assembled_code_size;
+
+    uint32_t assembled_instruction_count;
+
+
+    /* =========================================
+       DISASSEMBLY
+       ========================================= */
+
+    DebuggerStatus debugger_status;
+
+    uint32_t disassembly_count;
+
+    uint32_t disassembly_scroll;
+
+    bool disassembly_follow_pc;
+
+    bool disassembly_truncated;
+
+
+    /* =========================================
+       SOURCE NAVIGATION
+       ========================================= */
+
+    uint32_t source_scroll;
+
+} GUIState;
+
+static GUIDisassemblyRow gui_disassembly_rows[
+    GUI_DISASSEMBLY_MAX_ROWS
+];
+
+static const uint16_t FLAG_MASKS[4] = {
+    CPU_FLAG_ZF,
+    CPU_FLAG_CF,
+    CPU_FLAG_SF,
+    CPU_FLAG_OF
+};
+
+/* =========================================
+   ALU MAPPING & STATUS HELPERS
+   ========================================= */
+
+static bool gui_get_alu_operation(
+    InstructionOpcode opcode,
+    ALUOperation *operation
 )
 {
-    cycle->modified_reg = -1;
-    cycle->source_reg = -1;
-    cycle->alu_active = false;
+    if (operation == NULL) {
+        return false;
+    }
 
-    cycle->ctrl.reg_write = false;
-    cycle->ctrl.alu_src_imm = false;
-    cycle->ctrl.alu_op = "NONE";
-    cycle->ctrl.branch = false;
-    cycle->ctrl.branch_taken = false;
-    cycle->ctrl.is_out = false;
-    cycle->ctrl.is_halt = false;
+    switch (opcode) {
 
-    switch (opcode)
-    {
-        case OP_LOAD:
-            if (op1 < REGISTER_COUNT)
-            {
-                cycle->modified_reg = op1;
-            }
-            cycle->ctrl.reg_write = true;
-            cycle->ctrl.alu_src_imm = true;
-            cycle->ctrl.alu_op = "PASS";
-            cycle->alu_active = true;
-            cycle->alu_in_a = 0;
-            cycle->alu_in_b = op2;
-            cycle->alu_result = op2;
+        case DIOCPU_OP_ADD:
+            *operation = ALU_ADD;
+            return true;
 
-            snprintf(
-                cycle->decode_desc, sizeof(cycle->decode_desc),
-                "LOAD: Menyiapkan pengisian nilai immediate %u ke Register R%u",
-                op2, op1
-            );
-            break;
+        case DIOCPU_OP_SUB:
+            *operation = ALU_SUB;
+            return true;
 
-        case OP_ADD:
-            if (op1 < REGISTER_COUNT)
-            {
-                cycle->modified_reg = op1;
-            }
-            if (op2 < REGISTER_COUNT)
-            {
-                cycle->source_reg = op2;
-            }
-            cycle->ctrl.reg_write = true;
-            cycle->ctrl.alu_src_imm = false;
-            cycle->ctrl.alu_op = "ADD";
-            cycle->alu_active = true;
-            cycle->alu_in_a = (op1 < REGISTER_COUNT) ? cpu->registers[op1] : 0;
-            cycle->alu_in_b = (op2 < REGISTER_COUNT) ? cpu->registers[op2] : 0;
-            cycle->alu_result = (uint8_t)(cycle->alu_in_a + cycle->alu_in_b);
+        case DIOCPU_OP_MUL:
+            *operation = ALU_MUL;
+            return true;
 
-            snprintf(
-                cycle->decode_desc, sizeof(cycle->decode_desc),
-                "ADD: Menyiapkan ALU [ADD] R%u (%u) + R%u (%u)",
-                op1, cycle->alu_in_a, op2, cycle->alu_in_b
-            );
-            break;
+        case DIOCPU_OP_MULS:
+            *operation = ALU_MULS;
+            return true;
 
-        case OP_SUB:
-            if (op1 < REGISTER_COUNT)
-            {
-                cycle->modified_reg = op1;
-            }
-            if (op2 < REGISTER_COUNT)
-            {
-                cycle->source_reg = op2;
-            }
-            cycle->ctrl.reg_write = true;
-            cycle->ctrl.alu_src_imm = false;
-            cycle->ctrl.alu_op = "SUB";
-            cycle->alu_active = true;
-            cycle->alu_in_a = (op1 < REGISTER_COUNT) ? cpu->registers[op1] : 0;
-            cycle->alu_in_b = (op2 < REGISTER_COUNT) ? cpu->registers[op2] : 0;
-            cycle->alu_result = (uint8_t)(cycle->alu_in_a - cycle->alu_in_b);
+        case DIOCPU_OP_DIV:
+            *operation = ALU_DIV;
+            return true;
 
-            snprintf(
-                cycle->decode_desc, sizeof(cycle->decode_desc),
-                "SUB: Menyiapkan ALU [SUB] R%u (%u) - R%u (%u)",
-                op1, cycle->alu_in_a, op2, cycle->alu_in_b
-            );
-            break;
+        case DIOCPU_OP_DIVS:
+            *operation = ALU_DIVS;
+            return true;
 
-        case OP_JMP:
-            cycle->ctrl.branch = true;
-            cycle->ctrl.branch_taken = true;
-            snprintf(
-                cycle->decode_desc, sizeof(cycle->decode_desc),
-                "JMP: Menyiapkan lompatan tanpa syarat ke alamat 0x%02X",
-                op1
-            );
-            break;
+        case DIOCPU_OP_AND:
+            *operation = ALU_AND;
+            return true;
 
-        case OP_JZ:
-            cycle->ctrl.branch = true;
-            cycle->ctrl.branch_taken = cpu->zero_flag;
-            if (cpu->zero_flag)
-            {
-                snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "JZ: Zero Flag = 1 -> Bersiap melompat ke alamat 0x%02X", op1);
-            }
-            else
-            {
-                snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "JZ: Zero Flag = 0 -> Syarat tidak terpenuhi, lanjut PC+3");
-            }
-            break;
+        case DIOCPU_OP_OR:
+            *operation = ALU_OR;
+            return true;
 
-        case OP_JNZ:
-            cycle->ctrl.branch = true;
-            cycle->ctrl.branch_taken = !cpu->zero_flag;
-            if (!cpu->zero_flag)
-            {
-                snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "JNZ: Zero Flag = 0 -> Bersiap melompat ke alamat 0x%02X", op1);
-            }
-            else
-            {
-                snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "JNZ: Zero Flag = 1 -> Syarat tidak terpenuhi, lanjut PC+3");
-            }
-            break;
+        case DIOCPU_OP_XOR:
+            *operation = ALU_XOR;
+            return true;
 
-        case OP_OUT:
-            cycle->ctrl.is_out = true;
-            if (op1 == OUT_MODE_REGISTER)
-            {
-                if (op2 < REGISTER_COUNT)
-                {
-                    cycle->source_reg = op2;
-                }
-                snprintf(
-                    cycle->decode_desc, sizeof(cycle->decode_desc),
-                    "OUT: Menyiapkan bus I/O dengan isi Register R%u (%u)",
-                    op2, (op2 < REGISTER_COUNT) ? cpu->registers[op2] : 0
-                );
-            }
-            else if (op1 == OUT_MODE_IMMEDIATE)
-            {
-                snprintf(
-                    cycle->decode_desc, sizeof(cycle->decode_desc),
-                    "OUT: Menyiapkan bus I/O dengan nilai langsung %u",
-                    op2
-                );
-            }
-            else
-            {
-                snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "OUT: Mode output tidak valid (0x%02X)", op1);
-            }
-            break;
+        case DIOCPU_OP_NOT:
+            *operation = ALU_NOT;
+            return true;
 
-        case OP_HLT:
-            cycle->ctrl.is_halt = true;
-            snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "HLT: Menyiapkan sinyal penghentian CPU (HALT)");
-            break;
+        case DIOCPU_OP_CMP:
+            *operation = ALU_CMP;
+            return true;
 
         default:
-            snprintf(cycle->decode_desc, sizeof(cycle->decode_desc), "Opcode 0x%02X tidak dikenali oleh dekoder", opcode);
-            break;
+            return false;
     }
 }
 
-// Analisis hasil instruksi untuk fase EXECUTE
-static void describe_execution(
-    uint8_t opcode,
-    uint8_t op1,
-    uint8_t op2,
-    const CPU *cpu_before,
-    const CPU *cpu_after,
-    char *exec_desc,
-    size_t desc_size
+static const char *gui_alu_operation_name(
+    ALUOperation operation
 )
 {
-    switch (opcode)
-    {
-        case OP_LOAD:
-            snprintf(
-                exec_desc, desc_size,
-                "R%u diisi %u | PC: 0x%02X -> 0x%02X",
-                op1, (op1 < REGISTER_COUNT) ? cpu_after->registers[op1] : 0,
-                cpu_before->pc, cpu_after->pc
-            );
-            break;
+    switch (operation) {
 
-        case OP_ADD:
-            snprintf(
-                exec_desc, desc_size,
-                "ALU ADD: Hasil = %u | ZF: %d, CF: %d | PC -> 0x%02X",
-                (op1 < REGISTER_COUNT) ? cpu_after->registers[op1] : 0,
-                cpu_after->zero_flag, cpu_after->carry_flag,
-                cpu_after->pc
-            );
-            break;
-
-        case OP_SUB:
-            snprintf(
-                exec_desc, desc_size,
-                "ALU SUB: Hasil = %u | ZF: %d, CF: %d | PC -> 0x%02X",
-                (op1 < REGISTER_COUNT) ? cpu_after->registers[op1] : 0,
-                cpu_after->zero_flag, cpu_after->carry_flag,
-                cpu_after->pc
-            );
-            break;
-
-        case OP_JMP:
-            snprintf(
-                exec_desc, desc_size,
-                "Lompatan berhasil | PC: 0x%02X -> 0x%02X",
-                cpu_before->pc, cpu_after->pc
-            );
-            break;
-
-        case OP_JZ:
-            if (cpu_before->zero_flag)
-            {
-                snprintf(exec_desc, desc_size, "Lompat diambil (ZF=1) | PC: 0x%02X -> 0x%02X", cpu_before->pc, cpu_after->pc);
-            }
-            else
-            {
-                snprintf(exec_desc, desc_size, "Lompat diabaikan (ZF=0) | PC lanjut ke 0x%02X", cpu_after->pc);
-            }
-            break;
-
-        case OP_JNZ:
-            if (!cpu_before->zero_flag)
-            {
-                snprintf(exec_desc, desc_size, "Lompat diambil (ZF=0) | PC: 0x%02X -> 0x%02X", cpu_before->pc, cpu_after->pc);
-            }
-            else
-            {
-                snprintf(exec_desc, desc_size, "Lompat diabaikan (ZF=1) | PC lanjut ke 0x%02X", cpu_after->pc);
-            }
-            break;
-
-        case OP_OUT:
-            {
-                unsigned int val = (op1 == OUT_MODE_REGISTER && op2 < REGISTER_COUNT)
-                    ? cpu_before->registers[op2]
-                    : op2;
-                snprintf(exec_desc, desc_size, "Output tercetak: %u | PC lanjut ke 0x%02X", val, cpu_after->pc);
-            }
-            break;
-
-        case OP_HLT:
-            snprintf(exec_desc, desc_size, "CPU HALTED | Eksekusi instruksi selesai");
-            break;
+        case ALU_ADD:  return "ADD";
+        case ALU_SUB:  return "SUB";
+        case ALU_MUL:  return "MUL";
+        case ALU_MULS: return "MULS";
+        case ALU_DIV:  return "DIV";
+        case ALU_DIVS: return "DIVS";
+        case ALU_AND:  return "AND";
+        case ALU_OR:   return "OR";
+        case ALU_XOR:  return "XOR";
+        case ALU_NOT:  return "NOT";
+        case ALU_CMP:  return "CMP";
 
         default:
-            snprintf(exec_desc, desc_size, "Instruksi selesai | PC: 0x%02X", cpu_after->pc);
-            break;
+            return "UNKNOWN";
     }
 }
 
-// Menjalankan satu fase maju dalam siklus Fetch-Decode-Execute
-static void step_cycle_phase(
-    CPU *cpu,
-    InstructionCycleState *cycle,
-    uint16_t *last_pc,
-    bool *has_executed,
-    uint8_t *last_out_val,
-    bool *has_output
+static const char *gui_alu_status_string(ALUStatus status)
+{
+    switch (status) {
+
+        case ALU_STATUS_OK:
+            return "OK";
+
+        case ALU_STATUS_DIVIDE_BY_ZERO:
+            return "Divide by zero";
+
+        case ALU_STATUS_ARITHMETIC_OVERFLOW:
+            return "Arithmetic overflow";
+
+        case ALU_STATUS_INVALID_OPERATION:
+            return "Invalid ALU operation";
+
+        default:
+            return "Unknown ALU status";
+    }
+}
+
+static void clear_alu_visualization(GUIState *gui)
+{
+    gui->alu_preview_valid = false;
+    gui->alu_result_visible = false;
+    gui->alu_instruction_invalid = false;
+    gui->alu_execution_failed = false;
+
+    gui->alu_is_unary = false;
+    gui->alu_is_compare = false;
+    gui->alu_is_division = false;
+
+    gui->alu_operation = ALU_ADD;
+    gui->alu_preview = (ALUResult){0};
+
+    gui->alu_reg_a = 0;
+    gui->alu_reg_b = 0;
+
+    gui->alu_input_a = 0;
+    gui->alu_input_b = 0;
+
+    gui->alu_reg_a_before = 0;
+    gui->alu_reg_b_before = 0;
+
+    gui->alu_reg_a_after = 0;
+    gui->alu_reg_b_after = 0;
+
+    gui->alu_flags_before = 0;
+    gui->alu_flags_after = 0;
+}
+
+static void prepare_alu_visualization(
+    const DioCPU *cpu,
+    GUIState *gui
 )
 {
-    if (cpu->halted)
-    {
+    clear_alu_visualization(gui);
+
+    ALUOperation operation;
+
+    if (!gui_get_alu_operation(
+            gui->decoded.opcode,
+            &operation
+        )) {
+
+        /* Instruksi ini tidak menggunakan ALU. */
         return;
     }
 
-    if (cycle->phase == PHASE_IDLE || cycle->phase == PHASE_EXECUTE)
-    {
-        // === FASE 1: FETCH ===
-        cycle->fetch_pc = cpu->pc;
-        cycle->opcode = cpu->memory[cpu->pc];
-        cycle->operand1 = cpu->memory[cpu->pc + 1];
-        cycle->operand2 = cpu->memory[cpu->pc + 2];
+    uint8_t reg_a = gui->decoded.reg_a;
+    uint8_t reg_b = gui->decoded.reg_b;
 
-        disassemble_instruction(cpu->memory, cpu->pc, cycle->disasm_text, sizeof(cycle->disasm_text));
-        cycle->modified_reg = -1;
-        cycle->source_reg = -1;
-        cycle->phase = PHASE_FETCH;
+    if (reg_a >= CPU_GPR_COUNT ||
+        reg_b >= CPU_GPR_COUNT) {
+
+        gui->alu_instruction_invalid = true;
+        return;
     }
-    else if (cycle->phase == PHASE_FETCH)
-    {
-        // === FASE 2: DECODE ===
-        decode_instruction(
-            cycle->opcode,
-            cycle->operand1,
-            cycle->operand2,
-            cpu,
-            cycle
-        );
-        cycle->phase = PHASE_DECODE;
+
+    gui->alu_operation = operation;
+
+    gui->alu_reg_a = reg_a;
+    gui->alu_reg_b = reg_b;
+
+    gui->alu_is_unary =
+        gui->decoded.opcode == DIOCPU_OP_NOT;
+
+    gui->alu_is_compare =
+        gui->decoded.opcode == DIOCPU_OP_CMP;
+
+    gui->alu_is_division =
+        gui->decoded.opcode == DIOCPU_OP_DIV ||
+        gui->decoded.opcode == DIOCPU_OP_DIVS;
+
+    /* Ambil operand dari Register File. */
+
+    gui->alu_input_a = cpu->gpr[reg_a];
+
+    gui->alu_input_b = gui->alu_is_unary
+        ? 0
+        : cpu->gpr[reg_b];
+
+    /* Simpan kondisi sebelum eksekusi. */
+
+    gui->alu_reg_a_before = cpu->gpr[reg_a];
+    gui->alu_reg_b_before = cpu->gpr[reg_b];
+
+    gui->alu_flags_before = cpu->flags;
+
+    /*
+     * DIV dan DIVS membutuhkan dua register tujuan
+     * yang berbeda: quotient ke RA dan remainder ke RB.
+     */
+
+    if (gui->alu_is_division && reg_a == reg_b) {
+
+        gui->alu_instruction_invalid = true;
+        gui->alu_preview_valid = true;
+
+        return;
     }
-    else if (cycle->phase == PHASE_DECODE)
-    {
-        // === FASE 3: EXECUTE ===
-        CPU cpu_before = *cpu;
 
-        // Tangkap nilai OUT jika instruksi adalah OUT
-        if (cycle->opcode == OP_OUT)
-        {
-            if (cycle->operand1 == OUT_MODE_REGISTER && cycle->operand2 < REGISTER_COUNT)
-            {
-                *last_out_val = cpu->registers[cycle->operand2];
-                *has_output = true;
-            }
-            else if (cycle->operand1 == OUT_MODE_IMMEDIATE)
-            {
-                *last_out_val = cycle->operand2;
-                *has_output = true;
-            }
-        }
+    /*
+     * Preview hanya untuk visualisasi.
+     * Tidak mengubah GPR atau FLAGS CPU.
+     */
 
-        *last_pc = cpu->pc;
-        *has_executed = true;
+    gui->alu_preview = alu_execute(
+        operation,
+        gui->alu_input_a,
+        gui->alu_input_b,
+        cpu->flags
+    );
 
-        cpu_step(cpu);
-
-        describe_execution(
-            cycle->opcode,
-            cycle->operand1,
-            cycle->operand2,
-            &cpu_before,
-            cpu,
-            cycle->execute_desc,
-            sizeof(cycle->execute_desc)
-        );
-
-        cycle->phase = PHASE_EXECUTE;
-    }
+    gui->alu_preview_valid = true;
 }
 
-// Helper untuk merakit dan memuat file ASM secara aman ke CPU
-static bool do_assemble_and_load(
-    CPU *cpu,
-    const char *path,
-    InstructionCycleState *cycle,
-    char *status_msg,
-    size_t status_size,
-    Color *status_color
+static void complete_alu_visualization(
+    const DioCPU *cpu,
+    GUIState *gui,
+    CPUStatus execution_status
 )
 {
-    if (assemble_and_load(cpu, path))
-    {
-        reset_cycle(cycle);
-        snprintf(status_msg, status_size, "Loaded: %s", path);
-        *status_color = GREEN;
-        return true;
+    if (!gui->alu_preview_valid) {
+        return;
     }
-    else
-    {
-        snprintf(status_msg, status_size, "Error assembling: %s", path);
-        *status_color = RED;
-        return false;
+
+    gui->alu_result_visible = true;
+
+    gui->alu_execution_failed =
+        execution_status != CPU_STATUS_OK;
+
+    /*
+     * Ambil kondisi aktual setelah cpu_step().
+     */
+
+    gui->alu_reg_a_after =
+        cpu->gpr[gui->alu_reg_a];
+
+    gui->alu_reg_b_after =
+        cpu->gpr[gui->alu_reg_b];
+
+    gui->alu_flags_after = cpu->flags;
+}
+
+/* =========================================
+   MEMORY VIEWER HELPERS
+   ========================================= */
+
+static void normalize_memory_base(GUIState *gui)
+{
+    gui->memory_base -=
+        gui->memory_base % GUI_MEMORY_PAGE_SIZE;
+
+    if (gui->memory_base > GUI_MEMORY_MAX_BASE) {
+        gui->memory_base = GUI_MEMORY_MAX_BASE;
     }
 }
 
-// Draw a button and return true when clicked
-static bool draw_button(
+static uint8_t gui_memory_read_byte(
+    const DioCPU *cpu,
+    int memory_view,
+    uint32_t address
+)
+{
+    if (address >= DIOCPU_MEMORY_SIZE) {
+        return 0;
+    }
+
+    if (memory_view == GUI_MEMORY_VIEW_INSTRUCTION) {
+        return cpu->memory.instruction[address];
+    }
+
+    return cpu->memory.data[address];
+}
+
+static uint32_t get_memory_selected_address(
+    const DioCPU *cpu,
+    int memory_view
+)
+{
+    if (memory_view == GUI_MEMORY_VIEW_INSTRUCTION) {
+        return cpu->pc;
+    }
+
+    return cpu->mar;
+}
+
+static void memory_go_to_cpu_pointer(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    uint32_t address = get_memory_selected_address(
+        cpu,
+        gui->memory_view
+    );
+
+    if (address >= DIOCPU_MEMORY_SIZE) {
+        address = DIOCPU_MEMORY_MAX_ADDRESS;
+    }
+
+    gui->memory_base =
+        (address / GUI_MEMORY_PAGE_SIZE) *
+        GUI_MEMORY_PAGE_SIZE;
+
+    normalize_memory_base(gui);
+}
+
+static void memory_move_page(
+    GUIState *gui,
+    int direction
+)
+{
+    normalize_memory_base(gui);
+
+    if (direction < 0) {
+
+        if (gui->memory_base >= GUI_MEMORY_PAGE_SIZE) {
+            gui->memory_base -= GUI_MEMORY_PAGE_SIZE;
+        } else {
+            gui->memory_base = 0;
+        }
+
+    } else if (direction > 0) {
+
+        if (gui->memory_base <=
+            GUI_MEMORY_MAX_BASE - GUI_MEMORY_PAGE_SIZE) {
+
+            gui->memory_base += GUI_MEMORY_PAGE_SIZE;
+        }
+    }
+}
+
+static bool draw_memory_control(
     Rectangle bounds,
     const char *label,
-    Color base_color
+    bool active
 )
 {
     Vector2 mouse = GetMousePosition();
-    bool hovered = CheckCollisionPointRec(mouse, bounds);
 
-    Color color = hovered
-        ? (Color){65, 85, 110, 255}
-        : base_color;
+    bool hovered = CheckCollisionPointRec(
+        mouse,
+        bounds
+    );
 
-    DrawRectangleRec(bounds, color);
-    DrawRectangleLinesEx(bounds, 1, COLOR_BORDER);
+    Color background = active
+        ? (Color){35, 75, 95, 255}
+        : (hovered
+            ? (Color){55, 85, 110, 255}
+            : COLOR_PANEL_ALT);
 
-    int text_width = MeasureText(label, 16);
+    Color border = active || hovered
+        ? COLOR_CYAN
+        : COLOR_BORDER;
+
+    DrawRectangleRec(
+        bounds,
+        background
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        active ? 2.0f : 1.0f,
+        border
+    );
+
+    int text_width = MeasureText(label, 12);
 
     DrawText(
         label,
-        (int)(bounds.x + (bounds.width - text_width) / 2),
-        (int)(bounds.y + 12),
-        16,
+        (int)(bounds.x +
+            (bounds.width - text_width) / 2.0f),
+        (int)(bounds.y +
+            (bounds.height - 12.0f) / 2.0f),
+        12,
         COLOR_TEXT
     );
 
-    return hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    return hovered &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
 
-// Helper menggambar garis bus beranimasi dengan partikel data yang bergerak
-static void draw_animated_bus(
-    Vector2 start,
-    Vector2 end,
-    Color base_color,
-    Color active_color,
-    bool is_active,
-    float time
-)
+/* =========================================
+   STACK VIEWER HELPERS & EVENT TRACKING
+   ========================================= */
+
+static bool gui_stack_sp_valid(uint32_t sp)
 {
-    DrawLineEx(start, end, is_active ? 3.0f : 2.0f, is_active ? active_color : base_color);
-
-    if (is_active)
-    {
-        float dx = end.x - start.x;
-        float dy = end.y - start.y;
-        float length = sqrtf(dx * dx + dy * dy);
-
-        if (length > 0.0f)
-        {
-            float speed = 75.0f; // Kecepatan gerak partikel bus
-            float offset = fmodf(time * speed, 24.0f);
-
-            for (float d = offset; d < length; d += 24.0f)
-            {
-                float t = d / length;
-                Vector2 pos = (Vector2){
-                    start.x + t * dx,
-                    start.y + t * dy
-                };
-                DrawCircleV(pos, 3.5f, WHITE);
-            }
-        }
-    }
+    return
+        sp >= DIOCPU_STACK_BOTTOM &&
+        sp <= DIOCPU_STACK_INITIAL_SP &&
+        (sp % 2u) == 0u;
 }
 
-// Draw CPU registers and flags with highlight on modified register
-static void draw_register_panel(
-    const CPU *cpu,
-    uint8_t last_out_val,
-    bool has_output,
-    int modified_reg,
-    CyclePhase current_phase
+static bool gui_stack_read_word(
+    const DioCPU *cpu,
+    uint32_t address,
+    uint16_t *value
 )
 {
-    DrawRectangle(40, 160, 380, 290, COLOR_PANEL);
-    DrawRectangleLines(40, 160, 380, 290, COLOR_BORDER);
-
-    DrawText("CPU REGISTERS", 60, 175, 19, COLOR_ACCENT);
-
-    for (int i = 0; i < REGISTER_COUNT; i++)
-    {
-        int column = i % 2;
-        int row = i / 2;
-
-        int x = 65 + column * 165;
-        int y = 210 + row * 62;
-
-        bool is_modified = (current_phase == PHASE_EXECUTE && modified_reg == i);
-
-        if (is_modified)
-        {
-            DrawRectangle(x - 5, y - 2, 140, 52, (Color){25, 75, 45, 255});
-            DrawRectangleLines(x - 5, y - 2, 140, 52, COLOR_EXECUTE);
-        }
-
-        DrawText(
-            TextFormat("R%d", i),
-            x, y, 17, is_modified ? COLOR_EXECUTE : COLOR_MUTED
-        );
-
-        DrawText(
-            TextFormat("%03u", (unsigned int)cpu->registers[i]),
-            x, y + 20, 23, is_modified ? GREEN : COLOR_TEXT
-        );
+    if (cpu == NULL || value == NULL) {
+        return false;
     }
 
-    DrawLine(60, 345, 400, 345, COLOR_BORDER);
+    if (address < DIOCPU_STACK_BOTTOM ||
+        address + 1u > DIOCPU_STACK_TOP) {
 
-    bool pc_highlight = (current_phase == PHASE_FETCH);
-
-    DrawText(
-        TextFormat("PC: 0x%04X", (unsigned int)cpu->pc),
-        65, 360, 17, pc_highlight ? COLOR_FETCH : COLOR_TEXT
-    );
-
-    DrawText(
-        TextFormat("SP: 0x%02X", (unsigned int)cpu->sp),
-        210, 360, 17, COLOR_TEXT
-    );
-
-    if (has_output)
-    {
-        DrawText(
-            TextFormat("OUT: %u", (unsigned int)last_out_val),
-            310, 360, 17, COLOR_ACCENT
-        );
-    }
-    else
-    {
-        DrawText("OUT: --", 310, 360, 17, COLOR_MUTED);
+        return false;
     }
 
-    DrawText(
-        TextFormat("ZF: %d", cpu->zero_flag),
-        65, 400, 17, COLOR_TEXT
-    );
+    uint8_t low =
+        cpu->memory.data[address];
 
-    DrawText(
-        TextFormat("CF: %d", cpu->carry_flag),
-        170, 400, 17, COLOR_TEXT
-    );
+    uint8_t high =
+        cpu->memory.data[address + 1u];
 
-    const char *status = cpu->halted ? "HALTED" : "READY";
+    *value =
+        (uint16_t)low |
+        ((uint16_t)high << 8u);
 
-    DrawText(
-        status,
-        270, 400, 17,
-        cpu->halted ? RED : GREEN
-    );
+    return true;
 }
 
-// Draw the dynamic Program Disassembly panel
-static void draw_program_panel(
-    const CPU *cpu,
-    const InstructionCycleState *cycle,
-    uint16_t last_pc,
-    bool has_executed
+static uint32_t gui_stack_used_bytes(
+    const DioCPU *cpu
 )
 {
-    DrawRectangle(40, 465, 380, 250, COLOR_PANEL);
-    DrawRectangleLines(40, 465, 380, 250, COLOR_BORDER);
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return 0;
+    }
 
-    DrawText("PROGRAM DISASSEMBLY", 60, 480, 18, COLOR_ACCENT);
+    return DIOCPU_STACK_INITIAL_SP - cpu->sp;
+}
 
-    // Kumpulkan alamat instruksi yang terpasang di memori
-    uint16_t addresses[64];
-    int count = 0;
+static uint32_t gui_stack_free_bytes(
+    const DioCPU *cpu
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return 0;
+    }
 
-    for (uint16_t addr = 0; addr + INSTRUCTION_SIZE <= MEMORY_SIZE && count < 64; addr += INSTRUCTION_SIZE)
-    {
-        addresses[count++] = addr;
-        if (cpu->memory[addr] == OP_HLT)
-        {
+    return cpu->sp - DIOCPU_STACK_BOTTOM;
+}
+
+static uint32_t gui_stack_used_words(
+    const DioCPU *cpu
+)
+{
+    return gui_stack_used_bytes(cpu) / 2u;
+}
+
+static uint32_t gui_stack_capacity_words(void)
+{
+    return (
+        DIOCPU_STACK_INITIAL_SP -
+        DIOCPU_STACK_BOTTOM
+    ) / 2u;
+}
+
+static void gui_stack_follow_pointer(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return;
+    }
+
+    gui->stack_follow_sp = true;
+
+    gui->stack_view_base = cpu->sp;
+}
+
+static void gui_stack_view_older(
+    GUIState *gui
+)
+{
+    gui->stack_follow_sp = false;
+
+    uint32_t maximum =
+        DIOCPU_STACK_INITIAL_SP;
+
+    if (gui->stack_view_base <=
+        maximum - GUI_STACK_VIEW_BYTES) {
+
+        gui->stack_view_base += GUI_STACK_VIEW_BYTES;
+
+    } else {
+
+        gui->stack_view_base = maximum;
+    }
+
+    gui->stack_view_base -=
+        gui->stack_view_base % 2u;
+}
+
+static void gui_stack_view_newer(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (!gui_stack_sp_valid(cpu->sp)) {
+        return;
+    }
+
+    gui->stack_follow_sp = false;
+
+    if (gui->stack_view_base <=
+        cpu->sp + GUI_STACK_VIEW_BYTES) {
+
+        gui->stack_view_base = cpu->sp;
+
+    } else {
+
+        gui->stack_view_base -= GUI_STACK_VIEW_BYTES;
+    }
+
+    gui->stack_view_base -=
+        gui->stack_view_base % 2u;
+}
+
+static void prepare_stack_event(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    InstructionOpcode opcode = gui->decoded.opcode;
+
+    GUIStackEventType event_type =
+        GUI_STACK_EVENT_NONE;
+
+    switch (opcode) {
+
+        case DIOCPU_OP_PUSH:
+            event_type = GUI_STACK_EVENT_PUSH;
             break;
-        }
-    }
 
-    if (count == 0)
-    {
-        addresses[0] = 0;
-        count = 1;
-    }
-
-    uint16_t target_pc = (cycle->phase != PHASE_IDLE) ? cycle->fetch_pc : cpu->pc;
-
-    int current_idx = 0;
-    for (int i = 0; i < count; i++)
-    {
-        if (addresses[i] == target_pc)
-        {
-            current_idx = i;
+        case DIOCPU_OP_POP:
+            event_type = GUI_STACK_EVENT_POP;
             break;
+
+        case DIOCPU_OP_CALL:
+            event_type = GUI_STACK_EVENT_CALL;
+            break;
+
+        case DIOCPU_OP_RET:
+            event_type = GUI_STACK_EVENT_RET;
+            break;
+
+        default:
+            gui->stack_event_pending = false;
+            return;
+    }
+
+    gui->stack_event_type = event_type;
+
+    gui->stack_event_pending = true;
+
+    gui->stack_event_success = false;
+
+    gui->stack_event_old_sp = cpu->sp;
+    gui->stack_event_new_sp = cpu->sp;
+
+    gui->stack_event_register = gui->decoded.reg_a;
+
+    gui->stack_event_address = cpu->sp;
+
+    gui->stack_event_value = 0;
+    gui->stack_event_high_value = 0;
+
+    gui->stack_event_return_address = 0;
+
+    /*
+     * PUSH
+     */
+
+    if (opcode == DIOCPU_OP_PUSH) {
+
+        gui->stack_event_address =
+            cpu->sp >= DIOCPU_STACK_BOTTOM + 2u
+                ? cpu->sp - 2u
+                : cpu->sp;
+
+        if (gui->decoded.reg_a < CPU_GPR_COUNT) {
+
+            gui->stack_event_value =
+                cpu->gpr[gui->decoded.reg_a];
         }
     }
 
-    // Auto-scroll agar instruksi aktif selalu terlihat di panel
-    const int max_visible = 7;
-    int start_idx = 0;
-    if (current_idx >= max_visible - 2)
-    {
-        start_idx = current_idx - (max_visible - 3);
-    }
-    if (start_idx + max_visible > count && count >= max_visible)
-    {
-        start_idx = count - max_visible;
-    }
-    if (start_idx < 0)
-    {
-        start_idx = 0;
-    }
+    /*
+     * POP
+     */
 
-    for (int i = start_idx; i < count && (i - start_idx) < max_visible; i++)
-    {
-        uint16_t addr = addresses[i];
-        int y = 510 + (i - start_idx) * 26;
+    else if (opcode == DIOCPU_OP_POP) {
 
-        bool active = (!cpu->halted && target_pc == addr) ||
-                      (cpu->halted && has_executed && addr == last_pc);
+        gui->stack_event_address = cpu->sp;
 
-        Color line_border = COLOR_ACCENT;
-        Color line_bg = COLOR_HIGHLIGHT;
-        Color text_color = SKYBLUE;
-
-        if (active)
-        {
-            if (cycle->phase == PHASE_FETCH)
-            {
-                line_bg = (Color){70, 55, 15, 255};
-                line_border = COLOR_FETCH;
-                text_color = COLOR_FETCH;
-            }
-            else if (cycle->phase == PHASE_DECODE)
-            {
-                line_bg = (Color){20, 60, 85, 255};
-                line_border = COLOR_DECODE;
-                text_color = COLOR_DECODE;
-            }
-            else if (cycle->phase == PHASE_EXECUTE)
-            {
-                line_bg = (Color){20, 70, 40, 255};
-                line_border = COLOR_EXECUTE;
-                text_color = COLOR_EXECUTE;
-            }
-
-            DrawRectangle(50, y - 2, 360, 24, line_bg);
-            DrawRectangleLines(50, y - 2, 360, 24, line_border);
-        }
-        else
-        {
-            text_color = COLOR_TEXT;
-        }
-
-        char disasm[64];
-        disassemble_instruction(cpu->memory, addr, disasm, sizeof(disasm));
-
-        DrawText(
-            disasm,
-            60, y + 2, 16,
-            text_color
+        (void)gui_stack_read_word(
+            cpu,
+            cpu->sp,
+            &gui->stack_event_value
         );
+    }
+
+    /*
+     * CALL
+     */
+
+    else if (opcode == DIOCPU_OP_CALL) {
+
+        gui->stack_event_address =
+            cpu->sp >= DIOCPU_STACK_BOTTOM + 4u
+                ? cpu->sp - 4u
+                : cpu->sp;
+
+        gui->stack_event_return_address =
+            gui->decoded.next_pc;
+
+        gui->stack_event_value =
+            (uint16_t)(
+                gui->stack_event_return_address & 0xFFFFu
+            );
+
+        gui->stack_event_high_value =
+            (uint16_t)(
+                gui->stack_event_return_address >> 16u
+            );
+    }
+
+    /*
+     * RET
+     */
+
+    else if (opcode == DIOCPU_OP_RET) {
+
+        gui->stack_event_address = cpu->sp;
+
+        (void)gui_stack_read_word(
+            cpu,
+            cpu->sp,
+            &gui->stack_event_value
+        );
+
+        (void)gui_stack_read_word(
+            cpu,
+            cpu->sp + 2u,
+            &gui->stack_event_high_value
+        );
+
+        gui->stack_event_return_address =
+            (uint32_t)gui->stack_event_value |
+            ((uint32_t)gui->stack_event_high_value << 16u);
     }
 }
 
-// Draw the Instruction Cycle (Fetch - Decode - Execute) visualizer
-static void draw_cycle_panel(
-    const CPU *cpu,
-    const InstructionCycleState *cycle
+static void complete_stack_event(
+    const DioCPU *cpu,
+    GUIState *gui,
+    CPUStatus execution_status
 )
 {
-    DrawRectangle(440, 160, 800, 145, COLOR_PANEL);
-    DrawRectangleLines(440, 160, 800, 145, COLOR_BORDER);
-
-    DrawText("INSTRUCTION CYCLE", 460, 172, 18, COLOR_ACCENT);
-
-    const char *phase_title = "IDLE";
-    Color phase_color = COLOR_MUTED;
-
-    if (cycle->phase == PHASE_FETCH)
-    {
-        phase_title = "1. FETCH";
-        phase_color = COLOR_FETCH;
+    if (!gui->stack_event_pending) {
+        return;
     }
-    else if (cycle->phase == PHASE_DECODE)
-    {
-        phase_title = "2. DECODE";
-        phase_color = COLOR_DECODE;
-    }
-    else if (cycle->phase == PHASE_EXECUTE)
-    {
-        phase_title = "3. EXECUTE";
-        phase_color = COLOR_EXECUTE;
-    }
+
+    gui->stack_event_pending = false;
+
+    gui->stack_event_new_sp = cpu->sp;
+
+    gui->stack_event_success =
+        execution_status == CPU_STATUS_OK &&
+        cpu->sp != gui->stack_event_old_sp;
+
+    gui->stack_event_timer =
+        GUI_STACK_EVENT_DURATION;
+
+    /*
+     * Setelah operasi stack berhasil,
+     * ikuti posisi SP terbaru.
+     */
+
+    gui->stack_follow_sp = true;
+
+    gui->stack_view_base = cpu->sp;
+}
+
+static void clear_stack_event(GUIState *gui)
+{
+    gui->stack_event_type = GUI_STACK_EVENT_NONE;
+
+    gui->stack_event_pending = false;
+
+    gui->stack_event_success = false;
+
+    gui->stack_event_timer = 0.0f;
+
+    gui->stack_event_old_sp = 0;
+    gui->stack_event_new_sp = 0;
+
+    gui->stack_event_address = 0;
+    gui->stack_event_return_address = 0;
+
+    gui->stack_event_value = 0;
+    gui->stack_event_high_value = 0;
+
+    gui->stack_event_register = 0;
+}
+
+static bool draw_stack_control(
+    Rectangle bounds,
+    const char *label,
+    bool active
+)
+{
+    Vector2 mouse = GetMousePosition();
+
+    bool hovered = CheckCollisionPointRec(
+        mouse,
+        bounds
+    );
+
+    Color background = active
+        ? (Color){35, 75, 95, 255}
+        : (hovered
+            ? (Color){55, 85, 110, 255}
+            : COLOR_PANEL_ALT);
+
+    Color border =
+        active || hovered
+            ? COLOR_CYAN
+            : COLOR_BORDER;
+
+    DrawRectangleRec(
+        bounds,
+        background
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        active ? 2.0f : 1.0f,
+        border
+    );
+
+    int text_width = MeasureText(label, 12);
 
     DrawText(
-        TextFormat("PHASE: %s", phase_title),
-        1070, 174, 15, phase_color
+        label,
+        (int)(
+            bounds.x +
+            (bounds.width - text_width) / 2.0f
+        ),
+        (int)(
+            bounds.y +
+            (bounds.height - 12.0f) / 2.0f
+        ),
+        12,
+        COLOR_TEXT
     );
 
-    // Card 1: FETCH
-    Rectangle card_fetch = (Rectangle){455, 198, 230, 60};
-    bool fetch_active = (cycle->phase == PHASE_FETCH);
-    bool fetch_done = (cycle->phase > PHASE_FETCH);
+    return hovered &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
 
-    Color fetch_bg = fetch_active
-        ? (Color){60, 50, 18, 255}
-        : (fetch_done ? (Color){30, 42, 38, 255} : (Color){25, 30, 40, 255});
-    Color fetch_border = fetch_active
-        ? COLOR_FETCH
-        : (fetch_done ? (Color){80, 140, 100, 255} : COLOR_BORDER);
+static const char *gui_stack_event_name(
+    GUIStackEventType event
+)
+{
+    switch (event) {
 
-    DrawRectangleRec(card_fetch, fetch_bg);
-    DrawRectangleLinesEx(card_fetch, fetch_active ? 2 : 1, fetch_border);
+        case GUI_STACK_EVENT_PUSH:
+            return "PUSH";
 
-    DrawText("1. FETCH", 470, 204, 15, fetch_active ? COLOR_FETCH : (fetch_done ? GREEN : COLOR_TEXT));
+        case GUI_STACK_EVENT_POP:
+            return "POP";
 
-    if (cycle->phase != PHASE_IDLE)
-    {
-        DrawText(
-            TextFormat("PC: 0x%02X | Bytes: [%02X %02X %02X]", cycle->fetch_pc, cycle->opcode, cycle->operand1, cycle->operand2),
-            470, 228, 13, COLOR_TEXT
-        );
-    }
-    else
-    {
-        DrawText(TextFormat("PC: 0x%02X | Siap baca byte", cpu->pc), 470, 228, 13, COLOR_MUTED);
-    }
+        case GUI_STACK_EVENT_CALL:
+            return "CALL";
 
-    // Panah 1
-    DrawText("->", 698, 218, 20, (cycle->phase >= PHASE_DECODE) ? COLOR_ACCENT : COLOR_MUTED);
+        case GUI_STACK_EVENT_RET:
+            return "RET";
 
-    // Card 2: DECODE
-    Rectangle card_decode = (Rectangle){725, 198, 230, 60};
-    bool decode_active = (cycle->phase == PHASE_DECODE);
-    bool decode_done = (cycle->phase > PHASE_DECODE);
-
-    Color decode_bg = decode_active
-        ? (Color){18, 48, 68, 255}
-        : (decode_done ? (Color){30, 42, 38, 255} : (Color){25, 30, 40, 255});
-    Color decode_border = decode_active
-        ? COLOR_DECODE
-        : (decode_done ? (Color){80, 140, 100, 255} : COLOR_BORDER);
-
-    DrawRectangleRec(card_decode, decode_bg);
-    DrawRectangleLinesEx(card_decode, decode_active ? 2 : 1, decode_border);
-
-    DrawText("2. DECODE", 740, 204, 15, decode_active ? COLOR_DECODE : (decode_done ? GREEN : COLOR_TEXT));
-
-    if (cycle->phase >= PHASE_DECODE)
-    {
-        DrawText(TextFormat("Instr: %s (0x%02X)", cycle->disasm_text, cycle->opcode), 740, 228, 13, COLOR_TEXT);
-    }
-    else
-    {
-        DrawText("Menunggu Fetch...", 740, 228, 13, COLOR_MUTED);
-    }
-
-    // Panah 2
-    DrawText("->", 968, 218, 20, (cycle->phase >= PHASE_EXECUTE) ? COLOR_ACCENT : COLOR_MUTED);
-
-    // Card 3: EXECUTE
-    Rectangle card_execute = (Rectangle){995, 198, 230, 60};
-    bool exec_active = (cycle->phase == PHASE_EXECUTE);
-
-    Color exec_bg = exec_active
-        ? (Color){20, 60, 36, 255}
-        : (Color){25, 30, 40, 255};
-    Color exec_border = exec_active
-        ? COLOR_EXECUTE
-        : COLOR_BORDER;
-
-    DrawRectangleRec(card_execute, exec_bg);
-    DrawRectangleLinesEx(card_execute, exec_active ? 2 : 1, exec_border);
-
-    DrawText("3. EXECUTE", 1010, 204, 15, exec_active ? COLOR_EXECUTE : COLOR_TEXT);
-
-    if (cycle->phase == PHASE_EXECUTE)
-    {
-        DrawText(
-            TextFormat("Hasil: %s", cpu->halted ? "HALTED" : "COMPLETED"),
-            1010, 228, 13, cpu->halted ? RED : GREEN
-        );
-    }
-    else
-    {
-        DrawText("Menunggu Decode...", 1010, 228, 13, COLOR_MUTED);
-    }
-
-    // Banner penjelasan di bawah kartu
-    Rectangle banner_rect = (Rectangle){455, 266, 770, 30};
-    DrawRectangleRec(banner_rect, (Color){24, 28, 38, 255});
-    DrawRectangleLines(banner_rect.x, banner_rect.y, banner_rect.width, banner_rect.height, COLOR_BORDER);
-
-    if (cycle->phase == PHASE_IDLE)
-    {
-        DrawText("Siap. Tekan STEP untuk memulai siklus instruksi.", 465, 273, 13, COLOR_MUTED);
-    }
-    else if (cycle->phase == PHASE_FETCH)
-    {
-        DrawText(
-            TextFormat("[FETCH] Membaca instruksi '%s' dari alamat 0x%02X di memori.", cycle->disasm_text, cycle->fetch_pc),
-            465, 273, 13, COLOR_FETCH
-        );
-    }
-    else if (cycle->phase == PHASE_DECODE)
-    {
-        DrawText(
-            TextFormat("[DECODE] %s", cycle->decode_desc),
-            465, 273, 13, COLOR_DECODE
-        );
-    }
-    else if (cycle->phase == PHASE_EXECUTE)
-    {
-        DrawText(
-            TextFormat("[EXECUTE] %s", cycle->execute_desc),
-            465, 273, 13, COLOR_EXECUTE
-        );
+        default:
+            return "NONE";
     }
 }
 
-// Draw the Animated CPU Datapath Visualization (GUI-7)
-static void draw_datapath_panel(
-    const CPU *cpu,
-    const InstructionCycleState *cycle,
-    uint8_t last_out_val,
-    bool has_output,
-    float time
+static void draw_stack_event_information(
+    const GUIState *gui,
+    int x,
+    int y
 )
 {
-    DrawRectangle(440, 350, 800, 365, COLOR_PANEL);
-    DrawRectangleLines(440, 350, 800, 365, COLOR_BORDER);
+    if (gui->stack_event_type == GUI_STACK_EVENT_NONE) {
 
-    // Titik sambungan komponen datapath
-    // Row 1: PC -> Memory -> Decoder -> Control Unit
-    Rectangle rect_pc = (Rectangle){460, 370, 100, 52};
-    Rectangle rect_mem = (Rectangle){600, 370, 130, 52};
-    Rectangle rect_dec = (Rectangle){770, 370, 160, 52};
-    Rectangle rect_ctrl = (Rectangle){970, 370, 250, 52};
+        DrawText(
+            "Waiting for stack instruction...",
+            x,
+            y,
+            13,
+            COLOR_MUTED
+        );
 
-    // Row 2: Register File, ALU, Flags, Output
-    Rectangle rect_rf = (Rectangle){460, 455, 240, 155};
-    Rectangle rect_alu = (Rectangle){740, 455, 200, 155};
-    Rectangle rect_flags = (Rectangle){980, 455, 240, 70};
-    Rectangle rect_io = (Rectangle){980, 540, 240, 70};
-
-    // Sinyal aktif bus
-    bool bus_pc_mem = (cycle->phase == PHASE_FETCH);
-    bool bus_mem_dec = (cycle->phase == PHASE_FETCH || cycle->phase == PHASE_DECODE);
-    bool bus_dec_ctrl = (cycle->phase == PHASE_DECODE);
-    bool bus_rf_alu = (cycle->phase == PHASE_EXECUTE && cycle->alu_active && !cycle->ctrl.alu_src_imm);
-    bool bus_alu_rf = (cycle->phase == PHASE_EXECUTE && cycle->ctrl.reg_write);
-    bool bus_ctrl_branch = (cycle->phase == PHASE_EXECUTE && cycle->ctrl.branch && cycle->ctrl.branch_taken);
-    bool bus_rf_io = (cycle->phase == PHASE_EXECUTE && cycle->ctrl.is_out);
-
-    // Gambar Garis Bus Data & Kontrol Beranimasi
-    // 1. PC -> Memory Bus (Address Bus)
-    draw_animated_bus(
-        (Vector2){rect_pc.x + rect_pc.width, rect_pc.y + 26},
-        (Vector2){rect_mem.x, rect_mem.y + 26},
-        COLOR_BORDER, COLOR_FETCH, bus_pc_mem, time
-    );
-
-    // 2. Memory -> Instruction Decoder Bus (Data Bus)
-    draw_animated_bus(
-        (Vector2){rect_mem.x + rect_mem.width, rect_mem.y + 26},
-        (Vector2){rect_dec.x, rect_dec.y + 26},
-        COLOR_BORDER, COLOR_FETCH, bus_mem_dec, time
-    );
-
-    // 3. Decoder -> Control Unit Bus
-    draw_animated_bus(
-        (Vector2){rect_dec.x + rect_dec.width, rect_dec.y + 26},
-        (Vector2){rect_ctrl.x, rect_ctrl.y + 26},
-        COLOR_BORDER, COLOR_DECODE, bus_dec_ctrl, time
-    );
-
-    // 4. Register File -> ALU (Operand Bus)
-    draw_animated_bus(
-        (Vector2){rect_rf.x + rect_rf.width, rect_rf.y + 60},
-        (Vector2){rect_alu.x, rect_alu.y + 60},
-        COLOR_BORDER, COLOR_DECODE, bus_rf_alu, time
-    );
-
-    // 5. ALU Result -> Register File (Writeback Bus)
-    draw_animated_bus(
-        (Vector2){rect_alu.x, rect_alu.y + 110},
-        (Vector2){rect_rf.x + rect_rf.width, rect_rf.y + 110},
-        COLOR_BORDER, COLOR_EXECUTE, bus_alu_rf, time
-    );
-
-    // 6. ALU -> Flags Bus
-    draw_animated_bus(
-        (Vector2){rect_alu.x + rect_alu.width, rect_alu.y + 40},
-        (Vector2){rect_flags.x, rect_flags.y + 35},
-        COLOR_BORDER, COLOR_EXECUTE, (cycle->phase == PHASE_EXECUTE && cycle->alu_active), time
-    );
-
-    // 7. Register / Immediate -> I/O Output Bus
-    draw_animated_bus(
-        (Vector2){rect_alu.x + rect_alu.width, rect_alu.y + 110},
-        (Vector2){rect_io.x, rect_io.y + 35},
-        COLOR_BORDER, COLOR_ACCENT, bus_rf_io, time
-    );
-
-    // 8. Branch Feedback Bus (Control -> PC)
-    if (bus_ctrl_branch)
-    {
-        Vector2 p1 = (Vector2){rect_ctrl.x + 40, rect_ctrl.y};
-        Vector2 p2 = (Vector2){rect_ctrl.x + 40, rect_ctrl.y - 12};
-        Vector2 p3 = (Vector2){rect_pc.x + 50, rect_pc.y - 12};
-        Vector2 p4 = (Vector2){rect_pc.x + 50, rect_pc.y};
-
-        DrawLineEx(p1, p2, 2.5f, COLOR_FETCH);
-        DrawLineEx(p2, p3, 2.5f, COLOR_FETCH);
-        DrawLineEx(p3, p4, 2.5f, COLOR_FETCH);
-        DrawCircleV(p4, 4.0f, COLOR_FETCH);
+        return;
     }
 
-    // ==========================================
-    // GAMBAR BLOK-BLOK KOMPONEN HARDWARE DIO-8
-    // ==========================================
+    Color event_color = gui->stack_event_success
+        ? COLOR_GREEN
+        : COLOR_RED;
 
-    // 1. Program Counter (PC)
-    bool pc_act = (cycle->phase == PHASE_FETCH);
-    DrawRectangleRec(rect_pc, pc_act ? (Color){55, 45, 18, 255} : (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_pc, pc_act ? 2 : 1, pc_act ? COLOR_FETCH : COLOR_BORDER);
-    DrawText("PROG COUNTER", (int)rect_pc.x + 6, (int)rect_pc.y + 8, 11, pc_act ? COLOR_FETCH : COLOR_MUTED);
-    DrawText(TextFormat("PC: 0x%02X", (cycle->phase != PHASE_IDLE) ? cycle->fetch_pc : cpu->pc), (int)rect_pc.x + 10, (int)rect_pc.y + 25, 17, COLOR_TEXT);
+    const char *result_text =
+        gui->stack_event_success
+            ? "COMMITTED"
+            : "FAILED";
 
-    // 2. Instruction Memory (RAM 256B)
-    bool mem_act = (cycle->phase == PHASE_FETCH);
-    DrawRectangleRec(rect_mem, mem_act ? (Color){55, 45, 18, 255} : (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_mem, mem_act ? 2 : 1, mem_act ? COLOR_FETCH : COLOR_BORDER);
-    DrawText("INSTR MEMORY", (int)rect_mem.x + 8, (int)rect_mem.y + 8, 11, mem_act ? COLOR_FETCH : COLOR_MUTED);
-    DrawText(TextFormat("[%02X %02X %02X]", cycle->opcode, cycle->operand1, cycle->operand2), (int)rect_mem.x + 8, (int)rect_mem.y + 26, 14, COLOR_TEXT);
-
-    // 3. Instruction Decoder
-    bool dec_act = (cycle->phase == PHASE_DECODE);
-    DrawRectangleRec(rect_dec, dec_act ? (Color){18, 48, 68, 255} : (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_dec, dec_act ? 2 : 1, dec_act ? COLOR_DECODE : COLOR_BORDER);
-    DrawText("INSTRUCTION DECODER", (int)rect_dec.x + 8, (int)rect_dec.y + 8, 11, dec_act ? COLOR_DECODE : COLOR_MUTED);
-    DrawText(TextFormat("Op: 0x%02X (%s)", cycle->opcode, cycle->disasm_text), (int)rect_dec.x + 8, (int)rect_dec.y + 26, 13, COLOR_TEXT);
-
-    // 4. Control Unit
-    bool ctrl_act = (cycle->phase == PHASE_DECODE || cycle->phase == PHASE_EXECUTE);
-    DrawRectangleRec(rect_ctrl, ctrl_act ? (Color){28, 42, 60, 255} : (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_ctrl, ctrl_act ? 2 : 1, ctrl_act ? COLOR_ACCENT : COLOR_BORDER);
-    DrawText("CONTROL UNIT", (int)rect_ctrl.x + 10, (int)rect_ctrl.y + 8, 11, ctrl_act ? COLOR_ACCENT : COLOR_MUTED);
     DrawText(
-        TextFormat("ALUOp:%s | RegW:%d | Br:%d", cycle->ctrl.alu_op, cycle->ctrl.reg_write ? 1 : 0, cycle->ctrl.branch ? 1 : 0),
-        (int)rect_ctrl.x + 10, (int)rect_ctrl.y + 26, 12, COLOR_TEXT
+        TextFormat(
+            "LAST EVENT: %s",
+            gui_stack_event_name(gui->stack_event_type)
+        ),
+        x,
+        y,
+        13,
+        COLOR_CYAN
     );
 
-    // 5. Register File (R0 - R3)
-    DrawRectangleRec(rect_rf, (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_rf, 1, COLOR_BORDER);
-    DrawText("REGISTER FILE (R0 - R3)", (int)rect_rf.x + 12, (int)rect_rf.y + 10, 13, COLOR_ACCENT);
+    DrawText(
+        result_text,
+        x + 300,
+        y,
+        13,
+        event_color
+    );
 
-    for (int i = 0; i < REGISTER_COUNT; i++)
-    {
-        int rx = (int)rect_rf.x + 12 + (i % 2) * 110;
-        int ry = (int)rect_rf.y + 35 + (i / 2) * 52;
+    switch (gui->stack_event_type) {
 
-        bool is_dest = (cycle->phase == PHASE_EXECUTE && cycle->modified_reg == i);
-        bool is_src = (cycle->phase >= PHASE_DECODE && cycle->source_reg == i);
-
-        Color reg_bg = (Color){34, 42, 54, 255};
-        Color reg_bdr = COLOR_BORDER;
-
-        if (is_dest)
-        {
-            reg_bg = (Color){25, 75, 45, 255};
-            reg_bdr = COLOR_EXECUTE;
-        }
-        else if (is_src)
-        {
-            reg_bg = (Color){18, 50, 70, 255};
-            reg_bdr = COLOR_DECODE;
-        }
-
-        DrawRectangle(rx, ry, 100, 44, reg_bg);
-        DrawRectangleLines(rx, ry, 100, 44, reg_bdr);
-
-        DrawText(TextFormat("R%d", i), rx + 8, ry + 6, 13, is_dest ? COLOR_EXECUTE : (is_src ? COLOR_DECODE : COLOR_MUTED));
-        DrawText(TextFormat("%03u", (unsigned int)cpu->registers[i]), rx + 38, ry + 16, 18, is_dest ? GREEN : COLOR_TEXT);
-    }
-
-    // 6. Arithmetic Logic Unit (ALU)
-    bool alu_act = (cycle->phase == PHASE_EXECUTE && cycle->alu_active);
-    DrawRectangleRec(rect_alu, alu_act ? (Color){20, 60, 36, 255} : (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_alu, alu_act ? 2 : 1, alu_act ? COLOR_EXECUTE : COLOR_BORDER);
-
-    DrawText("ARITHMETIC LOGIC UNIT", (int)rect_alu.x + 10, (int)rect_alu.y + 10, 13, alu_act ? COLOR_EXECUTE : COLOR_ACCENT);
-
-    DrawText(TextFormat("Input A : %03u", cycle->alu_in_a), (int)rect_alu.x + 14, (int)rect_alu.y + 40, 14, COLOR_TEXT);
-    DrawText(TextFormat("Input B : %03u", cycle->alu_in_b), (int)rect_alu.x + 14, (int)rect_alu.y + 64, 14, COLOR_TEXT);
-    DrawText(TextFormat("OP      : [%s]", cycle->ctrl.alu_op), (int)rect_alu.x + 14, (int)rect_alu.y + 88, 14, alu_act ? COLOR_EXECUTE : COLOR_MUTED);
-
-    DrawLine((int)rect_alu.x + 12, (int)rect_alu.y + 112, (int)rect_alu.x + 185, (int)rect_alu.y + 112, COLOR_BORDER);
-    DrawText(TextFormat("RESULT  : %03u", cycle->alu_result), (int)rect_alu.x + 14, (int)rect_alu.y + 122, 17, alu_act ? GREEN : COLOR_MUTED);
-
-    // 7. Status Flags (ZF / CF)
-    DrawRectangleRec(rect_flags, (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_flags, 1, COLOR_BORDER);
-    DrawText("STATUS FLAGS", (int)rect_flags.x + 10, (int)rect_flags.y + 10, 12, COLOR_ACCENT);
-
-    DrawText(TextFormat("Zero Flag  (ZF) : %d", cpu->zero_flag), (int)rect_flags.x + 12, (int)rect_flags.y + 28, 14, cpu->zero_flag ? COLOR_FETCH : COLOR_TEXT);
-    DrawText(TextFormat("Carry Flag (CF) : %d", cpu->carry_flag), (int)rect_flags.x + 12, (int)rect_flags.y + 46, 14, cpu->carry_flag ? COLOR_FETCH : COLOR_TEXT);
-
-    // 8. Output / Peripherals
-    DrawRectangleRec(rect_io, (Color){26, 32, 42, 255});
-    DrawRectangleLinesEx(rect_io, 1, (cycle->ctrl.is_out && cycle->phase == PHASE_EXECUTE) ? COLOR_ACCENT : COLOR_BORDER);
-    DrawText("I/O OUTPUT (OUT)", (int)rect_io.x + 10, (int)rect_io.y + 10, 12, COLOR_ACCENT);
-
-    if (has_output)
-    {
-        DrawText(TextFormat("LATEST : %u", (unsigned int)last_out_val), (int)rect_io.x + 12, (int)rect_io.y + 34, 20, COLOR_ACCENT);
-    }
-    else
-    {
-        DrawText("LATEST : --", (int)rect_io.x + 12, (int)rect_io.y + 34, 18, COLOR_MUTED);
-    }
-
-    // Legend Bus di bawah panel
-    DrawText("Bus Legend: [Gold: Address/Fetch] | [Cyan: Instruction/Decode] | [Green: ALU & Writeback Data]", 460, 690, 12, COLOR_MUTED);
-}
-
-// Draw all 256 bytes of memory with phase-aware highlighting
-static void draw_memory_panel(
-    const CPU *cpu,
-    const InstructionCycleState *cycle,
-    uint16_t last_pc,
-    bool has_executed
-)
-{
-    DrawRectangle(440, 350, 800, 365, COLOR_PANEL);
-    DrawRectangleLines(440, 350, 800, 365, COLOR_BORDER);
-
-    DrawText("MEMORY VIEWER", 460, 360, 18, COLOR_ACCENT);
-    DrawText("256 BYTES | HEXADECIMAL", 1040, 364, 12, COLOR_MUTED);
-
-    for (int row = 0; row < 16; row++)
-    {
-        int y = 390 + row * 19;
-
-        DrawText(
-            TextFormat("%04X:", row * 16),
-            460, y + 2, 13, COLOR_MUTED
-        );
-
-        for (int column = 0; column < 16; column++)
-        {
-            int address = row * 16 + column;
-            int x = 510 + column * 45;
-
-            bool is_current_cycle = (cycle->phase != PHASE_IDLE &&
-                address >= cycle->fetch_pc &&
-                address < cycle->fetch_pc + INSTRUCTION_SIZE);
-
-            bool is_prev_instruction = (cpu->halted && has_executed &&
-                address >= last_pc &&
-                address < last_pc + INSTRUCTION_SIZE);
-
-            Color cell_color = (Color){40, 48, 62, 255};
-            Color border_color = COLOR_BORDER;
-
-            if (is_current_cycle)
-            {
-                if (cycle->phase == PHASE_FETCH)
-                {
-                    cell_color = (Color){90, 75, 20, 255};
-                    border_color = COLOR_FETCH;
-                }
-                else if (cycle->phase == PHASE_DECODE)
-                {
-                    cell_color = (Color){25, 75, 100, 255};
-                    border_color = COLOR_DECODE;
-                }
-                else if (cycle->phase == PHASE_EXECUTE)
-                {
-                    cell_color = (Color){25, 85, 45, 255};
-                    border_color = COLOR_EXECUTE;
-                }
-            }
-            else if (is_prev_instruction)
-            {
-                cell_color = COLOR_HIGHLIGHT;
-            }
-
-            DrawRectangle(x, y, 38, 17, cell_color);
-            DrawRectangleLines(x, y, 38, 17, border_color);
+        case GUI_STACK_EVENT_PUSH:
 
             DrawText(
-                TextFormat("%02X", cpu->memory[address]),
-                x + 8, y + 2, 13, COLOR_TEXT
+                TextFormat(
+                    "R%u = 0x%04X -> [0x%05X]",
+                    (unsigned int)gui->stack_event_register,
+                    (unsigned int)gui->stack_event_value,
+                    (unsigned int)gui->stack_event_address
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        case GUI_STACK_EVENT_POP:
+
+            DrawText(
+                TextFormat(
+                    "[0x%05X] = 0x%04X -> R%u",
+                    (unsigned int)gui->stack_event_address,
+                    (unsigned int)gui->stack_event_value,
+                    (unsigned int)gui->stack_event_register
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        case GUI_STACK_EVENT_CALL:
+
+            DrawText(
+                TextFormat(
+                    "Return PC 0x%05X saved at 0x%05X - 0x%05X",
+                    (unsigned int)gui->stack_event_return_address,
+                    (unsigned int)gui->stack_event_address,
+                    (unsigned int)(gui->stack_event_address + 3u)
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        case GUI_STACK_EVENT_RET:
+
+            DrawText(
+                TextFormat(
+                    "Return address loaded: 0x%05X from 0x%05X",
+                    (unsigned int)gui->stack_event_return_address,
+                    (unsigned int)gui->stack_event_address
+                ),
+                x,
+                y + 22,
+                12,
+                COLOR_TEXT
+            );
+
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* =========================================
+   STATE TRACKING FUNCTIONS
+   ========================================= */
+
+static void initialize_state_tracking(
+    GUIState *gui,
+    const DioCPU *cpu
+)
+{
+    memcpy(
+        gui->previous_registers,
+        cpu->gpr,
+        sizeof(cpu->gpr)
+    );
+
+    gui->previous_flags = cpu->flags;
+
+    for (unsigned int i = 0; i < CPU_GPR_COUNT; i++) {
+
+        gui->old_register_values[i] = cpu->gpr[i];
+
+        gui->register_flash[i] = 0.0f;
+    }
+
+    for (unsigned int i = 0; i < 4; i++) {
+
+        gui->old_flag_values[i] =
+            (cpu->flags & FLAG_MASKS[i]) != 0;
+
+        gui->flag_flash[i] = 0.0f;
+    }
+
+    gui->snapshot_initialized = true;
+}
+
+static void update_state_tracking(
+    GUIState *gui,
+    const DioCPU *cpu,
+    float delta_time
+)
+{
+    if (!gui->snapshot_initialized) {
+
+        initialize_state_tracking(gui, cpu);
+
+        return;
+    }
+
+
+    /* =====================================
+       REGISTER COMPARISON
+       ===================================== */
+
+    for (unsigned int i = 0;
+         i < CPU_GPR_COUNT;
+         i++) {
+
+        if (gui->register_flash[i] > 0.0f) {
+
+            gui->register_flash[i] -= delta_time;
+
+            if (gui->register_flash[i] < 0.0f) {
+                gui->register_flash[i] = 0.0f;
+            }
+        }
+
+        uint16_t current_value = cpu->gpr[i];
+
+        uint16_t previous_value =
+            gui->previous_registers[i];
+
+
+        if (current_value != previous_value) {
+
+            gui->old_register_values[i] =
+                previous_value;
+
+            gui->previous_registers[i] =
+                current_value;
+
+            gui->register_flash[i] =
+                CHANGE_HIGHLIGHT_DURATION;
+        }
+    }
+
+
+    /* =====================================
+       FLAGS COMPARISON
+       ===================================== */
+
+    for (unsigned int i = 0; i < 4; i++) {
+
+        if (gui->flag_flash[i] > 0.0f) {
+
+            gui->flag_flash[i] -= delta_time;
+
+            if (gui->flag_flash[i] < 0.0f) {
+                gui->flag_flash[i] = 0.0f;
+            }
+        }
+
+        bool current_value =
+            (cpu->flags & FLAG_MASKS[i]) != 0;
+
+        bool previous_value =
+            (gui->previous_flags & FLAG_MASKS[i]) != 0;
+
+
+        if (current_value != previous_value) {
+
+            gui->old_flag_values[i] =
+                previous_value;
+
+            gui->flag_flash[i] =
+                CHANGE_HIGHLIGHT_DURATION;
+        }
+    }
+
+    gui->previous_flags = cpu->flags;
+}
+
+/* =========================================
+   INSTRUCTION FORMATTING HELPER
+   ========================================= */
+
+static const char *get_opcode_name(InstructionOpcode opcode)
+{
+    switch (opcode) {
+        case DIOCPU_OP_NOP:   return "NOP";
+        case DIOCPU_OP_HLT:   return "HLT";
+        case DIOCPU_OP_JMP:   return "JMP";
+        case DIOCPU_OP_CALL:  return "CALL";
+        case DIOCPU_OP_RET:   return "RET";
+
+        case DIOCPU_OP_LOADI: return "LOADI";
+        case DIOCPU_OP_LOAD:  return "LOAD";
+        case DIOCPU_OP_STORE: return "STORE";
+        case DIOCPU_OP_PUSH:  return "PUSH";
+        case DIOCPU_OP_POP:   return "POP";
+
+        case DIOCPU_OP_ADD:   return "ADD";
+        case DIOCPU_OP_SUB:   return "SUB";
+        case DIOCPU_OP_MUL:   return "MUL";
+        case DIOCPU_OP_MULS:  return "MULS";
+        case DIOCPU_OP_DIV:   return "DIV";
+        case DIOCPU_OP_DIVS:  return "DIVS";
+
+        case DIOCPU_OP_AND:   return "AND";
+        case DIOCPU_OP_OR:    return "OR";
+        case DIOCPU_OP_XOR:   return "XOR";
+        case DIOCPU_OP_NOT:   return "NOT";
+
+        case DIOCPU_OP_CMP:   return "CMP";
+
+        case DIOCPU_OP_JZ:    return "JZ";
+        case DIOCPU_OP_JNZ:   return "JNZ";
+        case DIOCPU_OP_JC:    return "JC";
+        case DIOCPU_OP_JNC:   return "JNC";
+
+        default:              return "UNKNOWN";
+    }
+}
+
+static void format_instruction(
+    const DecodedInstruction *instruction,
+    char *buffer,
+    size_t size
+)
+{
+    if (buffer == NULL || size == 0) {
+        return;
+    }
+
+    const char *name = get_opcode_name(instruction->opcode);
+
+    switch (instruction->format) {
+        case INSTRUCTION_FORMAT_NONE:
+            snprintf(buffer, size, "%s", name);
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER:
+            snprintf(buffer, size, "%s R%u", name, (unsigned int)instruction->reg_a);
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_REGISTER:
+            snprintf(
+                buffer,
+                size,
+                "%s R%u, R%u",
+                name,
+                (unsigned int)instruction->reg_a,
+                (unsigned int)instruction->reg_b
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_IMMEDIATE16:
+            snprintf(
+                buffer,
+                size,
+                "%s R%u, 0x%04X",
+                name,
+                (unsigned int)instruction->reg_a,
+                (unsigned int)instruction->immediate16
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_ABSOLUTE18:
+            snprintf(
+                buffer,
+                size,
+                "%s R%u, [0x%05X]",
+                name,
+                (unsigned int)instruction->reg_a,
+                (unsigned int)instruction->absolute_address
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_ABSOLUTE18:
+            snprintf(
+                buffer,
+                size,
+                "%s 0x%05X",
+                name,
+                (unsigned int)instruction->absolute_address
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_RELATIVE8:
+        {
+            int64_t target =
+                (int64_t)instruction->next_pc +
+                (int64_t)instruction->relative_offset;
+
+            snprintf(
+                buffer,
+                size,
+                "%s %+d -> 0x%05X",
+                name,
+                (int)instruction->relative_offset,
+                (unsigned int)target
+            );
+            break;
+        }
+
+        default:
+            snprintf(buffer, size, "%s ???", name);
+            break;
+    }
+}
+
+/* =========================================
+   STEP 2 — RESET CYCLE
+   ========================================= */
+
+static void reset_gui_cycle(GUIState *gui)
+{
+    gui->phase = GUI_PHASE_IDLE;
+
+    gui->instruction_pc = 0;
+
+    gui->fetched_opcode = 0;
+
+    gui->fetched_byte_count = 0;
+
+    gui->fetch_valid = false;
+
+    memset(
+        gui->fetched_bytes,
+        0,
+        sizeof(gui->fetched_bytes)
+    );
+
+    gui->decoded = (DecodedInstruction){0};
+
+    gui->decode_status = DECODER_STATUS_OK;
+
+    gui->last_cpu_status = CPU_STATUS_OK;
+
+    gui->auto_run = false;
+
+    gui->phase_timer = 0.0f;
+
+    clear_alu_visualization(gui);
+
+    normalize_memory_base(gui);
+
+    snprintf(
+        gui->status_message,
+        sizeof(gui->status_message),
+        "Ready. Waiting for instruction."
+    );
+
+    gui->status_color = COLOR_GREEN;
+}
+
+/* =========================================
+   STEP 3 — FETCH PHASE
+   ========================================= */
+
+static void phase_fetch(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    clear_alu_visualization(gui);
+
+    gui->instruction_pc = cpu->pc;
+
+    gui->fetched_opcode = 0;
+
+    gui->fetched_byte_count = 0;
+
+    gui->fetch_valid = false;
+
+    memset(
+        gui->fetched_bytes,
+        0,
+        sizeof(gui->fetched_bytes)
+    );
+
+    /*
+     * Fetch opcode from Instruction Memory.
+     */
+
+    MemoryStatus status = memory_instruction_read8(
+        &cpu->memory,
+        cpu->pc,
+        &gui->fetched_opcode
+    );
+
+    if (status != MEMORY_STATUS_OK) {
+
+        gui->decode_status =
+            DECODER_STATUS_INSTRUCTION_FETCH_FAULT;
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "FETCH FAILED: Invalid instruction address."
+        );
+
+        gui->status_color = COLOR_RED;
+
+    } else {
+
+        gui->fetch_valid = true;
+
+        gui->fetched_bytes[0] = gui->fetched_opcode;
+
+        gui->fetched_byte_count = 1;
+
+        gui->decode_status = DECODER_STATUS_OK;
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "FETCH: Opcode 0x%02X from address 0x%05X.",
+            gui->fetched_opcode,
+            (unsigned int)cpu->pc
+        );
+
+        gui->status_color = COLOR_YELLOW;
+    }
+
+    gui->phase = GUI_PHASE_FETCH;
+}
+
+/* =========================================
+   STEP 4 — DECODE PHASE
+   ========================================= */
+
+static void phase_decode(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (!gui->fetch_valid) {
+
+        gui->decode_status =
+            DECODER_STATUS_INSTRUCTION_FETCH_FAULT;
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "DECODE FAILED: Fetch was unsuccessful."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        gui->phase = GUI_PHASE_DECODE;
+
+        return;
+    }
+
+
+    /*
+     * Decode instruction using actual decoder.
+     */
+
+    gui->decode_status = decoder_decode(
+        &cpu->memory,
+        gui->instruction_pc,
+        &gui->decoded
+    );
+
+    if (gui->decode_status != DECODER_STATUS_OK) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "DECODE FAILED: Decoder status %d.",
+            (int)gui->decode_status
+        );
+
+        gui->status_color = COLOR_RED;
+
+        gui->phase = GUI_PHASE_DECODE;
+
+        return;
+    }
+
+    /*
+     * Prepare ALU preview when instruction uses ALU.
+     */
+
+    prepare_alu_visualization(cpu, gui);
+
+
+    /*
+     * Capture complete instruction bytes.
+     */
+
+    gui->fetched_byte_count = gui->decoded.length;
+
+    for (uint8_t i = 0;
+         i < gui->decoded.length && i < GUI_MAX_INSTRUCTION_BYTES;
+         i++) {
+
+        gui->fetched_bytes[i] =
+            cpu->memory.instruction[
+                gui->instruction_pc + i
+            ];
+    }
+
+
+    /*
+     * Format decoded instruction.
+     */
+
+    char instruction_text[100];
+
+    format_instruction(
+        &gui->decoded,
+        instruction_text,
+        sizeof(instruction_text)
+    );
+
+
+    snprintf(
+        gui->status_message,
+        sizeof(gui->status_message),
+        "DECODE: %s | Length: %u byte(s).",
+        instruction_text,
+        (unsigned int)gui->decoded.length
+    );
+
+    gui->status_color = COLOR_CYAN;
+
+    gui->phase = GUI_PHASE_DECODE;
+}
+
+/* =========================================
+   FORWARD DECLARATIONS
+   ========================================= */
+
+static bool draw_button(Rectangle bounds, const char *label);
+static Color get_cpu_state_color(CPUState state);
+
+/* =========================================
+   CONTROLLER HELPERS
+   ========================================= */
+
+static void stop_auto_run(GUIState *gui)
+{
+    gui->auto_run = false;
+    gui->phase_timer = 0.0f;
+}
+
+static const char *gui_phase_name(GUIPhase phase)
+{
+    switch (phase) {
+
+        case GUI_PHASE_IDLE:
+            return "IDLE";
+
+        case GUI_PHASE_FETCH:
+            return "FETCH";
+
+        case GUI_PHASE_DECODE:
+            return "DECODE";
+
+        case GUI_PHASE_EXECUTE:
+            return "EXECUTE";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+/* =========================================
+   STEP 5 — EXECUTE PHASE
+   ========================================= */
+
+static void phase_execute(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    /*
+     * Capture execution result from the real CPU.
+     */
+
+    prepare_stack_event(cpu, gui);
+
+    gui->last_cpu_status = cpu_step(cpu);
+
+    /*
+     * Complete ALU visualization.
+     */
+
+    complete_alu_visualization(
+        cpu,
+        gui,
+        gui->last_cpu_status
+    );
+
+    /*
+     * Complete Stack visualization.
+     */
+
+    complete_stack_event(
+        cpu,
+        gui,
+        gui->last_cpu_status
+    );
+
+    /*
+     * Mark Execute phase as completed.
+     */
+
+    gui->phase = GUI_PHASE_EXECUTE;
+
+    /*
+     * Stop automatic execution after HALT or FAULT.
+     */
+
+    if (cpu->state != CPU_STATE_RUNNING) {
+
+        stop_auto_run(gui);
+
+        if (cpu->state == CPU_STATE_HALTED) {
+
+            snprintf(
+                gui->status_message,
+                sizeof(gui->status_message),
+                "CPU halted successfully."
+            );
+
+            gui->status_color = COLOR_YELLOW;
+
+        } else {
+
+            snprintf(
+                gui->status_message,
+                sizeof(gui->status_message),
+                "CPU fault: %s",
+                cpu_fault_string(cpu->fault)
+            );
+
+            gui->status_color = COLOR_RED;
+        }
+
+    } else {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "EXECUTE: Instruction completed. Next PC: 0x%05X.",
+            (unsigned int)cpu->pc
+        );
+
+        gui->status_color = COLOR_GREEN;
+    }
+}
+
+/* =========================================
+   STEP 6 — PHASE CONTROLLER
+   ========================================= */
+
+static void advance_cpu_phase(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (cpu->state != CPU_STATE_RUNNING) {
+
+        stop_auto_run(gui);
+        return;
+    }
+
+    switch (gui->phase) {
+
+        case GUI_PHASE_IDLE:
+        case GUI_PHASE_EXECUTE:
+
+            phase_fetch(cpu, gui);
+
+            gui->phase = GUI_PHASE_FETCH;
+
+            break;
+
+
+        case GUI_PHASE_FETCH:
+
+            phase_decode(cpu, gui);
+
+            gui->phase = GUI_PHASE_DECODE;
+
+            break;
+
+
+        case GUI_PHASE_DECODE:
+
+            phase_execute(cpu, gui);
+
+            break;
+
+
+        default:
+
+            reset_gui_cycle(gui);
+
+            break;
+    }
+}
+
+/* =========================================
+   STEP 7 — SINGLE INSTRUCTION STEP
+   ========================================= */
+
+static void execute_one_instruction(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (cpu->state != CPU_STATE_RUNNING) {
+        return;
+    }
+
+    /*
+     * Stop automatic execution before manual stepping.
+     */
+
+    stop_auto_run(gui);
+
+    /*
+     * If the previous instruction has already
+     * completed, prepare the next instruction.
+     */
+
+    if (gui->phase == GUI_PHASE_EXECUTE) {
+
+        gui->phase = GUI_PHASE_IDLE;
+    }
+
+    /*
+     * An instruction needs at most three
+     * phase transitions:
+     *
+     * IDLE    -> FETCH
+     * FETCH   -> DECODE
+     * DECODE  -> EXECUTE
+     */
+
+    for (unsigned int i = 0; i < 3; i++) {
+
+        if (cpu->state != CPU_STATE_RUNNING) {
+            break;
+        }
+
+        if (gui->phase == GUI_PHASE_EXECUTE) {
+            break;
+        }
+
+        advance_cpu_phase(cpu, gui);
+    }
+}
+
+/* =========================================
+   EXECUTION CONTROLLER LOGIC
+   ========================================= */
+
+static void reset_cpu_controller(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    stop_auto_run(gui);
+
+    CPUStatus status = cpu_reset(cpu);
+
+    if (status != CPU_STATUS_OK) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "CPU reset failed."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return;
+    }
+
+    /*
+     * Reset GUI instruction cycle.
+     */
+
+    reset_gui_cycle(gui);
+
+    /*
+     * Clear previous ALU visualization.
+     */
+
+    clear_alu_visualization(gui);
+
+    /*
+     * Clear previous stack event.
+     */
+
+    clear_stack_event(gui);
+
+    /*
+     * Reset controller execution state.
+     */
+
+    gui->last_cpu_status = CPU_STATUS_OK;
+
+    gui->phase_timer = 0.0f;
+
+    /*
+     * Keep loaded assembly and memory.
+     */
+
+    gui->disassembly_scroll = 0;
+
+    gui->disassembly_follow_pc = true;
+
+    gui->stack_follow_sp = true;
+
+    gui->stack_view_base = cpu->sp;
+
+    snprintf(
+        gui->status_message,
+        sizeof(gui->status_message),
+        "CPU reset. Program memory preserved."
+    );
+
+    gui->status_color = COLOR_GREEN;
+}
+
+static void process_gui_command(
+    DioCPU *cpu,
+    GUIState *gui,
+    GUICommand command
+)
+{
+    if (gui->initialization_failed) {
+        return;
+    }
+
+    switch (command) {
+
+        /*
+         * RUN / PAUSE
+         */
+
+        case GUI_COMMAND_RUN_PAUSE:
+
+            if (cpu->state != CPU_STATE_RUNNING) {
+
+                stop_auto_run(gui);
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "CPU cannot run: %s.",
+                    cpu_state_string(cpu->state)
+                );
+
+                gui->status_color = COLOR_RED;
+
+                break;
+            }
+
+            gui->auto_run = !gui->auto_run;
+
+            gui->phase_timer = 0.0f;
+
+            if (gui->auto_run) {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Automatic execution started."
+                );
+
+                gui->status_color = COLOR_GREEN;
+
+            } else {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Execution paused."
+                );
+
+                gui->status_color = COLOR_YELLOW;
+            }
+
+            break;
+
+
+        /*
+         * STEP PHASE
+         */
+
+        case GUI_COMMAND_STEP_PHASE:
+
+            if (cpu->state != CPU_STATE_RUNNING) {
+                break;
+            }
+
+            stop_auto_run(gui);
+
+            advance_cpu_phase(cpu, gui);
+
+            if (cpu->state == CPU_STATE_RUNNING) {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Phase: %s",
+                    gui_phase_name(gui->phase)
+                );
+
+                gui->status_color = COLOR_CYAN;
+            }
+
+            break;
+
+
+        /*
+         * STEP INSTRUCTION
+         */
+
+        case GUI_COMMAND_STEP_INSTRUCTION:
+
+            if (cpu->state != CPU_STATE_RUNNING) {
+                break;
+            }
+
+            execute_one_instruction(cpu, gui);
+
+            if (cpu->state == CPU_STATE_RUNNING) {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Single instruction completed. PC: 0x%05X",
+                    (unsigned int)cpu->pc
+                );
+
+                gui->status_color = COLOR_CYAN;
+            }
+
+            break;
+
+
+        /*
+         * RESET
+         */
+
+        case GUI_COMMAND_RESET:
+
+            reset_cpu_controller(cpu, gui);
+
+            break;
+
+
+        case GUI_COMMAND_NONE:
+        default:
+
+            break;
+    }
+}
+
+static GUICommand draw_execution_toolbar(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    const char *run_label = "RUN";
+
+    if (cpu->state == CPU_STATE_HALTED) {
+        run_label = "HALTED";
+    } else if (cpu->state == CPU_STATE_FAULTED) {
+        run_label = "FAULTED";
+    } else if (gui->auto_run) {
+        run_label = "PAUSE";
+    }
+
+    /*
+     * RUN / PAUSE
+     */
+
+    if (draw_button(
+            (Rectangle){790, 25, 105, 45},
+            run_label
+        )) {
+
+        return GUI_COMMAND_RUN_PAUSE;
+    }
+
+    /*
+     * STEP PHASE
+     */
+
+    if (draw_button(
+            (Rectangle){905, 25, 125, 45},
+            "STEP PHASE"
+        )) {
+
+        return GUI_COMMAND_STEP_PHASE;
+    }
+
+    /*
+     * STEP INSTRUCTION
+     */
+
+    if (draw_button(
+            (Rectangle){1040, 25, 145, 45},
+            "STEP INSTR"
+        )) {
+
+        return GUI_COMMAND_STEP_INSTRUCTION;
+    }
+
+    /*
+     * RESET
+     */
+
+    if (draw_button(
+            (Rectangle){1195, 25, 115, 45},
+            "RESET CPU"
+        )) {
+
+        return GUI_COMMAND_RESET;
+    }
+
+    return GUI_COMMAND_NONE;
+}
+
+static GUICommand read_controller_keyboard(void)
+{
+    if (IsKeyPressed(KEY_F6)) {
+        return GUI_COMMAND_RESET;
+    }
+
+    if (IsKeyPressed(KEY_F5)) {
+        return GUI_COMMAND_RUN_PAUSE;
+    }
+
+    if (IsKeyPressed(KEY_F8)) {
+        return GUI_COMMAND_STEP_PHASE;
+    }
+
+    if (IsKeyPressed(KEY_F10)) {
+        return GUI_COMMAND_STEP_INSTRUCTION;
+    }
+
+    return GUI_COMMAND_NONE;
+}
+
+static void update_auto_run(
+    DioCPU *cpu,
+    GUIState *gui,
+    float delta_time
+)
+{
+    if (!gui->auto_run) {
+        return;
+    }
+
+    /*
+     * Halt and fault must stop automatic execution.
+     */
+
+    if (cpu->state != CPU_STATE_RUNNING) {
+
+        stop_auto_run(gui);
+        return;
+    }
+
+    /*
+     * Protect against invalid timer configuration.
+     */
+
+    if (
+        gui->phase_interval < GUI_MIN_PHASE_INTERVAL ||
+        gui->phase_interval > GUI_MAX_PHASE_INTERVAL
+    ) {
+
+        gui->phase_interval =
+            GUI_DEFAULT_PHASE_INTERVAL;
+    }
+
+    gui->phase_timer += delta_time;
+
+    /*
+     * Advance only one phase per frame.
+     */
+
+    if (gui->phase_timer >= gui->phase_interval) {
+
+        gui->phase_timer = 0.0f;
+
+        advance_cpu_phase(cpu, gui);
+    }
+
+    /*
+     * Check CPU state again because the latest
+     * phase may have executed HLT or caused a fault.
+     */
+
+    if (cpu->state != CPU_STATE_RUNNING) {
+
+        stop_auto_run(gui);
+    }
+}
+
+static void draw_controller_status(
+    const DioCPU *cpu,
+    const GUIState *gui,
+    int x,
+    int y
+)
+{
+    const char *run_status =
+        gui->auto_run
+            ? "AUTO RUN"
+            : "MANUAL / PAUSED";
+
+    Color run_color =
+        gui->auto_run
+            ? COLOR_GREEN
+            : COLOR_YELLOW;
+
+    DrawText(
+        TextFormat(
+            "CPU: %s",
+            cpu_state_string(cpu->state)
+        ),
+        x,
+        y,
+        13,
+        get_cpu_state_color(cpu->state)
+    );
+
+    DrawText(
+        TextFormat(
+            "PHASE: %s",
+            gui_phase_name(gui->phase)
+        ),
+        x + 230,
+        y,
+        13,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        run_status,
+        x + 465,
+        y,
+        13,
+        run_color
+    );
+
+    DrawText(
+        TextFormat(
+            "INTERVAL: %.2f SEC",
+            gui->phase_interval
+        ),
+        x + 680,
+        y,
+        12,
+        COLOR_MUTED
+    );
+}
+
+/* =========================================
+   ASSEMBLY FILE LOADER & DISASSEMBLER
+   ========================================= */
+
+static bool gui_read_assembly_file(
+    const char *path,
+    char *buffer,
+    size_t capacity,
+    size_t *bytes_read
+)
+{
+    if (
+        path == NULL ||
+        buffer == NULL ||
+        capacity == 0 ||
+        bytes_read == NULL
+    ) {
+        return false;
+    }
+
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL) {
+        return false;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    long file_size = ftell(file);
+
+    if (
+        file_size < 0 ||
+        (unsigned long)file_size >= capacity
+    ) {
+        fclose(file);
+        return false;
+    }
+
+    rewind(file);
+
+    size_t count = fread(
+        buffer,
+        1,
+        (size_t)file_size,
+        file
+    );
+
+    bool read_error =
+        ferror(file) ||
+        count != (size_t)file_size;
+
+    fclose(file);
+
+    if (read_error) {
+        return false;
+    }
+
+    /*
+     * Reject embedded null bytes.
+     * Assembly source is expected to be text.
+     */
+
+    if (memchr(buffer, '\0', count) != NULL) {
+        return false;
+    }
+
+    buffer[count] = '\0';
+
+    *bytes_read = count;
+
+    return true;
+}
+
+static uint32_t gui_count_source_lines(
+    const char *source
+)
+{
+    if (source == NULL || *source == '\0') {
+        return 0;
+    }
+
+    uint32_t count = 1;
+
+    for (const char *p = source; *p; p++) {
+
+        if (*p == '\n') {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static bool gui_build_disassembly(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    gui->disassembly_count = 0;
+
+    gui->disassembly_scroll = 0;
+
+    gui->disassembly_truncated = false;
+
+    FILE *temporary_file = tmpfile();
+
+    if (temporary_file == NULL) {
+
+        gui->debugger_status =
+            DEBUGGER_STATUS_OUTPUT_ERROR;
+
+        return false;
+    }
+
+    DebuggerResult debugger_result = {0};
+
+    DebuggerStatus status = debugger_disassemble(
+        &cpu->memory,
+        0,
+        gui->assembled_code_size,
+        temporary_file,
+        &debugger_result
+    );
+
+    gui->debugger_status = status;
+
+    if (status != DEBUGGER_STATUS_OK) {
+
+        fclose(temporary_file);
+
+        return false;
+    }
+
+    rewind(temporary_file);
+
+    char line[GUI_DISASSEMBLY_LINE_LENGTH];
+
+    uint32_t stored_rows = 0;
+
+    while (
+        fgets(
+            line,
+            sizeof(line),
+            temporary_file
+        ) != NULL
+    ) {
+
+        if (
+            stored_rows >=
+            GUI_DISASSEMBLY_MAX_ROWS
+        ) {
+            gui->disassembly_truncated = true;
+            break;
+        }
+
+        unsigned int address = 0;
+
+        if (sscanf(line, "%5x:", &address) != 1) {
+            continue;
+        }
+
+        /*
+         * Remove newline from debugger output.
+         */
+
+        line[strcspn(line, "\r\n")] = '\0';
+
+        gui_disassembly_rows[stored_rows].address =
+            (uint32_t)address;
+
+        snprintf(
+            gui_disassembly_rows[stored_rows].text,
+            sizeof(gui_disassembly_rows[stored_rows].text),
+            "%s",
+            line
+        );
+
+        stored_rows++;
+    }
+
+    if (ferror(temporary_file)) {
+
+        fclose(temporary_file);
+
+        gui->debugger_status =
+            DEBUGGER_STATUS_OUTPUT_ERROR;
+
+        gui->disassembly_count = 0;
+
+        return false;
+    }
+
+    fclose(temporary_file);
+
+    gui->disassembly_count = stored_rows;
+
+    if (
+        debugger_result.instruction_count >
+        stored_rows
+    ) {
+
+        gui->disassembly_truncated = true;
+    }
+
+    return true;
+}
+
+static bool gui_load_assembly_program(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    if (
+        cpu == NULL ||
+        gui == NULL ||
+        gui->source_path[0] == '\0'
+    ) {
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "Please enter an Assembly file path."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return false;
+    }
+
+    /*
+     * Stop automatic execution while loading.
+     */
+
+    stop_auto_run(gui);
+
+    gui->phase_timer = 0.0f;
+
+    /*
+     * Read into temporary buffer first.
+     * This preserves the previous source
+     * if reading fails.
+     */
+
+    char candidate_source[GUI_SOURCE_CAPACITY];
+
+    size_t candidate_length = 0;
+
+    if (!gui_read_assembly_file(
+            gui->source_path,
+            candidate_source,
+            sizeof(candidate_source),
+            &candidate_length
+        )) {
+
+        gui->last_assembly_succeeded = false;
+
+        gui->assembly_error_line = 0;
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "Could not read Assembly file."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return false;
+    }
+
+    /*
+     * Update displayed source.
+     */
+
+    memcpy(
+        gui->source_text,
+        candidate_source,
+        candidate_length + 1u
+    );
+
+    gui->source_length = candidate_length;
+
+    gui->source_line_count =
+        gui_count_source_lines(gui->source_text);
+
+    gui->source_loaded = true;
+
+    gui->source_scroll = 0;
+
+    /*
+     * Assemble the source.
+     */
+
+    AssemblerResult assembler_result = {0};
+
+    AssemblerStatus status = assembler_assemble(
+        gui->source_text,
+        &cpu->memory,
+        &assembler_result
+    );
+
+    gui->assembly_status = status;
+
+    gui->assembly_error_line =
+        assembler_result.error_line;
+
+    gui->last_assembly_succeeded =
+        status == ASSEMBLER_STATUS_OK;
+
+    /*
+     * Assembly failure:
+     * The previous machine code remains intact.
+     */
+
+    if (status != ASSEMBLER_STATUS_OK) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "Assembly error at line %u: %s",
+            (unsigned int)assembler_result.error_line,
+            assembler_status_string(status)
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return false;
+    }
+
+    /*
+     * Assembly succeeded.
+     */
+
+    gui->assembled_code_size =
+        assembler_result.code_size;
+
+    gui->assembled_instruction_count =
+        assembler_result.instruction_count;
+
+    gui->assembly_valid = true;
+
+    /*
+     * Reset CPU registers and PC.
+     *
+     * cpu_reset() preserves Memory.
+     */
+
+    CPUStatus reset_status = cpu_reset(cpu);
+
+    if (reset_status != CPU_STATUS_OK) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "CPU reset failed after assembly."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return false;
+    }
+
+    /*
+     * Reset GUI execution state.
+     */
+
+    reset_gui_cycle(gui);
+
+    gui->last_cpu_status = CPU_STATUS_OK;
+
+    clear_alu_visualization(gui);
+
+    clear_stack_event(gui);
+
+    initialize_state_tracking(gui, cpu);
+
+    gui_stack_follow_pointer(cpu, gui);
+
+    /*
+     * Prepare disassembly cache.
+     */
+
+    bool disassembly_ok =
+        gui_build_disassembly(cpu, gui);
+
+    gui->disassembly_follow_pc = true;
+
+    gui->disassembly_scroll = 0;
+
+    /*
+     * Open Assembly workspace.
+     */
+
+    gui->workspace_view =
+        GUI_WORKSPACE_ASSEMBLY;
+
+    if (!disassembly_ok) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "Assembly loaded, but disassembly failed."
+        );
+
+        gui->status_color = COLOR_YELLOW;
+
+        return true;
+    }
+
+    snprintf(
+        gui->status_message,
+        sizeof(gui->status_message),
+        "Assembly successful: %u instructions, %u bytes.",
+        (unsigned int)gui->assembled_instruction_count,
+        (unsigned int)gui->assembled_code_size
+    );
+
+    gui->status_color = COLOR_GREEN;
+
+    return true;
+}
+
+static void load_assembly_program(DioCPU *cpu, GUIState *gui)
+{
+    (void)gui_load_assembly_program(cpu, gui);
+}
+
+/* =========================================
+   BASIC UI DRAWING HELPERS
+   ========================================= */
+
+static void draw_panel(
+    int x,
+    int y,
+    int width,
+    int height,
+    const char *title
+)
+{
+    DrawRectangle(
+        x,
+        y,
+        width,
+        height,
+        COLOR_PANEL
+    );
+
+    DrawRectangleLines(
+        x,
+        y,
+        width,
+        height,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        title,
+        x + 16,
+        y + 13,
+        18,
+        COLOR_ACCENT
+    );
+}
+
+static void draw_metric_card(
+    int x,
+    int y,
+    int width,
+    int height,
+    const char *label,
+    const char *value,
+    Color value_color
+)
+{
+    DrawRectangle(
+        x,
+        y,
+        width,
+        height,
+        COLOR_PANEL
+    );
+
+    DrawRectangleLines(
+        x,
+        y,
+        width,
+        height,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        label,
+        x + 15,
+        y + 12,
+        13,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        value,
+        x + 15,
+        y + 38,
+        23,
+        value_color
+    );
+}
+
+static bool draw_button(
+    Rectangle bounds,
+    const char *label
+)
+{
+    Vector2 mouse = GetMousePosition();
+
+    bool hovered = CheckCollisionPointRec(
+        mouse,
+        bounds
+    );
+
+    Color background = hovered
+        ? (Color){55, 85, 110, 255}
+        : COLOR_PANEL_ALT;
+
+    DrawRectangleRec(
+        bounds,
+        background
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        1,
+        hovered ? COLOR_ACCENT : COLOR_BORDER
+    );
+
+    int text_width = MeasureText(label, 14);
+
+    DrawText(
+        label,
+        (int)(bounds.x +
+            (bounds.width - text_width) / 2),
+        (int)(bounds.y + 12),
+        14,
+        COLOR_TEXT
+    );
+
+    return hovered &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+/* =========================================
+   HEADER & INTERACTIVE CONTROLS
+   ========================================= */
+
+static void draw_header(DioCPU *cpu, GUIState *gui)
+{
+    DrawText(
+        "DioCPU",
+        22,
+        18,
+        28,
+        COLOR_ACCENT
+    );
+
+    DrawText(
+        "16-BIT ARCHITECTURE | INTERACTIVE SIMULATOR & MEMORY VIEWER",
+        22,
+        48,
+        12,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        gui->status_message,
+        410,
+        28,
+        14,
+        gui->status_color
+    );
+
+    Rectangle load_btn = {1320, 25, 120, 45};
+    if (draw_button(load_btn, "LOAD ASM")) {
+        load_assembly_program(cpu, gui);
+    }
+}
+
+/* =========================================
+   CPU DASHBOARD
+   ========================================= */
+
+static Color get_cpu_state_color(CPUState state)
+{
+    switch (state) {
+        case CPU_STATE_RUNNING:
+            return COLOR_GREEN;
+        case CPU_STATE_HALTED:
+            return COLOR_YELLOW;
+        case CPU_STATE_FAULTED:
+            return COLOR_RED;
+        default:
+            return COLOR_MUTED;
+    }
+}
+
+static void draw_cpu_dashboard(const DioCPU *cpu)
+{
+    char pc_text[32];
+    char sp_text[32];
+    char mar_text[32];
+    char flags_text[32];
+
+    snprintf(
+        pc_text,
+        sizeof(pc_text),
+        "0x%05X",
+        (unsigned int)cpu->pc
+    );
+
+    snprintf(
+        sp_text,
+        sizeof(sp_text),
+        "0x%05X",
+        (unsigned int)cpu->sp
+    );
+
+    snprintf(
+        mar_text,
+        sizeof(mar_text),
+        "0x%05X",
+        (unsigned int)cpu->mar
+    );
+
+    snprintf(
+        flags_text,
+        sizeof(flags_text),
+        "0x%04X",
+        (unsigned int)cpu->flags
+    );
+
+    draw_metric_card(
+        20, 85, 295, 75,
+        "PROGRAM COUNTER",
+        pc_text,
+        COLOR_YELLOW
+    );
+
+    draw_metric_card(
+        335, 85, 295, 75,
+        "STACK POINTER",
+        sp_text,
+        COLOR_CYAN
+    );
+
+    draw_metric_card(
+        650, 85, 295, 75,
+        "MEMORY ADDRESS REGISTER",
+        mar_text,
+        COLOR_CYAN
+    );
+
+    draw_metric_card(
+        965, 85, 295, 75,
+        "FLAGS REGISTER",
+        flags_text,
+        COLOR_ACCENT
+    );
+
+    char state_text[40];
+    snprintf(
+        state_text,
+        sizeof(state_text),
+        "%s",
+        cpu_state_string(cpu->state)
+    );
+
+    draw_metric_card(
+        1280, 85, 300, 75,
+        "CPU STATE",
+        state_text,
+        get_cpu_state_color(cpu->state)
+    );
+}
+
+/* =========================================
+   INSTRUCTION CYCLE PANEL
+   ========================================= */
+
+static void draw_cycle_panel(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    draw_panel(
+        430,
+        175,
+        1150,
+        145,
+        "INSTRUCTION CYCLE"
+    );
+
+    const int x_positions[] = {
+        455, 820, 1185
+    };
+
+    const Color phase_colors[] = {
+        FETCH_COLOR,
+        DECODE_COLOR,
+        EXECUTE_COLOR
+    };
+
+    const char *phase_names[] = {
+        "1. FETCH",
+        "2. DECODE",
+        "3. EXECUTE"
+    };
+
+    for (int i = 0; i < 3; i++) {
+
+        GUIPhase phase = (GUIPhase)(i + 1);
+
+        bool active = gui->phase == phase;
+
+        bool completed = gui->phase > phase;
+
+        Color color = active
+            ? phase_colors[i]
+            : (completed ? COLOR_GREEN : COLOR_BORDER);
+
+        Color background = active
+            ? (Color){45, 50, 58, 255}
+            : PANEL_BG;
+
+        Rectangle card = {
+            (float)x_positions[i],
+            220,
+            325,
+            75
+        };
+
+        DrawRectangleRec(card, background);
+
+        DrawRectangleLinesEx(
+            card,
+            active ? 2.0f : 1.0f,
+            color
+        );
+
+        DrawText(
+            phase_names[i],
+            (int)card.x + 15,
+            (int)card.y + 8,
+            17,
+            color
+        );
+
+
+        /* =========================
+           FETCH CARD
+           ========================= */
+
+        if (i == 0) {
+
+            if (gui->phase == GUI_PHASE_IDLE) {
+
+                DrawText(
+                    TextFormat(
+                        "PC: %05X | Waiting...",
+                        (unsigned int)cpu->pc
+                    ),
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    COLOR_MUTED
+                );
+
+            } else if (gui->fetch_valid) {
+
+                DrawText(
+                    TextFormat(
+                        "PC: %05X | OPCODE: %02X",
+                        (unsigned int)gui->instruction_pc,
+                        gui->fetched_opcode
+                    ),
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    TEXT_COLOR
+                );
+
+            } else {
+
+                DrawText(
+                    "Instruction fetch failed.",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    FAULT_COLOR
+                );
+            }
+        }
+
+
+        /* =========================
+           DECODE CARD
+           ========================= */
+
+        else if (i == 1) {
+
+            if (gui->phase < GUI_PHASE_DECODE) {
+
+                DrawText(
+                    "Waiting for Fetch...",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    COLOR_MUTED
+                );
+
+            } else if (
+                gui->decode_status == DECODER_STATUS_OK &&
+                gui->fetch_valid
+            ) {
+
+                char text[100];
+
+                format_instruction(
+                    &gui->decoded,
+                    text,
+                    sizeof(text)
+                );
+
+                DrawText(
+                    text,
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    TEXT_COLOR
+                );
+
+            } else {
+
+                DrawText(
+                    "Invalid instruction.",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    FAULT_COLOR
+                );
+            }
+        }
+
+
+        /* =========================
+           EXECUTE CARD
+           ========================= */
+
+        else {
+
+            if (gui->phase < GUI_PHASE_EXECUTE) {
+
+                DrawText(
+                    "Waiting for Decode...",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    COLOR_MUTED
+                );
+
+            } else if (
+                cpu->state == CPU_STATE_FAULTED
+            ) {
+
+                DrawText(
+                    "EXECUTION FAULT",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    FAULT_COLOR
+                );
+
+            } else if (
+                cpu->state == CPU_STATE_HALTED
+            ) {
+
+                DrawText(
+                    "CPU HALTED",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    FETCH_COLOR
+                );
+
+            } else {
+
+                DrawText(
+                    "Instruction completed.",
+                    (int)card.x + 15,
+                    (int)card.y + 43,
+                    13,
+                    COLOR_GREEN
+                );
+            }
+        }
+    }
+
+
+    /* =========================
+       RAW INSTRUCTION BYTES
+       ========================= */
+
+    if (gui->fetched_byte_count > 0) {
+
+        char bytes_text[64] = {0};
+
+        size_t offset = 0;
+
+        for (uint8_t i = 0;
+             i < gui->fetched_byte_count;
+             i++) {
+
+            int written = snprintf(
+                bytes_text + offset,
+                sizeof(bytes_text) - offset,
+                "%02X ",
+                gui->fetched_bytes[i]
+            );
+
+            if (written < 0 ||
+                (size_t)written >= sizeof(bytes_text) - offset) {
+                break;
+            }
+
+            offset += (size_t)written;
+        }
+
+        DrawText(
+            TextFormat(
+                "INSTRUCTION BYTES: %s",
+                bytes_text
+            ),
+            455,
+            301,
+            12,
+            COLOR_MUTED
+        );
+    }
+}
+
+/* =========================================
+   PROGRAM / DISASSEMBLY PANEL
+   ========================================= */
+
+static void draw_program_panel(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    draw_panel(
+        20,
+        175,
+        390,
+        430,
+        "PROGRAM INSTRUCTIONS"
+    );
+
+    if (gui->program_size == 0) {
+        DrawText(
+            "No program loaded in memory.",
+            40,
+            240,
+            14,
+            COLOR_MUTED
+        );
+        DrawText(
+            "Click LOAD ASM or press F6 to reset.",
+            40,
+            268,
+            13,
+            COLOR_MUTED
+        );
+        return;
+    }
+
+    uint32_t current_pc = 0;
+    int line_index = 0;
+    const int max_display_lines = 11;
+
+    while (current_pc < gui->program_size && line_index < max_display_lines) {
+
+        DecodedInstruction instr = {0};
+        DecoderStatus status = decoder_decode(&cpu->memory, current_pc, &instr);
+
+        if (status != DECODER_STATUS_OK) {
+            break;
+        }
+
+        int y_pos = 225 + line_index * 32;
+        bool is_current = (current_pc == cpu->pc);
+
+        if (is_current) {
+            DrawRectangle(
+                35,
+                y_pos - 4,
+                360,
+                28,
+                (Color){45, 75, 110, 255}
+            );
+            DrawRectangleLines(
+                35,
+                y_pos - 4,
+                360,
+                28,
+                COLOR_CYAN
+            );
+        }
+
+        DrawText(
+            is_current ? ">" : " ",
+            42,
+            y_pos + 2,
+            14,
+            COLOR_YELLOW
+        );
+
+        DrawText(
+            TextFormat("%05X:", (unsigned int)current_pc),
+            58,
+            y_pos + 2,
+            13,
+            is_current ? COLOR_YELLOW : COLOR_MUTED
+        );
+
+        char instr_text[80];
+        format_instruction(&instr, instr_text, sizeof(instr_text));
+
+        DrawText(
+            instr_text,
+            125,
+            y_pos + 2,
+            14,
+            is_current ? COLOR_TEXT : (Color){200, 205, 215, 255}
+        );
+
+        current_pc += instr.length;
+        line_index++;
+    }
+}
+
+/* =========================================
+   GENERAL PURPOSE REGISTER PANEL
+   ========================================= */
+
+static void draw_register_panel(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    draw_panel(
+        430,
+        330,
+        760,
+        275,
+        "GENERAL PURPOSE REGISTER FILE"
+    );
+
+    for (unsigned int i = 0;
+         i < CPU_GPR_COUNT;
+         i++) {
+
+        int column = (int)(i % 4);
+        int row = (int)(i / 4);
+
+        int x = 448 + column * 183;
+        int y = 370 + row * 56;
+
+        bool changed =
+            gui->register_flash[i] > 0.0f;
+
+        Color background = changed
+            ? (Color){25, 75, 45, 255}
+            : COLOR_PANEL_ALT;
+
+        Color border = changed
+            ? COLOR_GREEN
+            : COLOR_BORDER;
+
+        Color value_color = changed
+            ? COLOR_GREEN
+            : COLOR_TEXT;
+
+        DrawRectangle(
+            x,
+            y,
+            165,
+            50,
+            background
+        );
+
+        DrawRectangleLinesEx(
+            (Rectangle){
+                (float)x,
+                (float)y,
+                165,
+                50
+            },
+            changed ? 2.0f : 1.0f,
+            border
+        );
+
+        DrawText(
+            TextFormat("R%u", i),
+            x + 10,
+            y + 4,
+            12,
+            COLOR_MUTED
+        );
+
+        DrawText(
+            TextFormat(
+                "0x%04X",
+                (unsigned int)cpu->gpr[i]
+            ),
+            x + 10,
+            y + 20,
+            17,
+            value_color
+        );
+
+        if (changed) {
+            DrawText(
+                TextFormat(
+                    "WAS: %04X",
+                    (unsigned int)gui->old_register_values[i]
+                ),
+                x + 95,
+                y + 32,
+                9,
+                COLOR_GREEN
             );
         }
     }
 }
+
+/* =========================================
+   CPU INFORMATION & FLAGS
+   ========================================= */
+
+static void draw_flag_card(
+    int x,
+    int y,
+    int width,
+    int height,
+    const char *name,
+    const char *description,
+    bool enabled,
+    bool changed,
+    bool old_value
+)
+{
+    Color state_color = enabled
+        ? COLOR_GREEN
+        : COLOR_MUTED;
+
+    Color border_color = changed
+        ? COLOR_YELLOW
+        : (enabled ? COLOR_GREEN : COLOR_BORDER);
+
+    Color background = changed
+        ? (Color){65, 55, 25, 255}
+        : COLOR_PANEL_ALT;
+
+    DrawRectangle(
+        x,
+        y,
+        width,
+        height,
+        background
+    );
+
+    DrawRectangleLinesEx(
+        (Rectangle){
+            (float)x,
+            (float)y,
+            (float)width,
+            (float)height
+        },
+        changed ? 2.0f : 1.0f,
+        border_color
+    );
+
+    DrawText(
+        name,
+        x + 10,
+        y + 6,
+        16,
+        changed ? COLOR_YELLOW : state_color
+    );
+
+    DrawText(
+        enabled ? "1" : "0",
+        x + width - 20,
+        y + 6,
+        16,
+        state_color
+    );
+
+    if (changed) {
+        DrawText(
+            TextFormat("%d -> %d", old_value ? 1 : 0, enabled ? 1 : 0),
+            x + 10,
+            y + 32,
+            11,
+            COLOR_YELLOW
+        );
+    } else {
+        DrawText(
+            description,
+            x + 10,
+            y + 32,
+            11,
+            COLOR_MUTED
+        );
+    }
+}
+
+static void draw_cpu_information(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    draw_panel(
+        1210,
+        330,
+        370,
+        275,
+        "CPU STATUS & FLAGS"
+    );
+
+    DrawText(
+        TextFormat(
+            "Instructions executed: %llu",
+            (unsigned long long)cpu->instructions_executed
+        ),
+        1230,
+        370,
+        13,
+        COLOR_TEXT
+    );
+
+    DrawText(
+        TextFormat(
+            "CPU State: %s",
+            cpu_state_string(cpu->state)
+        ),
+        1230,
+        392,
+        13,
+        get_cpu_state_color(cpu->state)
+    );
+
+    DrawText(
+        TextFormat(
+            "Fault: %s",
+            cpu_fault_string(cpu->fault)
+        ),
+        1230,
+        414,
+        13,
+        cpu->fault == CPU_FAULT_NONE
+            ? COLOR_MUTED
+            : COLOR_RED
+    );
+
+    DrawText(
+        TextFormat(
+            "Fault PC: 0x%05X",
+            (unsigned int)cpu->fault_pc
+        ),
+        1230,
+        434,
+        13,
+        COLOR_MUTED
+    );
+
+    /* Flags 2x2 grid */
+
+    draw_flag_card(
+        1230, 460, 160, 52,
+        "ZF",
+        "Zero Flag",
+        (cpu->flags & CPU_FLAG_ZF) != 0,
+        gui->flag_flash[0] > 0.0f,
+        gui->old_flag_values[0]
+    );
+
+    draw_flag_card(
+        1405, 460, 160, 52,
+        "CF",
+        "Carry Flag",
+        (cpu->flags & CPU_FLAG_CF) != 0,
+        gui->flag_flash[1] > 0.0f,
+        gui->old_flag_values[1]
+    );
+
+    draw_flag_card(
+        1230, 520, 160, 52,
+        "SF",
+        "Sign Flag",
+        (cpu->flags & CPU_FLAG_SF) != 0,
+        gui->flag_flash[2] > 0.0f,
+        gui->old_flag_values[2]
+    );
+
+    draw_flag_card(
+        1405, 520, 160, 52,
+        "OF",
+        "Overflow Flag",
+        (cpu->flags & CPU_FLAG_OF) != 0,
+        gui->flag_flash[3] > 0.0f,
+        gui->old_flag_values[3]
+    );
+
+    DrawText(
+        "STATUS FLAGS REGISTER (16-BIT)",
+        1230,
+        580,
+        11,
+        COLOR_MUTED
+    );
+}
+
+/* =========================================
+   ANIMATED DATAPATH & ALU VISUALIZATION
+   ========================================= */
+
+static void draw_datapath_node(
+    Rectangle bounds,
+    const char *title,
+    const char *line1,
+    const char *line2,
+    bool active
+)
+{
+    Color background = active
+        ? (Color){35, 65, 82, 255}
+        : COLOR_PANEL_ALT;
+
+    Color border = active
+        ? COLOR_CYAN
+        : COLOR_BORDER;
+
+    DrawRectangleRec(bounds, background);
+
+    DrawRectangleLinesEx(
+        bounds,
+        active ? 2.0f : 1.0f,
+        border
+    );
+
+    DrawText(
+        title,
+        (int)bounds.x + 12,
+        (int)bounds.y + 9,
+        13,
+        active ? COLOR_CYAN : COLOR_ACCENT
+    );
+
+    DrawText(
+        line1,
+        (int)bounds.x + 12,
+        (int)bounds.y + 32,
+        13,
+        COLOR_TEXT
+    );
+
+    DrawText(
+        line2,
+        (int)bounds.x + 12,
+        (int)bounds.y + 52,
+        12,
+        COLOR_MUTED
+    );
+}
+
+static void draw_bus_arrow(
+    float start_x,
+    float end_x,
+    float y,
+    bool active,
+    float progress
+)
+{
+    Color bus_color = active
+        ? COLOR_CYAN
+        : COLOR_BORDER;
+
+    DrawLineEx(
+        (Vector2){start_x, y},
+        (Vector2){end_x - 10.0f, y},
+        active ? 3.0f : 1.5f,
+        bus_color
+    );
+
+    DrawTriangle(
+        (Vector2){end_x, y},
+        (Vector2){end_x - 12.0f, y - 7.0f},
+        (Vector2){end_x - 12.0f, y + 7.0f},
+        bus_color
+    );
+
+    /*
+     * Titik bergerak hanya muncul
+     * pada jalur yang sedang aktif.
+     */
+
+    if (active) {
+
+        float dot_x =
+            start_x +
+            ((end_x - start_x) * progress);
+
+        DrawCircle(
+            (int)dot_x,
+            (int)y,
+            6,
+            COLOR_YELLOW
+        );
+    }
+}
+
+static void format_fetched_bytes(
+    const GUIState *gui,
+    char *output,
+    size_t output_size
+)
+{
+    if (output == NULL || output_size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+
+    if (!gui->fetch_valid ||
+        gui->fetched_byte_count == 0) {
+
+        snprintf(
+            output,
+            output_size,
+            "Waiting for instruction"
+        );
+
+        return;
+    }
+
+    size_t used = 0;
+
+    for (uint8_t i = 0;
+         i < gui->fetched_byte_count;
+         i++) {
+
+        int written = snprintf(
+            output + used,
+            output_size - used,
+            "%02X ",
+            (unsigned int)gui->fetched_bytes[i]
+        );
+
+        if (written < 0 ||
+            (size_t)written >= output_size - used) {
+
+            break;
+        }
+
+        used += (size_t)written;
+    }
+}
+
+static void draw_datapath_visualization(
+    const DioCPU *cpu,
+    const GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        "CPU DATAPATH & ALU VISUALIZATION"
+    );
+
+    bool fetching =
+        gui->phase == GUI_FETCH;
+
+    bool decoding =
+        gui->phase == GUI_DECODE;
+
+    bool executing =
+        gui->phase == GUI_EXECUTE;
+
+    float progress = gui->datapath_animation_time;
+
+    if (progress < 0.0f || progress > 1.0f) {
+        progress = 0.0f;
+    }
+
+    /*
+     * =====================================
+     * TOP ROW: INSTRUCTION FETCH & DECODE
+     * =====================================
+     */
+
+    char pc_text[48];
+    char memory_text[64];
+    char bytes_text[64];
+
+    snprintf(
+        pc_text,
+        sizeof(pc_text),
+        "PC: 0x%05X",
+        (unsigned int)gui->instruction_pc
+    );
+
+    if (gui->fetch_valid) {
+
+        snprintf(
+            memory_text,
+            sizeof(memory_text),
+            "Opcode: 0x%02X",
+            (unsigned int)gui->fetched_opcode
+        );
+
+    } else {
+
+        snprintf(
+            memory_text,
+            sizeof(memory_text),
+            "Waiting for fetch"
+        );
+    }
+
+    format_fetched_bytes(
+        gui,
+        bytes_text,
+        sizeof(bytes_text)
+    );
+
+
+    Rectangle pc_node = {
+        (float)(x + 20),
+        (float)(y + 50),
+        170,
+        72
+    };
+
+    Rectangle memory_node = {
+        (float)(x + 250),
+        (float)(y + 50),
+        220,
+        72
+    };
+
+    Rectangle ir_node = {
+        (float)(x + 545),
+        (float)(y + 50),
+        190,
+        72
+    };
+
+    Rectangle decoder_node = {
+        (float)(x + 800),
+        (float)(y + 50),
+        250,
+        72
+    };
+
+    Rectangle control_node = {
+        (float)(x + 1120),
+        (float)(y + 50),
+        420,
+        72
+    };
+
+
+    draw_datapath_node(
+        pc_node,
+        "PROGRAM COUNTER",
+        pc_text,
+        "Instruction address",
+        fetching
+    );
+
+    draw_datapath_node(
+        memory_node,
+        "INSTRUCTION MEMORY",
+        memory_text,
+        "Read machine code",
+        fetching
+    );
+
+    draw_datapath_node(
+        ir_node,
+        "INSTRUCTION REGISTER",
+        bytes_text,
+        "Fetched instruction bytes",
+        fetching
+    );
+
+    draw_datapath_node(
+        decoder_node,
+        "INSTRUCTION DECODER",
+        gui->decode_status == DECODER_STATUS_OK
+            ? "Instruction decoded"
+            : "Waiting for decode",
+        "Opcode and operands",
+        decoding
+    );
+
+    const char *phase_name = "IDLE";
+
+    if (fetching) {
+        phase_name = "FETCH";
+    } else if (decoding) {
+        phase_name = "DECODE";
+    } else if (executing) {
+        phase_name = "EXECUTE";
+    }
+
+    draw_datapath_node(
+        control_node,
+        "CONTROL UNIT",
+        TextFormat("ACTIVE PHASE: %s", phase_name),
+        gui->alu_preview_valid
+            ? "ALU operation detected"
+            : "No ALU operation detected",
+        fetching || decoding || executing
+    );
+
+
+    /*
+     * Instruction flow arrows.
+     */
+
+    draw_bus_arrow(
+        (float)(x + 192),
+        (float)(x + 242),
+        (float)(y + 86),
+        fetching,
+        progress
+    );
+
+    draw_bus_arrow(
+        (float)(x + 472),
+        (float)(x + 537),
+        (float)(y + 86),
+        fetching,
+        progress
+    );
+
+    draw_bus_arrow(
+        (float)(x + 737),
+        (float)(x + 792),
+        (float)(y + 86),
+        decoding,
+        progress
+    );
+
+    draw_bus_arrow(
+        (float)(x + 1052),
+        (float)(x + 1112),
+        (float)(y + 86),
+        decoding,
+        progress
+    );
+
+
+    /*
+     * =====================================
+     * BOTTOM ROW: REGISTER FILE AND ALU
+     * =====================================
+     */
+
+    char register_a_text[64];
+    char register_b_text[64];
+
+    char alu_line1[100];
+    char alu_line2[100];
+
+    char writeback_line1[100];
+    char writeback_line2[100];
+
+
+    /*
+     * Register File input values.
+     */
+
+    if (gui->alu_preview_valid) {
+
+        snprintf(
+            register_a_text,
+            sizeof(register_a_text),
+            "A: R%u = 0x%04X",
+            (unsigned int)gui->alu_reg_a,
+            (unsigned int)gui->alu_input_a
+        );
+
+        if (gui->alu_is_unary) {
+
+            snprintf(
+                register_b_text,
+                sizeof(register_b_text),
+                "B: Not required"
+            );
+
+        } else {
+
+            snprintf(
+                register_b_text,
+                sizeof(register_b_text),
+                "B: R%u = 0x%04X",
+                (unsigned int)gui->alu_reg_b,
+                (unsigned int)gui->alu_input_b
+            );
+        }
+
+    } else {
+
+        snprintf(
+            register_a_text,
+            sizeof(register_a_text),
+            "Waiting for operands"
+        );
+
+        snprintf(
+            register_b_text,
+            sizeof(register_b_text),
+            "No ALU instruction"
+        );
+    }
+
+
+    /*
+     * ALU information.
+     */
+
+    if (!gui->alu_preview_valid) {
+
+        snprintf(
+            alu_line1,
+            sizeof(alu_line1),
+            "No ALU operation"
+        );
+
+        snprintf(
+            alu_line2,
+            sizeof(alu_line2),
+            "Waiting for instruction"
+        );
+
+    } else if (gui->alu_instruction_invalid) {
+
+        snprintf(
+            alu_line1,
+            sizeof(alu_line1),
+            "Invalid register combination"
+        );
+
+        snprintf(
+            alu_line2,
+            sizeof(alu_line2),
+            "Operation cannot execute"
+        );
+
+    } else {
+
+        snprintf(
+            alu_line1,
+            sizeof(alu_line1),
+            "%s | A=0x%04X B=0x%04X",
+            gui_alu_operation_name(gui->alu_operation),
+            (unsigned int)gui->alu_input_a,
+            (unsigned int)gui->alu_input_b
+        );
+
+        if (!gui->alu_result_visible) {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "Result waiting for EXECUTE"
+            );
+
+        } else if (
+            gui->alu_preview.status != ALU_STATUS_OK
+        ) {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "ALU ERROR: %s",
+                gui_alu_status_string(
+                    gui->alu_preview.status
+                )
+            );
+
+        } else if (gui->alu_execution_failed) {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "CPU did not commit the result"
+            );
+
+        } else {
+
+            snprintf(
+                alu_line2,
+                sizeof(alu_line2),
+                "RESULT: 0x%04X",
+                (unsigned int)gui->alu_preview.result
+            );
+        }
+    }
+
+
+    /*
+     * Register Writeback information.
+     */
+
+    if (!gui->alu_preview_valid) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "Waiting for ALU result"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "No register writeback"
+        );
+
+    } else if (gui->alu_instruction_invalid) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "Invalid instruction"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "No register changes"
+        );
+
+    } else if (!gui->alu_result_visible) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "Waiting for execution"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "Writeback pending"
+        );
+
+    } else if (gui->alu_execution_failed) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "EXECUTION FAILED"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "Register changes not committed"
+        );
+
+    } else if (gui->alu_is_compare) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "CMP: FLAGS updated"
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "No GPR writeback"
+        );
+
+    } else if (gui->alu_is_division) {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "R%u = 0x%04X (quotient)",
+            (unsigned int)gui->alu_reg_a,
+            (unsigned int)gui->alu_reg_a_after
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "R%u = 0x%04X (remainder)",
+            (unsigned int)gui->alu_reg_b,
+            (unsigned int)gui->alu_reg_b_after
+        );
+
+    } else {
+
+        snprintf(
+            writeback_line1,
+            sizeof(writeback_line1),
+            "R%u: 0x%04X",
+            (unsigned int)gui->alu_reg_a,
+            (unsigned int)gui->alu_reg_a_after
+        );
+
+        snprintf(
+            writeback_line2,
+            sizeof(writeback_line2),
+            "Previous: 0x%04X",
+            (unsigned int)gui->alu_reg_a_before
+        );
+    }
+
+
+    Rectangle register_node = {
+        (float)(x + 20),
+        (float)(y + 175),
+        370,
+        95
+    };
+
+    Rectangle alu_node = {
+        (float)(x + 580),
+        (float)(y + 175),
+        380,
+        95
+    };
+
+    Rectangle writeback_node = {
+        (float)(x + 1160),
+        (float)(y + 175),
+        380,
+        95
+    };
+
+
+    draw_datapath_node(
+        register_node,
+        "REGISTER FILE",
+        register_a_text,
+        register_b_text,
+        decoding
+    );
+
+    draw_datapath_node(
+        alu_node,
+        "ARITHMETIC LOGIC UNIT",
+        alu_line1,
+        alu_line2,
+        executing
+    );
+
+    draw_datapath_node(
+        writeback_node,
+        "REGISTER WRITEBACK",
+        writeback_line1,
+        writeback_line2,
+        executing && gui->alu_result_visible
+    );
+
+
+    /*
+     * Register File -> ALU.
+     */
+
+    draw_bus_arrow(
+        (float)(x + 392),
+        (float)(x + 572),
+        (float)(y + 222),
+        decoding && gui->alu_preview_valid,
+        progress
+    );
+
+
+    /*
+     * ALU -> Register Writeback.
+     */
+
+    draw_bus_arrow(
+        (float)(x + 962),
+        (float)(x + 1152),
+        (float)(y + 222),
+        executing &&
+            gui->alu_result_visible &&
+            !gui->alu_execution_failed &&
+            gui->alu_preview.status == ALU_STATUS_OK,
+        progress
+    );
+
+
+    /*
+     * =====================================
+     * FLAGS & SHORTCUT HINT
+     * =====================================
+     */
+
+    uint16_t displayed_flags =
+        gui->alu_result_visible
+            ? gui->alu_flags_after
+            : (gui->alu_preview_valid
+                ? gui->alu_flags_before
+                : cpu->flags);
+
+    DrawText(
+        TextFormat(
+            "FLAGS: ZF=%u   CF=%u   SF=%u   OF=%u",
+            (displayed_flags & CPU_FLAG_ZF) != 0,
+            (displayed_flags & CPU_FLAG_CF) != 0,
+            (displayed_flags & CPU_FLAG_SF) != 0,
+            (displayed_flags & CPU_FLAG_OF) != 0
+        ),
+        x + 25,
+        y + 295,
+        15,
+        COLOR_YELLOW
+    );
+
+    DrawText(
+        "F7: OPEN MEMORY VIEWER",
+        x + 25,
+        y + 316,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "16-BIT DATA PATH | 18-BIT ADDRESS PATH",
+        x + 1150,
+        y + 295,
+        12,
+        COLOR_MUTED
+    );
+}
+
+static void draw_datapath(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    draw_datapath_visualization(
+        cpu,
+        gui,
+        (Rectangle){20, 620, 1560, 335}
+    );
+}
+
+/* =========================================
+   STEP 6 — MEMORY VIEWER (INSTRUCTION & DATA)
+   ========================================= */
+
+static void draw_memory_viewer(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    if (gui->memory_view != GUI_MEMORY_VIEW_INSTRUCTION &&
+        gui->memory_view != GUI_MEMORY_VIEW_DATA) {
+
+        gui->memory_view = GUI_MEMORY_VIEW_INSTRUCTION;
+    }
+
+    normalize_memory_base(gui);
+
+    bool instruction_view =
+        gui->memory_view == GUI_MEMORY_VIEW_INSTRUCTION;
+
+    const char *title = instruction_view
+        ? "INSTRUCTION MEMORY VIEWER"
+        : "DATA MEMORY VIEWER";
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        title
+    );
+
+    /*
+     * =====================================
+     * MEMORY VIEW CONTROLS
+     * =====================================
+     */
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 730),
+                (float)(y + 9),
+                140,
+                30
+            },
+            "INSTRUCTION",
+            instruction_view
+        )) {
+
+        gui->memory_view =
+            GUI_MEMORY_VIEW_INSTRUCTION;
+
+        memory_go_to_cpu_pointer(cpu, gui);
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 880),
+                (float)(y + 9),
+                100,
+                30
+            },
+            "DATA",
+            !instruction_view
+        )) {
+
+        gui->memory_view =
+            GUI_MEMORY_VIEW_DATA;
+
+        memory_go_to_cpu_pointer(cpu, gui);
+
+        instruction_view = false;
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 990),
+                (float)(y + 9),
+                80,
+                30
+            },
+            "< PREV",
+            false
+        )) {
+
+        memory_move_page(gui, -1);
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 1080),
+                (float)(y + 9),
+                80,
+                30
+            },
+            "NEXT >",
+            false
+        )) {
+
+        memory_move_page(gui, 1);
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 1170),
+                (float)(y + 9),
+                180,
+                30
+            },
+            instruction_view ? "FOLLOW PC" : "FOLLOW MAR",
+            false
+        )) {
+
+        memory_go_to_cpu_pointer(cpu, gui);
+    }
+
+    /*
+     * Update selected view after button interaction.
+     */
+
+    instruction_view =
+        gui->memory_view == GUI_MEMORY_VIEW_INSTRUCTION;
+
+    uint32_t selected_address =
+        get_memory_selected_address(
+            cpu,
+            gui->memory_view
+        );
+
+    /*
+     * =====================================
+     * MEMORY INFORMATION
+     * =====================================
+     */
+
+    uint32_t page_number =
+        gui->memory_base / GUI_MEMORY_PAGE_SIZE + 1u;
+
+    uint32_t total_pages =
+        DIOCPU_MEMORY_SIZE / GUI_MEMORY_PAGE_SIZE;
+
+    DrawText(
+        TextFormat(
+            "BASE: 0x%05X    END: 0x%05X    PAGE: %u / %u",
+            (unsigned int)gui->memory_base,
+            (unsigned int)(
+                gui->memory_base +
+                GUI_MEMORY_PAGE_SIZE - 1u
+            ),
+            (unsigned int)page_number,
+            (unsigned int)total_pages
+        ),
+        x + 22,
+        y + 49,
+        13,
+        COLOR_TEXT
+    );
+
+    DrawText(
+        TextFormat(
+            "%s: 0x%05X",
+            instruction_view ? "PC" : "MAR",
+            (unsigned int)selected_address
+        ),
+        x + 1100,
+        y + 49,
+        13,
+        COLOR_YELLOW
+    );
+
+    /*
+     * =====================================
+     * COLUMN HEADERS
+     * =====================================
+     */
+
+    DrawText(
+        "ADDRESS",
+        x + 22,
+        y + 78,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "BYTES (HEX)",
+        x + 110,
+        y + 78,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "ASCII",
+        x + 620,
+        y + 78,
+        11,
+        COLOR_MUTED
+    );
+
+    if (!instruction_view) {
+
+        DrawText(
+            "16-BIT WORDS (LITTLE ENDIAN)",
+            x + 835,
+            y + 78,
+            11,
+            COLOR_MUTED
+        );
+    }
+
+    /*
+     * =====================================
+     * MEMORY ROWS
+     * =====================================
+     */
+
+    for (unsigned int row = 0;
+         row < GUI_MEMORY_ROWS;
+         row++) {
+
+        uint32_t row_address =
+            gui->memory_base +
+            row * GUI_MEMORY_BYTES_PER_ROW;
+
+        int row_y =
+            y + 99 + (int)row * 27;
+
+        /*
+         * Address label.
+         */
+
+        DrawText(
+            TextFormat(
+                "0x%05X",
+                (unsigned int)row_address
+            ),
+            x + 22,
+            row_y + 4,
+            13,
+            COLOR_CYAN
+        );
+
+        /*
+         * ASCII representation.
+         */
+
+        char ascii[GUI_MEMORY_BYTES_PER_ROW + 1];
+
+        /*
+         * Read and draw each byte.
+         */
+
+        for (unsigned int column = 0;
+             column < GUI_MEMORY_BYTES_PER_ROW;
+             column++) {
+
+            uint32_t address =
+                row_address + column;
+
+            uint8_t value = gui_memory_read_byte(
+                cpu,
+                gui->memory_view,
+                address
+            );
+
+            /*
+             * Convert byte into ASCII.
+             * Non-printable characters become '.'.
+             */
+
+            ascii[column] =
+                (value >= 32 && value <= 126)
+                    ? (char)value
+                    : '.';
+
+            bool selected =
+                address == selected_address ||
+                (!instruction_view &&
+                 selected_address < DIOCPU_MEMORY_MAX_ADDRESS &&
+                 address == selected_address + 1u);
+
+            Color cell_background = selected
+                ? (instruction_view
+                    ? (Color){75, 65, 25, 255}
+                    : (Color){25, 70, 90, 255})
+                : ((column % 2u == 0u)
+                    ? COLOR_PANEL_ALT
+                    : COLOR_PANEL);
+
+            Color cell_border = selected
+                ? COLOR_YELLOW
+                : COLOR_BORDER;
+
+            int cell_x =
+                x + 110 + (int)column * 30;
+
+            Rectangle cell = {
+                (float)cell_x,
+                (float)row_y,
+                26,
+                23
+            };
+
+            DrawRectangleRec(
+                cell,
+                cell_background
+            );
+
+            DrawRectangleLinesEx(
+                cell,
+                selected ? 1.5f : 0.7f,
+                cell_border
+            );
+
+            DrawText(
+                TextFormat("%02X", (unsigned int)value),
+                cell_x + 3,
+                row_y + 5,
+                12,
+                selected ? COLOR_YELLOW : COLOR_TEXT
+            );
+        }
+
+        ascii[GUI_MEMORY_BYTES_PER_ROW] = '\0';
+
+        /*
+         * ASCII column.
+         */
+
+        DrawText(
+            ascii,
+            x + 620,
+            row_y + 5,
+            13,
+            COLOR_MUTED
+        );
+
+        /*
+         * =================================
+         * DATA MEMORY WORD REPRESENTATION
+         * =================================
+         */
+
+        if (!instruction_view) {
+
+            for (unsigned int word = 0;
+                 word < 8;
+                 word++) {
+
+                uint32_t address =
+                    row_address + word * 2u;
+
+                uint8_t low = gui_memory_read_byte(
+                    cpu,
+                    GUI_MEMORY_VIEW_DATA,
+                    address
+                );
+
+                uint8_t high = gui_memory_read_byte(
+                    cpu,
+                    GUI_MEMORY_VIEW_DATA,
+                    address + 1u
+                );
+
+                uint16_t value =
+                    (uint16_t)low |
+                    ((uint16_t)high << 8u);
+
+                bool selected =
+                    selected_address == address ||
+                    selected_address == address + 1u;
+
+                int word_x =
+                    x + 835 + (int)word * 82;
+
+                Rectangle word_cell = {
+                    (float)word_x,
+                    (float)row_y,
+                    72,
+                    23
+                };
+
+                DrawRectangleRec(
+                    word_cell,
+                    selected
+                        ? (Color){65, 55, 25, 255}
+                        : COLOR_PANEL_ALT
+                );
+
+                DrawRectangleLinesEx(
+                    word_cell,
+                    selected ? 1.5f : 0.7f,
+                    selected ? COLOR_YELLOW : COLOR_BORDER
+                );
+
+                DrawText(
+                    TextFormat(
+                        "%04X",
+                        (unsigned int)value
+                    ),
+                    word_x + 10,
+                    row_y + 5,
+                    13,
+                    selected ? COLOR_YELLOW : COLOR_TEXT
+                );
+            }
+        }
+    }
+
+    /*
+     * =====================================
+     * FOOTER
+     * =====================================
+     */
+
+    DrawText(
+        instruction_view
+            ? "F7: BACK TO DATAPATH | I: Instruction | D: Data | PgUp/PgDn: Page | Home: PC | PC is highlighted in yellow"
+            : "F7: BACK TO DATAPATH | I: Instruction | D: Data | PgUp/PgDn: Page | Home: MAR | MAR and next byte are highlighted",
+        x + 22,
+        y + 316,
+        12,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "READ ONLY VIEW",
+        x + 1400,
+        y + 316,
+        11,
+        COLOR_GREEN
+    );
+}
+
+/* =========================================
+   STACK VIEWER
+   ========================================= */
+
+static void draw_stack_viewer(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    bool sp_valid = gui_stack_sp_valid(cpu->sp);
+
+    /*
+     * Follow SP automatically when enabled.
+     */
+
+    if (gui->stack_follow_sp && sp_valid) {
+
+        gui->stack_view_base = cpu->sp;
+    }
+
+    /*
+     * Ensure page alignment.
+     */
+
+    gui->stack_view_base -=
+        gui->stack_view_base % 2u;
+
+    /*
+     * Clamp view base to stack bounds.
+     */
+
+    if (sp_valid) {
+
+        if (gui->stack_view_base < cpu->sp) {
+            gui->stack_view_base = cpu->sp;
+        }
+
+        if (
+            gui->stack_view_base >
+            DIOCPU_STACK_INITIAL_SP
+        ) {
+
+            gui->stack_view_base =
+                DIOCPU_STACK_INITIAL_SP;
+        }
+    }
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        "STACK MEMORY VIEWER"
+    );
+
+    /*
+     * =====================================
+     * CONTROLS
+     * =====================================
+     */
+
+    if (draw_stack_control(
+            (Rectangle){
+                (float)(x + 1050),
+                (float)(y + 9),
+                130,
+                30
+            },
+            "FOLLOW SP",
+            gui->stack_follow_sp
+        )) {
+
+        gui_stack_follow_pointer(cpu, gui);
+    }
+
+    if (draw_stack_control(
+            (Rectangle){
+                (float)(x + 1190),
+                (float)(y + 9),
+                90,
+                30
+            },
+            "OLDER >",
+            false
+        )) {
+
+        gui_stack_view_older(gui);
+    }
+
+    if (draw_stack_control(
+            (Rectangle){
+                (float)(x + 1290),
+                (float)(y + 9),
+                90,
+                30
+            },
+            "< NEWER",
+            false
+        )) {
+
+        gui_stack_view_newer(cpu, gui);
+    }
+
+    /*
+     * =====================================
+     * STACK STATISTICS
+     * =====================================
+     */
+
+    if (sp_valid) {
+
+        uint32_t used_bytes =
+            gui_stack_used_bytes(cpu);
+
+        uint32_t free_bytes =
+            gui_stack_free_bytes(cpu);
+
+        uint32_t used_words =
+            gui_stack_used_words(cpu);
+
+        uint32_t capacity_words =
+            gui_stack_capacity_words();
+
+        DrawText(
+            TextFormat(
+                "SP: 0x%05X",
+                (unsigned int)cpu->sp
+            ),
+            x + 22,
+            y + 49,
+            14,
+            COLOR_YELLOW
+        );
+
+        DrawText(
+            TextFormat(
+                "USED: %u / %u WORDS",
+                (unsigned int)used_words,
+                (unsigned int)capacity_words
+            ),
+            x + 245,
+            y + 49,
+            13,
+            COLOR_TEXT
+        );
+
+        DrawText(
+            TextFormat(
+                "USED BYTES: %u",
+                (unsigned int)used_bytes
+            ),
+            x + 570,
+            y + 49,
+            13,
+            COLOR_CYAN
+        );
+
+        DrawText(
+            TextFormat(
+                "FREE BYTES: %u",
+                (unsigned int)free_bytes
+            ),
+            x + 790,
+            y + 49,
+            13,
+            COLOR_GREEN
+        );
+
+    } else {
+
+        DrawText(
+            "INVALID STACK POINTER",
+            x + 22,
+            y + 49,
+            14,
+            COLOR_RED
+        );
+    }
+
+    /*
+     * =====================================
+     * EVENT INFORMATION
+     * =====================================
+     */
+
+    draw_stack_event_information(
+        gui,
+        x + 22,
+        y + 78
+    );
+
+    /*
+     * =====================================
+     * STACK TABLE HEADERS
+     * =====================================
+     */
+
+    int table_y = y + 130;
+
+    DrawText(
+        "ADDRESS",
+        x + 22,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "LOW BYTE",
+        x + 180,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "HIGH BYTE",
+        x + 320,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "16-BIT VALUE",
+        x + 500,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "STACK STATUS",
+        x + 690,
+        table_y,
+        11,
+        COLOR_MUTED
+    );
+
+    /*
+     * =====================================
+     * STACK ROWS
+     * =====================================
+     */
+
+    for (unsigned int i = 0;
+         i < GUI_STACK_VIEW_WORDS;
+         i++) {
+
+        uint32_t address =
+            gui->stack_view_base + i * 2u;
+
+        int row_y =
+            table_y + 18 + (int)i * 17;
+
+        if (address + 1u > DIOCPU_STACK_TOP) {
+            break;
+        }
+
+        uint8_t low =
+            cpu->memory.data[address];
+
+        uint8_t high =
+            cpu->memory.data[address + 1u];
+
+        uint16_t value =
+            (uint16_t)low |
+            ((uint16_t)high << 8u);
+
+        bool active =
+            sp_valid &&
+            address >= cpu->sp &&
+            address + 1u < DIOCPU_STACK_INITIAL_SP;
+
+        bool is_top =
+            active && address == cpu->sp;
+
+        bool event_address =
+            gui->stack_event_timer > 0.0f &&
+            address == gui->stack_event_address;
+
+        bool event_high_address =
+            gui->stack_event_timer > 0.0f &&
+            gui->stack_event_type == GUI_STACK_EVENT_CALL &&
+            address == gui->stack_event_address + 2u;
+
+        Color background = is_top
+            ? (Color){65, 55, 25, 255}
+            : ((active)
+                ? COLOR_PANEL_ALT
+                : COLOR_PANEL);
+
+        Color border = is_top
+            ? COLOR_YELLOW
+            : (event_address || event_high_address
+                ? COLOR_CYAN
+                : COLOR_BORDER);
+
+        DrawRectangle(
+            x + 20,
+            row_y,
+            950,
+            15,
+            background
+        );
+
+        DrawRectangleLines(
+            x + 20,
+            row_y,
+            950,
+            15,
+            border
+        );
+
+        /*
+         * ADDRESS
+         */
+
+        DrawText(
+            TextFormat(
+                "0x%05X",
+                (unsigned int)address
+            ),
+            x + 22,
+            row_y + 2,
+            11,
+            COLOR_CYAN
+        );
+
+        /*
+         * LOW BYTE
+         */
+
+        DrawText(
+            TextFormat(
+                "%02X",
+                (unsigned int)low
+            ),
+            x + 190,
+            row_y + 2,
+            11,
+            COLOR_TEXT
+        );
+
+        /*
+         * HIGH BYTE
+         */
+
+        DrawText(
+            TextFormat(
+                "%02X",
+                (unsigned int)high
+            ),
+            x + 335,
+            row_y + 2,
+            11,
+            COLOR_TEXT
+        );
+
+        /*
+         * 16-BIT WORD
+         */
+
+        DrawText(
+            TextFormat(
+                "0x%04X",
+                (unsigned int)value
+            ),
+            x + 515,
+            row_y + 2,
+            11,
+            COLOR_YELLOW
+        );
+
+        /*
+         * STATUS
+         */
+
+        const char *status = "INACTIVE";
+
+        Color status_color = COLOR_MUTED;
+
+        if (is_top) {
+
+            status = "TOP OF STACK";
+            status_color = COLOR_YELLOW;
+
+        } else if (active) {
+
+            status = "ACTIVE";
+            status_color = COLOR_GREEN;
+        }
+
+        if (event_address) {
+
+            if (gui->stack_event_type == GUI_STACK_EVENT_PUSH) {
+                status = "PUSHED";
+                status_color = COLOR_GREEN;
+            }
+
+            if (gui->stack_event_type == GUI_STACK_EVENT_CALL) {
+                status = "RETURN LOW";
+                status_color = COLOR_CYAN;
+            }
+        }
+
+        if (event_high_address) {
+
+            status = "RETURN HIGH";
+            status_color = COLOR_CYAN;
+        }
+
+        DrawText(
+            status,
+            x + 690,
+            row_y + 2,
+            11,
+            status_color
+        );
+    }
+
+    /*
+     * =====================================
+     * EMPTY STACK MESSAGE / INFO BOX
+     * =====================================
+     */
+
+    if (sp_valid && cpu->sp == DIOCPU_STACK_INITIAL_SP) {
+
+        DrawText(
+            "STACK IS EMPTY",
+            x + 1000,
+            y + 165,
+            18,
+            COLOR_MUTED
+        );
+
+        DrawText(
+            "Initial SP is at 0x3FFFE.\nPushing 16-bit values decrements SP by 2.\nCalling subroutines pushes 32-bit return address (4 bytes).",
+            x + 1000,
+            y + 195,
+            12,
+            COLOR_MUTED
+        );
+
+    } else if (sp_valid) {
+
+        DrawText(
+            "STACK MEMORY REGION",
+            x + 1000,
+            y + 140,
+            14,
+            COLOR_CYAN
+        );
+
+        DrawText(
+            TextFormat("Current SP: 0x%05X\nInitial SP: 0x%05X\nStack Bottom: 0x%05X",
+                (unsigned int)cpu->sp,
+                (unsigned int)DIOCPU_STACK_INITIAL_SP,
+                (unsigned int)DIOCPU_STACK_BOTTOM),
+            x + 1000,
+            y + 165,
+            12,
+            COLOR_TEXT
+        );
+
+        DrawText(
+            "Stack grows downwards towards lower addresses.\nLow byte is stored at address N, high byte at N+1.",
+            x + 1000,
+            y + 225,
+            12,
+            COLOR_MUTED
+        );
+    }
+
+    /*
+     * =====================================
+     * FOOTER
+     * =====================================
+     */
+
+    DrawText(
+        "STACK GROWS DOWNWARD | 16-BIT PUSH/POP | 32-BIT CALL/RET",
+        x + 22,
+        y + 316,
+        12,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "F7: NEXT WORKSPACE",
+        x + 1320,
+        y + 316,
+        11,
+        COLOR_ACCENT
+    );
+}
+
+/* =========================================
+   ASSEMBLY WORKSPACE COMPONENTS
+   ========================================= */
+
+static void update_assembly_path_input(
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    Vector2 mouse = GetMousePosition();
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+
+        gui->path_focused =
+            CheckCollisionPointRec(mouse, bounds);
+    }
+
+    if (!gui->path_focused) {
+        return;
+    }
+
+    /*
+     * Type printable ASCII characters.
+     */
+
+    int character = GetCharPressed();
+
+    while (character > 0) {
+
+        size_t length = strlen(gui->source_path);
+
+        if (
+            character >= 32 &&
+            character <= 126 &&
+            length + 1 < sizeof(gui->source_path)
+        ) {
+
+            gui->source_path[length] =
+                (char)character;
+
+            gui->source_path[length + 1] = '\0';
+        }
+
+        character = GetCharPressed();
+    }
+
+    /*
+     * Backspace.
+     */
+
+    if (IsKeyPressed(KEY_BACKSPACE)) {
+
+        size_t length = strlen(gui->source_path);
+
+        if (length > 0) {
+
+            gui->source_path[length - 1] = '\0';
+        }
+    }
+}
+
+static void draw_source_listing(
+    const GUIState *gui,
+    Rectangle bounds
+)
+{
+    DrawRectangleRec(
+        bounds,
+        COLOR_PANEL_ALT
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        1.0f,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        "ASSEMBLY SOURCE",
+        (int)bounds.x + 12,
+        (int)bounds.y + 8,
+        14,
+        COLOR_ACCENT
+    );
+
+    if (!gui->source_loaded) {
+
+        DrawText(
+            "Load an .asm file to display source code.",
+            (int)bounds.x + 15,
+            (int)bounds.y + 45,
+            13,
+            COLOR_MUTED
+        );
+
+        return;
+    }
+
+    const char *cursor = gui->source_text;
+
+    uint32_t line_number = 1;
+
+    uint32_t first_line =
+        gui->source_scroll + 1u;
+
+    uint32_t last_line =
+        first_line + GUI_SOURCE_VISIBLE_ROWS - 1u;
+
+    int row = 0;
+
+    while (cursor != NULL && *cursor != '\0') {
+
+        const char *line_start = cursor;
+
+        const char *newline = strchr(cursor, '\n');
+
+        size_t length = newline
+            ? (size_t)(newline - line_start)
+            : strlen(line_start);
+
+        if (
+            length > 0 &&
+            line_start[length - 1] == '\r'
+        ) {
+
+            length--;
+        }
+
+        if (line_number >= first_line &&
+            line_number <= last_line) {
+
+            int line_y =
+                (int)bounds.y + 34 + row * 20;
+
+            bool error_line =
+                !gui->last_assembly_succeeded &&
+                gui->assembly_error_line == line_number;
+
+            if (error_line) {
+
+                DrawRectangle(
+                    (int)bounds.x + 5,
+                    line_y - 2,
+                    (int)bounds.width - 10,
+                    19,
+                    (Color){75, 30, 35, 255}
+                );
+            }
+
+            DrawText(
+                TextFormat("%03u", (unsigned int)line_number),
+                (int)bounds.x + 12,
+                line_y,
+                11,
+                error_line ? COLOR_RED : COLOR_MUTED
+            );
+
+            char line_text[120];
+
+            size_t copy_length = length;
+
+            if (copy_length >= sizeof(line_text)) {
+                copy_length = sizeof(line_text) - 1u;
+            }
+
+            memcpy(
+                line_text,
+                line_start,
+                copy_length
+            );
+
+            line_text[copy_length] = '\0';
+
+            DrawText(
+                line_text,
+                (int)bounds.x + 55,
+                line_y,
+                12,
+                error_line ? COLOR_RED : COLOR_TEXT
+            );
+
+            row++;
+        }
+
+        if (row >= (int)GUI_SOURCE_VISIBLE_ROWS) {
+            break;
+        }
+
+        if (newline == NULL) {
+            break;
+        }
+
+        cursor = newline + 1;
+
+        line_number++;
+    }
+
+    DrawText(
+        TextFormat(
+            "LINES: %u",
+            (unsigned int)gui->source_line_count
+        ),
+        (int)bounds.x + 12,
+        (int)(bounds.y + bounds.height - 22),
+        10,
+        COLOR_MUTED
+    );
+}
+
+static void draw_disassembly_listing(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    DrawRectangleRec(
+        bounds,
+        COLOR_PANEL_ALT
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        1.0f,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        gui->last_assembly_succeeded
+            ? "MACHINE CODE & DISASSEMBLY"
+            : "LAST SUCCESSFUL MACHINE CODE",
+        (int)bounds.x + 12,
+        (int)bounds.y + 8,
+        14,
+        COLOR_ACCENT
+    );
+
+    if (!gui->assembly_valid) {
+
+        DrawText(
+            "No assembled program available.",
+            (int)bounds.x + 15,
+            (int)bounds.y + 45,
+            13,
+            COLOR_MUTED
+        );
+
+        return;
+    }
+
+    /*
+     * Find current PC in disassembly.
+     */
+
+    if (gui->disassembly_follow_pc) {
+
+        for (
+            uint32_t i = 0;
+            i < gui->disassembly_count;
+            i++
+        ) {
+
+            if (
+                gui_disassembly_rows[i].address ==
+                cpu->pc
+            ) {
+
+                if (i < gui->disassembly_scroll) {
+
+                    gui->disassembly_scroll = i;
+
+                } else if (
+                    i >=
+                    gui->disassembly_scroll +
+                    GUI_DISASSEMBLY_VISIBLE_ROWS
+                ) {
+
+                    gui->disassembly_scroll =
+                        i - GUI_DISASSEMBLY_VISIBLE_ROWS + 1u;
+                }
+
+                break;
+            }
+        }
+    }
+
+    /*
+     * Draw visible disassembly rows.
+     */
+
+    uint32_t end =
+        gui->disassembly_scroll +
+        GUI_DISASSEMBLY_VISIBLE_ROWS;
+
+    if (end > gui->disassembly_count) {
+        end = gui->disassembly_count;
+    }
+
+    int row = 0;
+
+    for (
+        uint32_t i = gui->disassembly_scroll;
+        i < end;
+        i++
+    ) {
+
+        const GUIDisassemblyRow *entry =
+            &gui_disassembly_rows[i];
+
+        int line_y =
+            (int)bounds.y + 34 + row * 20;
+
+        bool current_instruction =
+            entry->address == cpu->pc;
+
+        Color background = current_instruction
+            ? (Color){75, 60, 25, 255}
+            : COLOR_PANEL_ALT;
+
+        Color text_color = current_instruction
+            ? COLOR_YELLOW
+            : COLOR_TEXT;
+
+        DrawRectangle(
+            (int)bounds.x + 5,
+            line_y - 2,
+            (int)bounds.width - 10,
+            19,
+            background
+        );
+
+        DrawText(
+            entry->text,
+            (int)bounds.x + 12,
+            line_y,
+            11,
+            text_color
+        );
+
+        row++;
+    }
+
+    if (gui->disassembly_count == 0) {
+
+        DrawText(
+            "No instructions to display.",
+            (int)bounds.x + 15,
+            (int)bounds.y + 45,
+            13,
+            COLOR_MUTED
+        );
+    }
+
+    DrawText(
+        TextFormat(
+            "INSTRUCTIONS: %u | PC: 0x%05X",
+            (unsigned int)gui->disassembly_count,
+            (unsigned int)cpu->pc
+        ),
+        (int)bounds.x + 12,
+        (int)(bounds.y + bounds.height - 22),
+        10,
+        COLOR_MUTED
+    );
+
+    if (gui->disassembly_truncated) {
+
+        DrawText(
+            "DISPLAY LIMIT: 1024 ROWS",
+            (int)bounds.x + 500,
+            (int)(bounds.y + bounds.height - 22),
+            10,
+            COLOR_YELLOW
+        );
+    }
+}
+
+static void draw_assembly_workspace(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        "ASSEMBLY LOADER & DISASSEMBLY WORKSPACE"
+    );
+
+    /*
+     * =====================================
+     * PATH INPUT
+     * =====================================
+     */
+
+    Rectangle path_bounds = {
+        (float)(x + 20),
+        (float)(y + 45),
+        1080,
+        35
+    };
+
+    update_assembly_path_input(
+        gui,
+        path_bounds
+    );
+
+    DrawRectangleRec(
+        path_bounds,
+        gui->path_focused
+            ? (Color){40, 55, 75, 255}
+            : COLOR_PANEL_ALT
+    );
+
+    DrawRectangleLinesEx(
+        path_bounds,
+        gui->path_focused ? 2.0f : 1.0f,
+        gui->path_focused
+            ? COLOR_CYAN
+            : COLOR_BORDER
+    );
+
+    DrawText(
+        gui->source_path,
+        (int)path_bounds.x + 10,
+        (int)path_bounds.y + 10,
+        13,
+        COLOR_TEXT
+    );
+
+    if (gui->path_focused) {
+
+        DrawText(
+            "_",
+            (int)path_bounds.x +
+                12 +
+                MeasureText(gui->source_path, 13),
+            (int)path_bounds.y + 10,
+            13,
+            COLOR_CYAN
+        );
+    }
+
+    /*
+     * LOAD BUTTON
+     */
+
+    if (draw_button(
+            (Rectangle){
+                (float)(x + 1120),
+                (float)(y + 43),
+                150,
+                40
+            },
+            "LOAD ASSEMBLY"
+        )) {
+
+        gui_load_assembly_program(
+            (DioCPU *)cpu,
+            gui
+        );
+    }
+
+    /*
+     * FOLLOW PC CONTROL
+     */
+
+    if (draw_button(
+            (Rectangle){
+                (float)(x + 1290),
+                (float)(y + 43),
+                235,
+                40
+            },
+            gui->disassembly_follow_pc
+                ? "FOLLOW PC: ON"
+                : "FOLLOW PC: OFF"
+        )) {
+
+        gui->disassembly_follow_pc =
+            !gui->disassembly_follow_pc;
+    }
+
+    /*
+     * ENTER can load the file too.
+     */
+
+    if (
+        gui->path_focused &&
+        IsKeyPressed(KEY_ENTER)
+    ) {
+
+        gui->path_focused = false;
+
+        gui_load_assembly_program(
+            (DioCPU *)cpu,
+            gui
+        );
+    }
+
+    /*
+     * =====================================
+     * SOURCE AND DISASSEMBLY PANELS
+     * =====================================
+     */
+
+    Rectangle source_bounds = {
+        (float)(x + 20),
+        (float)(y + 90),
+        730,
+        230
+    };
+
+    Rectangle disassembly_bounds = {
+        (float)(x + 770),
+        (float)(y + 90),
+        770,
+        230
+    };
+
+    draw_source_listing(
+        gui,
+        source_bounds
+    );
+
+    draw_disassembly_listing(
+        cpu,
+        gui,
+        disassembly_bounds
+    );
+
+    /*
+     * =====================================
+     * SCROLL CONTROLS
+     * =====================================
+     */
+
+    if (IsKeyPressed(KEY_PAGE_UP)) {
+
+        if (gui->source_scroll > 0) {
+            gui->source_scroll =
+                gui->source_scroll > GUI_SOURCE_VISIBLE_ROWS
+                    ? gui->source_scroll - GUI_SOURCE_VISIBLE_ROWS
+                    : 0;
+        }
+
+        gui->disassembly_scroll =
+            gui->disassembly_scroll > GUI_DISASSEMBLY_VISIBLE_ROWS
+                ? gui->disassembly_scroll -
+                    GUI_DISASSEMBLY_VISIBLE_ROWS
+                : 0;
+    }
+
+    if (IsKeyPressed(KEY_PAGE_DOWN)) {
+
+        if (
+            gui->source_scroll +
+            GUI_SOURCE_VISIBLE_ROWS <
+            gui->source_line_count
+        ) {
+
+            gui->source_scroll +=
+                GUI_SOURCE_VISIBLE_ROWS;
+        }
+
+        if (
+            gui->disassembly_scroll +
+            GUI_DISASSEMBLY_VISIBLE_ROWS <
+            gui->disassembly_count
+        ) {
+
+            gui->disassembly_scroll +=
+                GUI_DISASSEMBLY_VISIBLE_ROWS;
+        }
+    }
+
+    /*
+     * =====================================
+     * PROGRAM INFORMATION
+     * =====================================
+     */
+
+    DrawText(
+        TextFormat(
+            "CODE SIZE: %u BYTES",
+            (unsigned int)gui->assembled_code_size
+        ),
+        x + 22,
+        y + 326,
+        11,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        TextFormat(
+            "INSTRUCTION COUNT: %u",
+            (unsigned int)gui->assembled_instruction_count
+        ),
+        x + 260,
+        y + 326,
+        11,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        "F7: NEXT WORKSPACE | PAGE UP/DOWN: SCROLL",
+        x + 950,
+        y + 326,
+        11,
+        COLOR_MUTED
+    );
+}
+
+/* =========================================
+   STATUS BAR (FOOTER)
+   ========================================= */
+
+static void draw_status_bar(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    (void)cpu;
+
+    DrawRectangle(
+        20,
+        960,
+        1560,
+        32,
+        COLOR_PANEL
+    );
+
+    DrawRectangleLines(
+        20,
+        960,
+        1560,
+        32,
+        COLOR_BORDER
+    );
+
+    DrawText(
+        TextFormat(
+            "SHORTCUTS: F5: %s | F8: Step Phase | F10: Step Instr | F7: %s | F6: Reset CPU",
+            gui->auto_run ? "Pause" : "Run",
+            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "Memory View" :
+            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "Stack View" :
+            (gui->workspace_view == GUI_WORKSPACE_STACK ? "Assembly View" : "Datapath View"))
+        ),
+        35,
+        969,
+        13,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        TextFormat(
+            "WORKSPACE: %s | ANIMATION: %s | PHASE: %s",
+            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "DATAPATH" :
+            (gui->workspace_view == GUI_WORKSPACE_MEMORY ? "MEMORY" :
+            (gui->workspace_view == GUI_WORKSPACE_STACK ? "STACK" : "ASSEMBLY")),
+            gui->auto_run ? "RUNNING" : "PAUSED",
+            gui->phase == GUI_PHASE_FETCH ? "FETCH" :
+            (gui->phase == GUI_PHASE_DECODE ? "DECODE" :
+            (gui->phase == GUI_PHASE_EXECUTE ? "EXECUTE" : "IDLE"))
+        ),
+        1050,
+        969,
+        13,
+        gui->workspace_view == GUI_WORKSPACE_MEMORY ? COLOR_CYAN :
+        (gui->workspace_view == GUI_WORKSPACE_STACK ? COLOR_YELLOW :
+        (gui->workspace_view == GUI_WORKSPACE_ASSEMBLY ? COLOR_GREEN :
+        (gui->auto_run ? COLOR_GREEN : COLOR_YELLOW)))
+    );
+}
+
+/* =========================================
+   MAIN
+   ========================================= */
 
 int main(void)
 {
     InitWindow(
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
-        "Dio-8 | 8-bit CPU Simulator, Datapath & Cycle Visualizer"
+        "DioCPU - Interactive Simulator, Datapath & Memory Viewer"
     );
 
-    SetTargetFPS(60);
+    SetTargetFPS(FPS);
 
-    CPU cpu;
-    cpu_init(&cpu);
+    /*
+     * CPU is static because Memory contains
+     * two 256 KiB arrays.
+     */
 
-    InstructionCycleState cycle;
-    reset_cycle(&cycle);
+    static DioCPU cpu;
 
-    char file_path[MAX_INPUT_CHARS] = "programs/countdown.asm";
-    int letter_count = (int)strlen(file_path);
-    bool input_box_focused = false;
+    GUIState gui = {0};
 
-    char status_msg[128] = "Ready";
-    Color status_color = GREEN;
+    CPUStatus init_status = cpu_init(&cpu);
 
-    // Load program awal
-    if (!do_assemble_and_load(&cpu, file_path, &cycle, status_msg, sizeof(status_msg), &status_color))
-    {
-        strncpy(file_path, "countdown.asm", MAX_INPUT_CHARS);
-        file_path[MAX_INPUT_CHARS - 1] = '\0';
-        letter_count = (int)strlen(file_path);
-        do_assemble_and_load(&cpu, file_path, &cycle, status_msg, sizeof(status_msg), &status_color);
+    if (init_status != CPU_STATUS_OK) {
+
+        gui.initialization_failed = true;
+
+        gui.status_color = COLOR_RED;
+
+        snprintf(
+            gui.status_message,
+            sizeof(gui.status_message),
+            "CPU initialization failed."
+        );
+
+    } else {
+
+        gui.status_color = COLOR_GREEN;
+
+        snprintf(
+            gui.status_message,
+            sizeof(gui.status_message),
+            "CPU initialized successfully."
+        );
     }
 
-    bool run_mode = false;
-    bool has_executed = false;
-    bool has_output = false;
-    uint8_t last_out_val = 0;
+    gui.workspace_view = GUI_WORKSPACE_ASSEMBLY;
 
-    uint16_t last_pc = 0;
+    gui.memory_view = GUI_MEMORY_VIEW_INSTRUCTION;
 
-    StepMode step_mode = STEP_MODE_PHASE;
-    RightPanelView right_view = VIEW_DATAPATH;
+    gui.memory_base = 0;
 
-    float step_timer = 0.0f;
-    const float phase_interval = 0.35f;
+    gui.stack_follow_sp = true;
 
-    Rectangle file_box = (Rectangle){440, 95, 290, 42};
+    gui.stack_view_base = cpu.sp;
 
-    while (!WindowShouldClose())
-    {
+    gui.stack_event_type = GUI_STACK_EVENT_NONE;
+
+    gui.disassembly_follow_pc = true;
+
+    gui.source_scroll = 0;
+
+    gui.disassembly_scroll = 0;
+
+    gui.disassembly_count = 0;
+
+    gui.auto_run = false;
+
+    gui.phase_timer = 0.0f;
+
+    gui.phase_interval =
+        GUI_DEFAULT_PHASE_INTERVAL;
+
+    gui.phase = GUI_PHASE_IDLE;
+
+    snprintf(
+        gui.source_path,
+        sizeof(gui.source_path),
+        "programs/test.asm"
+    );
+
+    reset_gui_cycle(&gui);
+
+    initialize_state_tracking(&gui, &cpu);
+
+    gui_load_assembly_program(&cpu, &gui);
+
+
+    while (!WindowShouldClose()) {
+
         float delta_time = GetFrameTime();
-        float current_time = (float)GetTime();
-        Vector2 mouse = GetMousePosition();
 
-        // Cek fokus text box input file ASM
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-        {
-            input_box_focused = CheckCollisionPointRec(mouse, file_box);
-        }
+        if (gui.stack_event_timer > 0.0f) {
 
-        // Tangani pengetikan nama file saat text box aktif
-        if (input_box_focused)
-        {
-            int key = GetCharPressed();
-            while (key > 0)
-            {
-                if ((key >= 32) && (key <= 126) && (letter_count < MAX_INPUT_CHARS - 1))
-                {
-                    file_path[letter_count] = (char)key;
-                    letter_count++;
-                    file_path[letter_count] = '\0';
-                }
-                key = GetCharPressed();
-            }
+            gui.stack_event_timer -= delta_time;
 
-            if (IsKeyPressed(KEY_BACKSPACE) && letter_count > 0)
-            {
-                letter_count--;
-                file_path[letter_count] = '\0';
+            if (gui.stack_event_timer <= 0.0f) {
+
+                clear_stack_event(&gui);
             }
         }
+
+
+        /* =================================
+           ANIMATION TIMER
+           ================================= */
+
+        gui.datapath_animation_time += delta_time * 0.8f;
+
+        while (gui.datapath_animation_time >= 1.0f) {
+            gui.datapath_animation_time -= 1.0f;
+        }
+
+
+        /* =================================
+           WORKSPACE VIEW CONTROL
+           ================================= */
+
+        if (IsKeyPressed(KEY_F7)) {
+
+            gui.workspace_view =
+                (gui.workspace_view + 1) % 4;
+
+            if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_DATAPATH
+            ) {
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Datapath Viewer opened."
+                );
+
+            } else if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_MEMORY
+            ) {
+
+                memory_go_to_cpu_pointer(
+                    &cpu,
+                    &gui
+                );
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Memory Viewer opened."
+                );
+
+            } else if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_STACK
+            ) {
+
+                gui_stack_follow_pointer(
+                    &cpu,
+                    &gui
+                );
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Stack Viewer opened."
+                );
+
+            } else if (
+                gui.workspace_view ==
+                GUI_WORKSPACE_ASSEMBLY
+            ) {
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Assembly Viewer opened."
+                );
+            }
+
+            gui.status_color = COLOR_CYAN;
+        }
+
+
+        /* =================================
+           MEMORY NAVIGATION SHORTCUTS
+           ================================= */
+
+        if (gui.workspace_view == GUI_WORKSPACE_MEMORY) {
+
+            if (IsKeyPressed(KEY_PAGE_UP)) {
+                memory_move_page(&gui, -1);
+            }
+
+            if (IsKeyPressed(KEY_PAGE_DOWN)) {
+                memory_move_page(&gui, 1);
+            }
+
+            if (IsKeyPressed(KEY_HOME)) {
+                memory_go_to_cpu_pointer(&cpu, &gui);
+            }
+
+            if (IsKeyPressed(KEY_I)) {
+
+                gui.memory_view =
+                    GUI_MEMORY_VIEW_INSTRUCTION;
+
+                memory_go_to_cpu_pointer(&cpu, &gui);
+            }
+
+            if (IsKeyPressed(KEY_D)) {
+
+                gui.memory_view =
+                    GUI_MEMORY_VIEW_DATA;
+
+                memory_go_to_cpu_pointer(&cpu, &gui);
+            }
+        }
+
+
+        /* =================================
+           STACK NAVIGATION SHORTCUTS
+           ================================= */
+
+        if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_STACK
+        ) {
+
+            if (IsKeyPressed(KEY_HOME)) {
+
+                gui_stack_follow_pointer(
+                    &cpu,
+                    &gui
+                );
+            }
+
+            if (IsKeyPressed(KEY_PAGE_UP)) {
+
+                gui_stack_view_older(
+                    &gui
+                );
+            }
+
+            if (IsKeyPressed(KEY_PAGE_DOWN)) {
+
+                gui_stack_view_newer(
+                    &cpu,
+                    &gui
+                );
+            }
+        }
+
+
+        /* =================================
+           DRAWING
+           ================================= */
 
         BeginDrawing();
 
-        ClearBackground(COLOR_BG);
+        ClearBackground(COLOR_BACKGROUND);
 
-        // Header
-        DrawText(
-            "DIO-8 CPU SIMULATOR",
-            40, 35, 30, COLOR_TEXT
+        /* Header and interactive buttons */
+
+        draw_header(&cpu, &gui);
+
+        /* =====================================
+           EXECUTION CONTROLLER INPUT
+           ===================================== */
+
+        /* Draw toolbar and get mouse command. */
+
+        GUICommand button_command =
+            draw_execution_toolbar(
+                &cpu,
+                &gui
+            );
+
+        /* Read keyboard command. */
+
+        GUICommand keyboard_command =
+            read_controller_keyboard();
+
+        /*
+         * Button command takes priority over keyboard
+         * if both are somehow triggered in one frame.
+         */
+
+        GUICommand selected_command =
+            button_command != GUI_COMMAND_NONE
+                ? button_command
+                : keyboard_command;
+
+        /*
+         * Process exactly one command.
+         */
+
+        process_gui_command(
+            &cpu,
+            &gui,
+            selected_command
         );
 
-        DrawText(
-            "CPU DATAPATH & INSTRUCTION CYCLE VISUALIZER",
-            405, 45, 15, COLOR_MUTED
+        /* =====================================
+           AUTOMATIC EXECUTION
+           ===================================== */
+
+        update_auto_run(
+            &cpu,
+            &gui,
+            delta_time
         );
 
-        // Tombol STEP
-        bool step_clicked = draw_button(
-            (Rectangle){40, 95, 85, 42},
-            "STEP",
-            COLOR_PANEL
+        /* =====================================
+           REGISTER AND FLAGS TRACKING
+           ===================================== */
+
+        update_state_tracking(
+            &gui,
+            &cpu,
+            delta_time
         );
 
-        // Tombol Toggle Mode Step (PHASE / INSTR)
-        const char *mode_label = (step_mode == STEP_MODE_PHASE) ? "MODE: PHASE" : "MODE: INSTR";
-        bool mode_clicked = draw_button(
-            (Rectangle){135, 95, 115, 42},
-            mode_label,
-            (step_mode == STEP_MODE_PHASE) ? (Color){38, 55, 75, 255} : COLOR_PANEL
+        /* =====================================
+           CONTROLLER STATUS
+           ===================================== */
+
+        draw_controller_status(
+            &cpu,
+            &gui,
+            22,
+            68
         );
 
-        if (mode_clicked)
-        {
-            step_mode = (step_mode == STEP_MODE_PHASE) ? STEP_MODE_INSTRUCTION : STEP_MODE_PHASE;
+
+        /* =================================
+           DRAW CPU PANELS
+           ================================= */
+
+        draw_status_bar(&cpu, &gui);
+
+        draw_cpu_dashboard(&cpu);
+
+        draw_program_panel(&cpu, &gui);
+
+        draw_cycle_panel(&cpu, &gui);
+
+        draw_register_panel(&cpu, &gui);
+
+        draw_cpu_information(&cpu, &gui);
+
+        if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_DATAPATH
+        ) {
+
+            draw_datapath(
+                &cpu,
+                &gui
+            );
+
+        } else if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_MEMORY
+        ) {
+
+            draw_memory_viewer(
+                &cpu,
+                &gui,
+                (Rectangle){20, 620, 1560, 335}
+            );
+
+        } else if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_STACK
+        ) {
+
+            draw_stack_viewer(
+                &cpu,
+                &gui,
+                (Rectangle){20, 620, 1560, 335}
+            );
+
+        } else if (
+            gui.workspace_view ==
+            GUI_WORKSPACE_ASSEMBLY
+        ) {
+
+            draw_assembly_workspace(
+                &cpu,
+                &gui,
+                (Rectangle){20, 620, 1560, 335}
+            );
         }
 
-        // Tombol RUN / PAUSE
-        bool run_clicked = draw_button(
-            (Rectangle){260, 95, 85, 42},
-            run_mode ? "PAUSE" : "RUN",
-            COLOR_ACCENT
-        );
-
-        // Tombol RESET
-        bool reset_clicked = draw_button(
-            (Rectangle){355, 95, 75, 42},
-            "RESET",
-            COLOR_PANEL
-        );
-
-        // Text box input file ASM
-        DrawRectangleRec(file_box, (Color){26, 32, 42, 255});
-        DrawRectangleLinesEx(file_box, 1, input_box_focused ? COLOR_ACCENT : COLOR_BORDER);
-
-        DrawText("ASM FILE PATH:", 440, 75, 13, COLOR_MUTED);
-        DrawText(file_path, (int)(file_box.x + 10), (int)(file_box.y + 13), 15, COLOR_TEXT);
-
-        if (input_box_focused && (((int)(current_time * 2.0f)) % 2 == 0))
-        {
-            int cursor_x = (int)(file_box.x + 10 + MeasureText(file_path, 15));
-            DrawText("|", cursor_x, (int)(file_box.y + 11), 17, COLOR_ACCENT);
-        }
-
-        // Tombol ASSEMBLE
-        bool assemble_clicked = draw_button(
-            (Rectangle){740, 95, 105, 42},
-            "ASSEMBLE",
-            COLOR_PANEL
-        );
-
-        // Tombol COUNTDOWN
-        bool countdown_clicked = draw_button(
-            (Rectangle){855, 95, 115, 42},
-            "COUNTDOWN",
-            COLOR_PANEL
-        );
-
-        // Tombol HELLO
-        bool hello_clicked = draw_button(
-            (Rectangle){980, 95, 85, 42},
-            "HELLO",
-            COLOR_PANEL
-        );
-
-        // Status bar
-        DrawText(status_msg, 740, 75, 13, status_color);
-
-        // Aksi tombol COUNTDOWN
-        if (countdown_clicked)
-        {
-            strncpy(file_path, "programs/countdown.asm", MAX_INPUT_CHARS);
-            file_path[MAX_INPUT_CHARS - 1] = '\0';
-            letter_count = (int)strlen(file_path);
-            if (do_assemble_and_load(&cpu, file_path, &cycle, status_msg, sizeof(status_msg), &status_color))
-            {
-                run_mode = false;
-                has_executed = false;
-                last_pc = 0;
-                step_timer = 0.0f;
-                has_output = false;
-                last_out_val = 0;
-            }
-        }
-
-        // Aksi tombol HELLO
-        if (hello_clicked)
-        {
-            strncpy(file_path, "programs/hello.asm", MAX_INPUT_CHARS);
-            file_path[MAX_INPUT_CHARS - 1] = '\0';
-            letter_count = (int)strlen(file_path);
-            if (do_assemble_and_load(&cpu, file_path, &cycle, status_msg, sizeof(status_msg), &status_color))
-            {
-                run_mode = false;
-                has_executed = false;
-                last_pc = 0;
-                step_timer = 0.0f;
-                has_output = false;
-                last_out_val = 0;
-            }
-        }
-
-        // Aksi ASSEMBLE atau Enter di text box
-        if (assemble_clicked || (input_box_focused && IsKeyPressed(KEY_ENTER)))
-        {
-            if (do_assemble_and_load(&cpu, file_path, &cycle, status_msg, sizeof(status_msg), &status_color))
-            {
-                run_mode = false;
-                has_executed = false;
-                last_pc = 0;
-                step_timer = 0.0f;
-                has_output = false;
-                last_out_val = 0;
-            }
-        }
-
-        // Aksi RESET
-        if (reset_clicked)
-        {
-            do_assemble_and_load(&cpu, file_path, &cycle, status_msg, sizeof(status_msg), &status_color);
-            run_mode = false;
-            has_executed = false;
-            last_pc = 0;
-            step_timer = 0.0f;
-            has_output = false;
-            last_out_val = 0;
-        }
-
-        // Aksi tombol STEP
-        if (step_clicked && !cpu.halted)
-        {
-            run_mode = false;
-
-            if (step_mode == STEP_MODE_PHASE)
-            {
-                step_cycle_phase(&cpu, &cycle, &last_pc, &has_executed, &last_out_val, &has_output);
-            }
-            else
-            {
-                do {
-                    step_cycle_phase(&cpu, &cycle, &last_pc, &has_executed, &last_out_val, &has_output);
-                } while (cycle.phase != PHASE_EXECUTE && !cpu.halted);
-            }
-        }
-
-        // Toggle Continuous RUN
-        if (run_clicked && !cpu.halted)
-        {
-            run_mode = !run_mode;
-            step_timer = 0.0f;
-        }
-
-        // Automatic continuous execution
-        if (run_mode && !cpu.halted)
-        {
-            step_timer += delta_time;
-
-            if (step_timer >= phase_interval)
-            {
-                step_timer = 0.0f;
-                step_cycle_phase(&cpu, &cycle, &last_pc, &has_executed, &last_out_val, &has_output);
-            }
-        }
-
-        if (cpu.halted)
-        {
-            run_mode = false;
-        }
-
-        // ==========================================
-        // RENDER PANEL-PANEL UTAMA
-        // ==========================================
-
-        // Sisi Kiri
-        draw_register_panel(&cpu, last_out_val, has_output, cycle.modified_reg, cycle.phase);
-        draw_program_panel(&cpu, &cycle, last_pc, has_executed);
-
-        // Sisi Kanan: Panel Siklus Instruksi
-        draw_cycle_panel(&cpu, &cycle);
-
-        // Sisi Kanan: Tab Switcher (CPU DATAPATH vs MEMORY VIEWER)
-        Rectangle tab_datapath = (Rectangle){440, 315, 175, 28};
-        Rectangle tab_memory = (Rectangle){625, 315, 175, 28};
-
-        if (draw_button(tab_datapath, "CPU DATAPATH", (right_view == VIEW_DATAPATH) ? (Color){45, 65, 90, 255} : COLOR_PANEL))
-        {
-            right_view = VIEW_DATAPATH;
-        }
-
-        if (draw_button(tab_memory, "MEMORY (HEX)", (right_view == VIEW_MEMORY) ? (Color){45, 65, 90, 255} : COLOR_PANEL))
-        {
-            right_view = VIEW_MEMORY;
-        }
-
-        // Tampilkan Tampilan Panel yang Aktif
-        if (right_view == VIEW_DATAPATH)
-        {
-            draw_datapath_panel(&cpu, &cycle, last_out_val, has_output, current_time);
-        }
-        else
-        {
-            draw_memory_panel(&cpu, &cycle, last_pc, has_executed);
-        }
-
-        // Footer
-        DrawText(
-            "Dio-8 | Educational 8-bit CPU Simulator, Datapath & Cycle Visualizer",
-            40, 735, 15, COLOR_MUTED
-        );
-
-        DrawText(
-            "Controls: STEP (maju 1 fase/instruksi) | MODE (Phase/Instruction) | TAB (Datapath/Memory) | RUN/PAUSE | RESET",
-            40, 760, 13, COLOR_MUTED
-        );
 
         EndDrawing();
     }
+
 
     CloseWindow();
 
