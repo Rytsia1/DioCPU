@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -Werror -std=c11 -I./src
 LIBS_GUI = -lraylib
 
-all: cli gui test cpu-v2
+all: cli gui test cpu-v2 gui-v2
 
 cli: dio_cpu.exe
 
@@ -58,6 +58,10 @@ diocpu_v2.exe: src/main_v2.c $(V2_CORE_SOURCES)
 tests_cpu_v2.exe: tests/tests_cpu_v2.c $(V2_CORE_SOURCES)
 	$(CC) $(CFLAGS) -o $@ $^
 
+# Build V2 GUI Dashboard
+diocpu_v2_gui.exe: src/gui_v2.c $(V2_CORE_SOURCES)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS_GUI)
+
 memory-test: tests_memory.exe
 	./tests_memory.exe
 
@@ -80,7 +84,9 @@ cpu-v2-test: tests_cpu_v2.exe
 # Build and test
 cpu-v2: diocpu_v2.exe tests_cpu_v2.exe
 
-clean:
-	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe test_v2_cpu_state.exe diocpu_v2.exe tests_cpu_v2.exe *.o
+gui-v2: diocpu_v2_gui.exe
 
-.PHONY: all cli gui test clean memory-test stack-test decoder-test assembler-test debugger-test cpu-v2 cpu-v2-test
+clean:
+	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe test_v2_cpu_state.exe diocpu_v2.exe tests_cpu_v2.exe diocpu_v2_gui.exe *.o
+
+.PHONY: all cli gui test clean memory-test stack-test decoder-test assembler-test debugger-test cpu-v2 cpu-v2-test gui-v2
