@@ -49,6 +49,25 @@
 #define ACCENT_COLOR      COLOR_ACCENT
 
 /* =========================================
+   MEMORY VIEWER CONFIGURATION
+   ========================================= */
+
+#define GUI_MEMORY_BYTES_PER_ROW 16
+#define GUI_MEMORY_ROWS 8
+
+#define GUI_MEMORY_PAGE_SIZE \
+    (GUI_MEMORY_BYTES_PER_ROW * GUI_MEMORY_ROWS)
+
+#define GUI_MEMORY_MAX_BASE \
+    (DIOCPU_MEMORY_SIZE - GUI_MEMORY_PAGE_SIZE)
+
+#define GUI_MEMORY_VIEW_INSTRUCTION 0
+#define GUI_MEMORY_VIEW_DATA        1
+
+#define GUI_WORKSPACE_DATAPATH 0
+#define GUI_WORKSPACE_MEMORY   1
+
+/* =========================================
    GUI STATE & TRACKING
    ========================================= */
 
@@ -62,12 +81,6 @@ typedef enum {
 #define GUI_FETCH    GUI_PHASE_FETCH
 #define GUI_DECODE   GUI_PHASE_DECODE
 #define GUI_EXECUTE  GUI_PHASE_EXECUTE
-
-typedef enum {
-    MEMORY_VIEW_INSTRUCTION = 0,
-    MEMORY_VIEW_DATA,
-    MEMORY_VIEW_STACK
-} MemoryView;
 
 #define CHANGE_HIGHLIGHT_DURATION 0.85f
 
@@ -121,12 +134,14 @@ typedef struct {
 
 
     /* =================================
-       MEMORY VIEWER
+       WORKSPACE & MEMORY VIEWER
        ================================= */
 
-    MemoryView memory_view;
+    int workspace_view;
 
     uint32_t memory_base;
+
+    int memory_view;
 
     uint32_t program_size;
 
@@ -461,6 +476,145 @@ static void complete_alu_visualization(
 }
 
 /* =========================================
+   MEMORY VIEWER HELPERS
+   ========================================= */
+
+static void normalize_memory_base(GUIState *gui)
+{
+    gui->memory_base -=
+        gui->memory_base % GUI_MEMORY_PAGE_SIZE;
+
+    if (gui->memory_base > GUI_MEMORY_MAX_BASE) {
+        gui->memory_base = GUI_MEMORY_MAX_BASE;
+    }
+}
+
+static uint8_t gui_memory_read_byte(
+    const DioCPU *cpu,
+    int memory_view,
+    uint32_t address
+)
+{
+    if (address >= DIOCPU_MEMORY_SIZE) {
+        return 0;
+    }
+
+    if (memory_view == GUI_MEMORY_VIEW_INSTRUCTION) {
+        return cpu->memory.instruction[address];
+    }
+
+    return cpu->memory.data[address];
+}
+
+static uint32_t get_memory_selected_address(
+    const DioCPU *cpu,
+    int memory_view
+)
+{
+    if (memory_view == GUI_MEMORY_VIEW_INSTRUCTION) {
+        return cpu->pc;
+    }
+
+    return cpu->mar;
+}
+
+static void memory_go_to_cpu_pointer(
+    const DioCPU *cpu,
+    GUIState *gui
+)
+{
+    uint32_t address = get_memory_selected_address(
+        cpu,
+        gui->memory_view
+    );
+
+    if (address >= DIOCPU_MEMORY_SIZE) {
+        address = DIOCPU_MEMORY_MAX_ADDRESS;
+    }
+
+    gui->memory_base =
+        (address / GUI_MEMORY_PAGE_SIZE) *
+        GUI_MEMORY_PAGE_SIZE;
+
+    normalize_memory_base(gui);
+}
+
+static void memory_move_page(
+    GUIState *gui,
+    int direction
+)
+{
+    normalize_memory_base(gui);
+
+    if (direction < 0) {
+
+        if (gui->memory_base >= GUI_MEMORY_PAGE_SIZE) {
+            gui->memory_base -= GUI_MEMORY_PAGE_SIZE;
+        } else {
+            gui->memory_base = 0;
+        }
+
+    } else if (direction > 0) {
+
+        if (gui->memory_base <=
+            GUI_MEMORY_MAX_BASE - GUI_MEMORY_PAGE_SIZE) {
+
+            gui->memory_base += GUI_MEMORY_PAGE_SIZE;
+        }
+    }
+}
+
+static bool draw_memory_control(
+    Rectangle bounds,
+    const char *label,
+    bool active
+)
+{
+    Vector2 mouse = GetMousePosition();
+
+    bool hovered = CheckCollisionPointRec(
+        mouse,
+        bounds
+    );
+
+    Color background = active
+        ? (Color){35, 75, 95, 255}
+        : (hovered
+            ? (Color){55, 85, 110, 255}
+            : COLOR_PANEL_ALT);
+
+    Color border = active || hovered
+        ? COLOR_CYAN
+        : COLOR_BORDER;
+
+    DrawRectangleRec(
+        bounds,
+        background
+    );
+
+    DrawRectangleLinesEx(
+        bounds,
+        active ? 2.0f : 1.0f,
+        border
+    );
+
+    int text_width = MeasureText(label, 12);
+
+    DrawText(
+        label,
+        (int)(bounds.x +
+            (bounds.width - text_width) / 2.0f),
+        (int)(bounds.y +
+            (bounds.height - 12.0f) / 2.0f),
+        12,
+        COLOR_TEXT
+    );
+
+    return hovered &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+/* =========================================
    STATE TRACKING FUNCTIONS
    ========================================= */
 
@@ -743,6 +897,8 @@ static void reset_gui_cycle(GUIState *gui)
     gui->phase_timer = 0.0f;
 
     clear_alu_visualization(gui);
+
+    normalize_memory_base(gui);
 
     snprintf(
         gui->status_message,
@@ -1301,7 +1457,7 @@ static void draw_header(DioCPU *cpu, GUIState *gui)
     );
 
     DrawText(
-        "16-BIT ARCHITECTURE | ANIMATED DATAPATH & ALU VISUALIZER",
+        "16-BIT ARCHITECTURE | INTERACTIVE SIMULATOR & MEMORY VIEWER",
         22,
         52,
         12,
@@ -2097,7 +2253,7 @@ static void draw_cpu_information(
 }
 
 /* =========================================
-   STEP 7 — ANIMATED DATAPATH & ALU
+   ANIMATED DATAPATH & ALU VISUALIZATION
    ========================================= */
 
 static void draw_datapath_node(
@@ -2782,7 +2938,7 @@ static void draw_datapath_visualization(
 
     /*
      * =====================================
-     * FLAGS
+     * FLAGS & SHORTCUT HINT
      * =====================================
      */
 
@@ -2808,6 +2964,14 @@ static void draw_datapath_visualization(
     );
 
     DrawText(
+        "F7: OPEN MEMORY VIEWER",
+        x + 25,
+        y + 316,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
         "16-BIT DATA PATH | 18-BIT ADDRESS PATH",
         x + 1150,
         y + 295,
@@ -2824,7 +2988,446 @@ static void draw_datapath(
     draw_datapath_visualization(
         cpu,
         gui,
-        (Rectangle){20, 620, 1560, 330}
+        (Rectangle){20, 620, 1560, 335}
+    );
+}
+
+/* =========================================
+   STEP 6 — MEMORY VIEWER (INSTRUCTION & DATA)
+   ========================================= */
+
+static void draw_memory_viewer(
+    const DioCPU *cpu,
+    GUIState *gui,
+    Rectangle bounds
+)
+{
+    int x = (int)bounds.x;
+    int y = (int)bounds.y;
+
+    if (gui->memory_view != GUI_MEMORY_VIEW_INSTRUCTION &&
+        gui->memory_view != GUI_MEMORY_VIEW_DATA) {
+
+        gui->memory_view = GUI_MEMORY_VIEW_INSTRUCTION;
+    }
+
+    normalize_memory_base(gui);
+
+    bool instruction_view =
+        gui->memory_view == GUI_MEMORY_VIEW_INSTRUCTION;
+
+    const char *title = instruction_view
+        ? "INSTRUCTION MEMORY VIEWER"
+        : "DATA MEMORY VIEWER";
+
+    draw_panel(
+        x,
+        y,
+        (int)bounds.width,
+        (int)bounds.height,
+        title
+    );
+
+    /*
+     * =====================================
+     * MEMORY VIEW CONTROLS
+     * =====================================
+     */
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 730),
+                (float)(y + 9),
+                140,
+                30
+            },
+            "INSTRUCTION",
+            instruction_view
+        )) {
+
+        gui->memory_view =
+            GUI_MEMORY_VIEW_INSTRUCTION;
+
+        memory_go_to_cpu_pointer(cpu, gui);
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 880),
+                (float)(y + 9),
+                100,
+                30
+            },
+            "DATA",
+            !instruction_view
+        )) {
+
+        gui->memory_view =
+            GUI_MEMORY_VIEW_DATA;
+
+        memory_go_to_cpu_pointer(cpu, gui);
+
+        instruction_view = false;
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 990),
+                (float)(y + 9),
+                80,
+                30
+            },
+            "< PREV",
+            false
+        )) {
+
+        memory_move_page(gui, -1);
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 1080),
+                (float)(y + 9),
+                80,
+                30
+            },
+            "NEXT >",
+            false
+        )) {
+
+        memory_move_page(gui, 1);
+    }
+
+    if (draw_memory_control(
+            (Rectangle){
+                (float)(x + 1170),
+                (float)(y + 9),
+                180,
+                30
+            },
+            instruction_view ? "FOLLOW PC" : "FOLLOW MAR",
+            false
+        )) {
+
+        memory_go_to_cpu_pointer(cpu, gui);
+    }
+
+    /*
+     * Update selected view after button interaction.
+     */
+
+    instruction_view =
+        gui->memory_view == GUI_MEMORY_VIEW_INSTRUCTION;
+
+    uint32_t selected_address =
+        get_memory_selected_address(
+            cpu,
+            gui->memory_view
+        );
+
+    /*
+     * =====================================
+     * MEMORY INFORMATION
+     * =====================================
+     */
+
+    uint32_t page_number =
+        gui->memory_base / GUI_MEMORY_PAGE_SIZE + 1u;
+
+    uint32_t total_pages =
+        DIOCPU_MEMORY_SIZE / GUI_MEMORY_PAGE_SIZE;
+
+    DrawText(
+        TextFormat(
+            "BASE: 0x%05X    END: 0x%05X    PAGE: %u / %u",
+            (unsigned int)gui->memory_base,
+            (unsigned int)(
+                gui->memory_base +
+                GUI_MEMORY_PAGE_SIZE - 1u
+            ),
+            (unsigned int)page_number,
+            (unsigned int)total_pages
+        ),
+        x + 22,
+        y + 49,
+        13,
+        COLOR_TEXT
+    );
+
+    DrawText(
+        TextFormat(
+            "%s: 0x%05X",
+            instruction_view ? "PC" : "MAR",
+            (unsigned int)selected_address
+        ),
+        x + 1100,
+        y + 49,
+        13,
+        COLOR_YELLOW
+    );
+
+    /*
+     * =====================================
+     * COLUMN HEADERS
+     * =====================================
+     */
+
+    DrawText(
+        "ADDRESS",
+        x + 22,
+        y + 78,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "BYTES (HEX)",
+        x + 110,
+        y + 78,
+        11,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "ASCII",
+        x + 620,
+        y + 78,
+        11,
+        COLOR_MUTED
+    );
+
+    if (!instruction_view) {
+
+        DrawText(
+            "16-BIT WORDS (LITTLE ENDIAN)",
+            x + 835,
+            y + 78,
+            11,
+            COLOR_MUTED
+        );
+    }
+
+    /*
+     * =====================================
+     * MEMORY ROWS
+     * =====================================
+     */
+
+    for (unsigned int row = 0;
+         row < GUI_MEMORY_ROWS;
+         row++) {
+
+        uint32_t row_address =
+            gui->memory_base +
+            row * GUI_MEMORY_BYTES_PER_ROW;
+
+        int row_y =
+            y + 99 + (int)row * 27;
+
+        /*
+         * Address label.
+         */
+
+        DrawText(
+            TextFormat(
+                "0x%05X",
+                (unsigned int)row_address
+            ),
+            x + 22,
+            row_y + 4,
+            13,
+            COLOR_CYAN
+        );
+
+        /*
+         * ASCII representation.
+         */
+
+        char ascii[GUI_MEMORY_BYTES_PER_ROW + 1];
+
+        /*
+         * Read and draw each byte.
+         */
+
+        for (unsigned int column = 0;
+             column < GUI_MEMORY_BYTES_PER_ROW;
+             column++) {
+
+            uint32_t address =
+                row_address + column;
+
+            uint8_t value = gui_memory_read_byte(
+                cpu,
+                gui->memory_view,
+                address
+            );
+
+            /*
+             * Convert byte into ASCII.
+             * Non-printable characters become '.'.
+             */
+
+            ascii[column] =
+                (value >= 32 && value <= 126)
+                    ? (char)value
+                    : '.';
+
+            bool selected =
+                address == selected_address ||
+                (!instruction_view &&
+                 selected_address < DIOCPU_MEMORY_MAX_ADDRESS &&
+                 address == selected_address + 1u);
+
+            Color cell_background = selected
+                ? (instruction_view
+                    ? (Color){75, 65, 25, 255}
+                    : (Color){25, 70, 90, 255})
+                : ((column % 2u == 0u)
+                    ? COLOR_PANEL_ALT
+                    : COLOR_PANEL);
+
+            Color cell_border = selected
+                ? COLOR_YELLOW
+                : COLOR_BORDER;
+
+            int cell_x =
+                x + 110 + (int)column * 30;
+
+            Rectangle cell = {
+                (float)cell_x,
+                (float)row_y,
+                26,
+                23
+            };
+
+            DrawRectangleRec(
+                cell,
+                cell_background
+            );
+
+            DrawRectangleLinesEx(
+                cell,
+                selected ? 1.5f : 0.7f,
+                cell_border
+            );
+
+            DrawText(
+                TextFormat("%02X", (unsigned int)value),
+                cell_x + 3,
+                row_y + 5,
+                12,
+                selected ? COLOR_YELLOW : COLOR_TEXT
+            );
+        }
+
+        ascii[GUI_MEMORY_BYTES_PER_ROW] = '\0';
+
+        /*
+         * ASCII column.
+         */
+
+        DrawText(
+            ascii,
+            x + 620,
+            row_y + 5,
+            13,
+            COLOR_MUTED
+        );
+
+        /*
+         * =================================
+         * DATA MEMORY WORD REPRESENTATION
+         * =================================
+         */
+
+        if (!instruction_view) {
+
+            for (unsigned int word = 0;
+                 word < 8;
+                 word++) {
+
+                uint32_t address =
+                    row_address + word * 2u;
+
+                uint8_t low = gui_memory_read_byte(
+                    cpu,
+                    GUI_MEMORY_VIEW_DATA,
+                    address
+                );
+
+                uint8_t high = gui_memory_read_byte(
+                    cpu,
+                    GUI_MEMORY_VIEW_DATA,
+                    address + 1u
+                );
+
+                uint16_t value =
+                    (uint16_t)low |
+                    ((uint16_t)high << 8u);
+
+                bool selected =
+                    selected_address == address ||
+                    selected_address == address + 1u;
+
+                int word_x =
+                    x + 835 + (int)word * 82;
+
+                Rectangle word_cell = {
+                    (float)word_x,
+                    (float)row_y,
+                    72,
+                    23
+                };
+
+                DrawRectangleRec(
+                    word_cell,
+                    selected
+                        ? (Color){65, 55, 25, 255}
+                        : COLOR_PANEL_ALT
+                );
+
+                DrawRectangleLinesEx(
+                    word_cell,
+                    selected ? 1.5f : 0.7f,
+                    selected ? COLOR_YELLOW : COLOR_BORDER
+                );
+
+                DrawText(
+                    TextFormat(
+                        "%04X",
+                        (unsigned int)value
+                    ),
+                    word_x + 10,
+                    row_y + 5,
+                    13,
+                    selected ? COLOR_YELLOW : COLOR_TEXT
+                );
+            }
+        }
+    }
+
+    /*
+     * =====================================
+     * FOOTER
+     * =====================================
+     */
+
+    DrawText(
+        instruction_view
+            ? "F7: BACK TO DATAPATH | I: Instruction | D: Data | PgUp/PgDn: Page | Home: PC | PC is highlighted in yellow"
+            : "F7: BACK TO DATAPATH | I: Instruction | D: Data | PgUp/PgDn: Page | Home: MAR | MAR and next byte are highlighted",
+        x + 22,
+        y + 316,
+        12,
+        COLOR_MUTED
+    );
+
+    DrawText(
+        "READ ONLY VIEW",
+        x + 1400,
+        y + 316,
+        11,
+        COLOR_GREEN
     );
 }
 
@@ -2857,8 +3460,9 @@ static void draw_status_bar(
 
     DrawText(
         TextFormat(
-            "SHORTCUTS: F5: %s | F8: Step Phase | F10: Step Instr | F6: Reset CPU",
-            gui->auto_run ? "Pause" : "Run"
+            "SHORTCUTS: F5: %s | F8: Step Phase | F10: Step Instr | F7: %s | F6: Reset CPU",
+            gui->auto_run ? "Pause" : "Run",
+            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "Memory View" : "Datapath View"
         ),
         35,
         969,
@@ -2868,17 +3472,17 @@ static void draw_status_bar(
 
     DrawText(
         TextFormat(
-            "ANIMATION: %s (Interval: %.2fs) | PHASE: %s",
+            "WORKSPACE: %s | ANIMATION: %s | PHASE: %s",
+            gui->workspace_view == GUI_WORKSPACE_DATAPATH ? "DATAPATH" : "MEMORY",
             gui->auto_run ? "RUNNING" : "PAUSED",
-            gui->phase_interval,
             gui->phase == GUI_PHASE_FETCH ? "FETCH" :
             (gui->phase == GUI_PHASE_DECODE ? "DECODE" :
             (gui->phase == GUI_PHASE_EXECUTE ? "EXECUTE" : "IDLE"))
         ),
-        1100,
+        1050,
         969,
         13,
-        gui->auto_run ? COLOR_GREEN : COLOR_CYAN
+        gui->workspace_view == GUI_WORKSPACE_MEMORY ? COLOR_CYAN : (gui->auto_run ? COLOR_GREEN : COLOR_YELLOW)
     );
 }
 
@@ -2891,7 +3495,7 @@ int main(void)
     InitWindow(
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
-        "DioCPU V2 - Animated Datapath & ALU Visualizer"
+        "DioCPU V2 - Interactive Simulator, Datapath & Memory Viewer"
     );
 
     SetTargetFPS(FPS);
@@ -2930,9 +3534,13 @@ int main(void)
         );
     }
 
-    gui.phase_interval = 0.35f;
+    gui.workspace_view = GUI_WORKSPACE_DATAPATH;
 
-    gui.memory_view = MEMORY_VIEW_INSTRUCTION;
+    gui.memory_view = GUI_MEMORY_VIEW_INSTRUCTION;
+
+    gui.memory_base = 0;
+
+    gui.phase_interval = 0.35f;
 
     snprintf(
         gui.source_path,
@@ -2960,6 +3568,75 @@ int main(void)
 
         while (gui.datapath_animation_time >= 1.0f) {
             gui.datapath_animation_time -= 1.0f;
+        }
+
+
+        /* =================================
+           WORKSPACE VIEW CONTROL
+           ================================= */
+
+        if (IsKeyPressed(KEY_F7)) {
+
+            if (gui.workspace_view == GUI_WORKSPACE_DATAPATH) {
+
+                gui.workspace_view = GUI_WORKSPACE_MEMORY;
+
+                memory_go_to_cpu_pointer(&cpu, &gui);
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Memory Viewer opened."
+                );
+
+            } else {
+
+                gui.workspace_view = GUI_WORKSPACE_DATAPATH;
+
+                snprintf(
+                    gui.status_message,
+                    sizeof(gui.status_message),
+                    "Datapath Viewer opened."
+                );
+            }
+
+            gui.status_color = COLOR_CYAN;
+        }
+
+
+        /* =================================
+           MEMORY NAVIGATION SHORTCUTS
+           ================================= */
+
+        if (gui.workspace_view == GUI_WORKSPACE_MEMORY) {
+
+            if (IsKeyPressed(KEY_PAGE_UP)) {
+                memory_move_page(&gui, -1);
+            }
+
+            if (IsKeyPressed(KEY_PAGE_DOWN)) {
+                memory_move_page(&gui, 1);
+            }
+
+            if (IsKeyPressed(KEY_HOME)) {
+                memory_go_to_cpu_pointer(&cpu, &gui);
+            }
+
+            if (IsKeyPressed(KEY_I)) {
+
+                gui.memory_view =
+                    GUI_MEMORY_VIEW_INSTRUCTION;
+
+                memory_go_to_cpu_pointer(&cpu, &gui);
+            }
+
+            if (IsKeyPressed(KEY_D)) {
+
+                gui.memory_view =
+                    GUI_MEMORY_VIEW_DATA;
+
+                memory_go_to_cpu_pointer(&cpu, &gui);
+            }
         }
 
 
@@ -3064,7 +3741,18 @@ int main(void)
 
         draw_cpu_information(&cpu, &gui);
 
-        draw_datapath(&cpu, &gui);
+        if (gui.workspace_view == GUI_WORKSPACE_MEMORY) {
+
+            draw_memory_viewer(
+                &cpu,
+                &gui,
+                (Rectangle){20, 620, 1560, 335}
+            );
+
+        } else {
+
+            draw_datapath(&cpu, &gui);
+        }
 
 
         EndDrawing();
