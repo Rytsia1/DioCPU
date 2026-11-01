@@ -88,6 +88,29 @@
 
 #define GUI_STACK_EVENT_DURATION 2.5f
 
+#define GUI_DEFAULT_PHASE_INTERVAL 0.35f
+
+#define GUI_MIN_PHASE_INTERVAL 0.05f
+#define GUI_MAX_PHASE_INTERVAL 2.00f
+
+/* =========================================
+   COMMAND TYPES
+   ========================================= */
+
+typedef enum {
+
+    GUI_COMMAND_NONE = 0,
+
+    GUI_COMMAND_RUN_PAUSE,
+
+    GUI_COMMAND_STEP_PHASE,
+
+    GUI_COMMAND_STEP_INSTRUCTION,
+
+    GUI_COMMAND_RESET
+
+} GUICommand;
+
 /* =========================================
    STACK EVENT TYPES
    ========================================= */
@@ -1750,6 +1773,44 @@ static void phase_decode(
 }
 
 /* =========================================
+   FORWARD DECLARATIONS
+   ========================================= */
+
+static bool draw_button(Rectangle bounds, const char *label);
+static Color get_cpu_state_color(CPUState state);
+
+/* =========================================
+   CONTROLLER HELPERS
+   ========================================= */
+
+static void stop_auto_run(GUIState *gui)
+{
+    gui->auto_run = false;
+    gui->phase_timer = 0.0f;
+}
+
+static const char *gui_phase_name(GUIPhase phase)
+{
+    switch (phase) {
+
+        case GUI_PHASE_IDLE:
+            return "IDLE";
+
+        case GUI_PHASE_FETCH:
+            return "FETCH";
+
+        case GUI_PHASE_DECODE:
+            return "DECODE";
+
+        case GUI_PHASE_EXECUTE:
+            return "EXECUTE";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+/* =========================================
    STEP 5 — EXECUTE PHASE
    ========================================= */
 
@@ -1759,18 +1820,16 @@ static void phase_execute(
 )
 {
     /*
-     * Execute instruction through actual CPU engine.
+     * Capture execution result from the real CPU.
      */
 
     prepare_stack_event(cpu, gui);
 
     gui->last_cpu_status = cpu_v2_step(cpu);
 
-    complete_stack_event(
-        cpu,
-        gui,
-        gui->last_cpu_status
-    );
+    /*
+     * Complete ALU visualization.
+     */
 
     complete_alu_visualization(
         cpu,
@@ -1778,32 +1837,51 @@ static void phase_execute(
         gui->last_cpu_status
     );
 
+    /*
+     * Complete Stack visualization.
+     */
 
-    if (cpu->state == CPU_STATE_FAULTED) {
+    complete_stack_event(
+        cpu,
+        gui,
+        gui->last_cpu_status
+    );
 
-        snprintf(
-            gui->status_message,
-            sizeof(gui->status_message),
-            "FAULT: %s at 0x%05X",
-            cpu_v2_fault_string(cpu->fault),
-            (unsigned int)cpu->fault_pc
-        );
+    /*
+     * Mark Execute phase as completed.
+     */
 
-        gui->status_color = COLOR_RED;
+    gui->phase = GUI_PHASE_EXECUTE;
 
-        gui->auto_run = false;
+    /*
+     * Stop automatic execution after HALT or FAULT.
+     */
 
-    } else if (cpu->state == CPU_STATE_HALTED) {
+    if (cpu->state != CPU_STATE_RUNNING) {
 
-        snprintf(
-            gui->status_message,
-            sizeof(gui->status_message),
-            "CPU HALTED. Execution completed."
-        );
+        stop_auto_run(gui);
 
-        gui->status_color = COLOR_YELLOW;
+        if (cpu->state == CPU_STATE_HALTED) {
 
-        gui->auto_run = false;
+            snprintf(
+                gui->status_message,
+                sizeof(gui->status_message),
+                "CPU halted successfully."
+            );
+
+            gui->status_color = COLOR_YELLOW;
+
+        } else {
+
+            snprintf(
+                gui->status_message,
+                sizeof(gui->status_message),
+                "CPU fault: %s",
+                cpu_v2_fault_string(cpu->fault)
+            );
+
+            gui->status_color = COLOR_RED;
+        }
 
     } else {
 
@@ -1816,8 +1894,6 @@ static void phase_execute(
 
         gui->status_color = COLOR_GREEN;
     }
-
-    gui->phase = GUI_PHASE_EXECUTE;
 }
 
 /* =========================================
@@ -1831,11 +1907,9 @@ static void advance_cpu_phase(
 {
     if (cpu->state != CPU_STATE_RUNNING) {
 
-        gui->auto_run = false;
-
+        stop_auto_run(gui);
         return;
     }
-
 
     switch (gui->phase) {
 
@@ -1844,12 +1918,16 @@ static void advance_cpu_phase(
 
             phase_fetch(cpu, gui);
 
+            gui->phase = GUI_PHASE_FETCH;
+
             break;
 
 
         case GUI_PHASE_FETCH:
 
             phase_decode(cpu, gui);
+
+            gui->phase = GUI_PHASE_DECODE;
 
             break;
 
@@ -1882,33 +1960,455 @@ static void execute_one_instruction(
         return;
     }
 
+    /*
+     * Stop automatic execution before manual stepping.
+     */
+
+    stop_auto_run(gui);
 
     /*
-     * If the previous instruction has completed,
-     * begin the next instruction.
+     * If the previous instruction has already
+     * completed, prepare the next instruction.
      */
 
     if (gui->phase == GUI_PHASE_EXECUTE) {
+
         gui->phase = GUI_PHASE_IDLE;
     }
 
-
     /*
-     * Complete the remaining phases.
+     * An instruction needs at most three
+     * phase transitions:
+     *
+     * IDLE    -> FETCH
+     * FETCH   -> DECODE
+     * DECODE  -> EXECUTE
      */
 
-    unsigned int transitions = 0;
+    for (unsigned int i = 0; i < 3; i++) {
 
-    while (
-        cpu->state == CPU_STATE_RUNNING &&
-        gui->phase != GUI_PHASE_EXECUTE &&
-        transitions < 3
-    ) {
+        if (cpu->state != CPU_STATE_RUNNING) {
+            break;
+        }
+
+        if (gui->phase == GUI_PHASE_EXECUTE) {
+            break;
+        }
 
         advance_cpu_phase(cpu, gui);
-
-        transitions++;
     }
+}
+
+/* =========================================
+   EXECUTION CONTROLLER LOGIC
+   ========================================= */
+
+static void reset_cpu_controller(
+    DioCPU *cpu,
+    GUIState *gui
+)
+{
+    stop_auto_run(gui);
+
+    CPUStatus status = cpu_v2_reset(cpu);
+
+    if (status != CPU_STATUS_OK) {
+
+        snprintf(
+            gui->status_message,
+            sizeof(gui->status_message),
+            "CPU reset failed."
+        );
+
+        gui->status_color = COLOR_RED;
+
+        return;
+    }
+
+    /*
+     * Reset GUI instruction cycle.
+     */
+
+    reset_gui_cycle(gui);
+
+    /*
+     * Clear previous ALU visualization.
+     */
+
+    clear_alu_visualization(gui);
+
+    /*
+     * Clear previous stack event.
+     */
+
+    clear_stack_event(gui);
+
+    /*
+     * Reset controller execution state.
+     */
+
+    gui->last_cpu_status = CPU_STATUS_OK;
+
+    gui->phase_timer = 0.0f;
+
+    /*
+     * Keep loaded assembly and memory.
+     */
+
+    gui->disassembly_scroll = 0;
+
+    gui->disassembly_follow_pc = true;
+
+    gui->stack_follow_sp = true;
+
+    gui->stack_view_base = cpu->sp;
+
+    snprintf(
+        gui->status_message,
+        sizeof(gui->status_message),
+        "CPU reset. Program memory preserved."
+    );
+
+    gui->status_color = COLOR_GREEN;
+}
+
+static void process_gui_command(
+    DioCPU *cpu,
+    GUIState *gui,
+    GUICommand command
+)
+{
+    if (gui->initialization_failed) {
+        return;
+    }
+
+    switch (command) {
+
+        /*
+         * RUN / PAUSE
+         */
+
+        case GUI_COMMAND_RUN_PAUSE:
+
+            if (cpu->state != CPU_STATE_RUNNING) {
+
+                stop_auto_run(gui);
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "CPU cannot run: %s.",
+                    cpu_v2_state_string(cpu->state)
+                );
+
+                gui->status_color = COLOR_RED;
+
+                break;
+            }
+
+            gui->auto_run = !gui->auto_run;
+
+            gui->phase_timer = 0.0f;
+
+            if (gui->auto_run) {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Automatic execution started."
+                );
+
+                gui->status_color = COLOR_GREEN;
+
+            } else {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Execution paused."
+                );
+
+                gui->status_color = COLOR_YELLOW;
+            }
+
+            break;
+
+
+        /*
+         * STEP PHASE
+         */
+
+        case GUI_COMMAND_STEP_PHASE:
+
+            if (cpu->state != CPU_STATE_RUNNING) {
+                break;
+            }
+
+            stop_auto_run(gui);
+
+            advance_cpu_phase(cpu, gui);
+
+            if (cpu->state == CPU_STATE_RUNNING) {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Phase: %s",
+                    gui_phase_name(gui->phase)
+                );
+
+                gui->status_color = COLOR_CYAN;
+            }
+
+            break;
+
+
+        /*
+         * STEP INSTRUCTION
+         */
+
+        case GUI_COMMAND_STEP_INSTRUCTION:
+
+            if (cpu->state != CPU_STATE_RUNNING) {
+                break;
+            }
+
+            execute_one_instruction(cpu, gui);
+
+            if (cpu->state == CPU_STATE_RUNNING) {
+
+                snprintf(
+                    gui->status_message,
+                    sizeof(gui->status_message),
+                    "Single instruction completed. PC: 0x%05X",
+                    (unsigned int)cpu->pc
+                );
+
+                gui->status_color = COLOR_CYAN;
+            }
+
+            break;
+
+
+        /*
+         * RESET
+         */
+
+        case GUI_COMMAND_RESET:
+
+            reset_cpu_controller(cpu, gui);
+
+            break;
+
+
+        case GUI_COMMAND_NONE:
+        default:
+
+            break;
+    }
+}
+
+static GUICommand draw_execution_toolbar(
+    const DioCPU *cpu,
+    const GUIState *gui
+)
+{
+    const char *run_label = "RUN";
+
+    if (cpu->state == CPU_STATE_HALTED) {
+        run_label = "HALTED";
+    } else if (cpu->state == CPU_STATE_FAULTED) {
+        run_label = "FAULTED";
+    } else if (gui->auto_run) {
+        run_label = "PAUSE";
+    }
+
+    /*
+     * RUN / PAUSE
+     */
+
+    if (draw_button(
+            (Rectangle){790, 25, 105, 45},
+            run_label
+        )) {
+
+        return GUI_COMMAND_RUN_PAUSE;
+    }
+
+    /*
+     * STEP PHASE
+     */
+
+    if (draw_button(
+            (Rectangle){905, 25, 125, 45},
+            "STEP PHASE"
+        )) {
+
+        return GUI_COMMAND_STEP_PHASE;
+    }
+
+    /*
+     * STEP INSTRUCTION
+     */
+
+    if (draw_button(
+            (Rectangle){1040, 25, 145, 45},
+            "STEP INSTR"
+        )) {
+
+        return GUI_COMMAND_STEP_INSTRUCTION;
+    }
+
+    /*
+     * RESET
+     */
+
+    if (draw_button(
+            (Rectangle){1195, 25, 115, 45},
+            "RESET CPU"
+        )) {
+
+        return GUI_COMMAND_RESET;
+    }
+
+    return GUI_COMMAND_NONE;
+}
+
+static GUICommand read_controller_keyboard(void)
+{
+    if (IsKeyPressed(KEY_F6)) {
+        return GUI_COMMAND_RESET;
+    }
+
+    if (IsKeyPressed(KEY_F5)) {
+        return GUI_COMMAND_RUN_PAUSE;
+    }
+
+    if (IsKeyPressed(KEY_F8)) {
+        return GUI_COMMAND_STEP_PHASE;
+    }
+
+    if (IsKeyPressed(KEY_F10)) {
+        return GUI_COMMAND_STEP_INSTRUCTION;
+    }
+
+    return GUI_COMMAND_NONE;
+}
+
+static void update_auto_run(
+    DioCPU *cpu,
+    GUIState *gui,
+    float delta_time
+)
+{
+    if (!gui->auto_run) {
+        return;
+    }
+
+    /*
+     * Halt and fault must stop automatic execution.
+     */
+
+    if (cpu->state != CPU_STATE_RUNNING) {
+
+        stop_auto_run(gui);
+        return;
+    }
+
+    /*
+     * Protect against invalid timer configuration.
+     */
+
+    if (
+        gui->phase_interval < GUI_MIN_PHASE_INTERVAL ||
+        gui->phase_interval > GUI_MAX_PHASE_INTERVAL
+    ) {
+
+        gui->phase_interval =
+            GUI_DEFAULT_PHASE_INTERVAL;
+    }
+
+    gui->phase_timer += delta_time;
+
+    /*
+     * Advance only one phase per frame.
+     */
+
+    if (gui->phase_timer >= gui->phase_interval) {
+
+        gui->phase_timer = 0.0f;
+
+        advance_cpu_phase(cpu, gui);
+    }
+
+    /*
+     * Check CPU state again because the latest
+     * phase may have executed HLT or caused a fault.
+     */
+
+    if (cpu->state != CPU_STATE_RUNNING) {
+
+        stop_auto_run(gui);
+    }
+}
+
+static void draw_controller_status(
+    const DioCPU *cpu,
+    const GUIState *gui,
+    int x,
+    int y
+)
+{
+    const char *run_status =
+        gui->auto_run
+            ? "AUTO RUN"
+            : "MANUAL / PAUSED";
+
+    Color run_color =
+        gui->auto_run
+            ? COLOR_GREEN
+            : COLOR_YELLOW;
+
+    DrawText(
+        TextFormat(
+            "CPU: %s",
+            cpu_v2_state_string(cpu->state)
+        ),
+        x,
+        y,
+        13,
+        get_cpu_state_color(cpu->state)
+    );
+
+    DrawText(
+        TextFormat(
+            "PHASE: %s",
+            gui_phase_name(gui->phase)
+        ),
+        x + 230,
+        y,
+        13,
+        COLOR_CYAN
+    );
+
+    DrawText(
+        run_status,
+        x + 465,
+        y,
+        13,
+        run_color
+    );
+
+    DrawText(
+        TextFormat(
+            "INTERVAL: %.2f SEC",
+            gui->phase_interval
+        ),
+        x + 680,
+        y,
+        12,
+        COLOR_MUTED
+    );
 }
 
 /* =========================================
@@ -2143,6 +2643,14 @@ static bool gui_load_assembly_program(
     }
 
     /*
+     * Stop automatic execution while loading.
+     */
+
+    stop_auto_run(gui);
+
+    gui->phase_timer = 0.0f;
+
+    /*
      * Read into temporary buffer first.
      * This preserves the previous source
      * if reading fails.
@@ -2271,6 +2779,8 @@ static bool gui_load_assembly_program(
      */
 
     reset_gui_cycle(gui);
+
+    gui->last_cpu_status = CPU_STATUS_OK;
 
     clear_alu_visualization(gui);
 
@@ -2468,7 +2978,7 @@ static void draw_header(DioCPU *cpu, GUIState *gui)
     DrawText(
         "16-BIT ARCHITECTURE | INTERACTIVE SIMULATOR & MEMORY VIEWER",
         22,
-        52,
+        48,
         12,
         COLOR_MUTED
     );
@@ -2481,38 +2991,7 @@ static void draw_header(DioCPU *cpu, GUIState *gui)
         gui->status_color
     );
 
-    /* Buttons: RUN/PAUSE, STEP PHASE, STEP INSTR, RESET, LOAD ASM */
-
-    Rectangle run_btn = {960, 20, 110, 42};
-    const char *run_label = gui->auto_run ? "PAUSE (F5)" : "RUN (F5)";
-    if (draw_button(run_btn, run_label)) {
-        if (cpu->state == CPU_STATE_RUNNING) {
-            gui->auto_run = !gui->auto_run;
-            gui->phase_timer = 0.0f;
-        }
-    }
-
-    Rectangle step_phase_btn = {1080, 20, 115, 42};
-    if (draw_button(step_phase_btn, "PHASE (F8)")) {
-        gui->auto_run = false;
-        advance_cpu_phase(cpu, gui);
-    }
-
-    Rectangle step_instr_btn = {1205, 20, 115, 42};
-    if (draw_button(step_instr_btn, "INSTR (F10)")) {
-        gui->auto_run = false;
-        execute_one_instruction(cpu, gui);
-    }
-
-    Rectangle reset_btn = {1330, 20, 110, 42};
-    if (draw_button(reset_btn, "RESET (F6)")) {
-        cpu_v2_reset(cpu);
-        reset_gui_cycle(gui);
-        clear_stack_event(gui);
-        gui_stack_follow_pointer(cpu, gui);
-    }
-
-    Rectangle load_btn = {1450, 20, 130, 42};
+    Rectangle load_btn = {1320, 25, 120, 45};
     if (draw_button(load_btn, "LOAD ASM")) {
         load_assembly_program(cpu, gui);
     }
@@ -5691,7 +6170,14 @@ int main(void)
 
     gui.disassembly_count = 0;
 
-    gui.phase_interval = 0.35f;
+    gui.auto_run = false;
+
+    gui.phase_timer = 0.0f;
+
+    gui.phase_interval =
+        GUI_DEFAULT_PHASE_INTERVAL;
+
+    gui.phase = GUI_PHASE_IDLE;
 
     snprintf(
         gui.source_path,
@@ -5871,49 +6357,6 @@ int main(void)
 
 
         /* =================================
-           KEYBOARD SHORTCUTS
-           ================================= */
-
-        if (IsKeyPressed(KEY_F8)) {
-
-            gui.auto_run = false;
-
-            advance_cpu_phase(&cpu, &gui);
-        }
-
-        if (IsKeyPressed(KEY_F10)) {
-
-            gui.auto_run = false;
-
-            execute_one_instruction(&cpu, &gui);
-        }
-
-        if (IsKeyPressed(KEY_F5)) {
-
-            if (cpu.state == CPU_STATE_RUNNING) {
-
-                gui.auto_run = !gui.auto_run;
-
-                gui.phase_timer = 0.0f;
-            }
-        }
-
-        if (IsKeyPressed(KEY_F6)) {
-
-            cpu_v2_reset(&cpu);
-
-            reset_gui_cycle(&gui);
-
-            clear_stack_event(&gui);
-
-            gui_stack_follow_pointer(
-                &cpu,
-                &gui
-            );
-        }
-
-
-        /* =================================
            DRAWING
            ================================= */
 
@@ -5921,44 +6364,76 @@ int main(void)
 
         ClearBackground(COLOR_BACKGROUND);
 
-
         /* Header and interactive buttons */
 
         draw_header(&cpu, &gui);
 
+        /* =====================================
+           EXECUTION CONTROLLER INPUT
+           ===================================== */
 
-        /* =================================
+        /* Draw toolbar and get mouse command. */
+
+        GUICommand button_command =
+            draw_execution_toolbar(
+                &cpu,
+                &gui
+            );
+
+        /* Read keyboard command. */
+
+        GUICommand keyboard_command =
+            read_controller_keyboard();
+
+        /*
+         * Button command takes priority over keyboard
+         * if both are somehow triggered in one frame.
+         */
+
+        GUICommand selected_command =
+            button_command != GUI_COMMAND_NONE
+                ? button_command
+                : keyboard_command;
+
+        /*
+         * Process exactly one command.
+         */
+
+        process_gui_command(
+            &cpu,
+            &gui,
+            selected_command
+        );
+
+        /* =====================================
            AUTOMATIC EXECUTION
-           ================================= */
+           ===================================== */
 
-        if (gui.auto_run &&
-            cpu.state == CPU_STATE_RUNNING) {
+        update_auto_run(
+            &cpu,
+            &gui,
+            delta_time
+        );
 
-            gui.phase_timer += delta_time;
-
-            if (gui.phase_timer >= gui.phase_interval) {
-
-                gui.phase_timer = 0.0f;
-
-                advance_cpu_phase(&cpu, &gui);
-            }
-        }
-
-
-        if (cpu.state != CPU_STATE_RUNNING) {
-
-            gui.auto_run = false;
-        }
-
-
-        /* =================================
-           STATE CHANGE TRACKING
-           ================================= */
+        /* =====================================
+           REGISTER AND FLAGS TRACKING
+           ===================================== */
 
         update_state_tracking(
             &gui,
             &cpu,
             delta_time
+        );
+
+        /* =====================================
+           CONTROLLER STATUS
+           ===================================== */
+
+        draw_controller_status(
+            &cpu,
+            &gui,
+            22,
+            68
         );
 
 

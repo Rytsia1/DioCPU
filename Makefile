@@ -2,13 +2,13 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -Werror -std=c11 -I./src
 LIBS_GUI = -lraylib
 
-all: cli gui test cpu-v2 gui-v2
+all: cli gui test cpu-v2 gui-v2 gui-v2-test
 
 cli: dio_cpu.exe
 
 gui: dio8_gui.exe
 
-test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_cpu_v2.exe
+test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_cpu_v2.exe tests_gui_v2_integration.exe
 
 dio_cpu.exe: src/main.c src/cpu.c src/assembler_dio8.c
 	$(CC) -Wall -Wextra -Wpedantic -I./src -o $@ $^
@@ -62,6 +62,10 @@ tests_cpu_v2.exe: tests/tests_cpu_v2.c $(V2_CORE_SOURCES)
 diocpu_v2_gui.exe: src/gui_v2.c $(V2_CORE_SOURCES)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS_GUI)
 
+# Build V2 GUI integration tests
+tests_gui_v2_integration.exe: tests/tests_gui_v2_integration.c $(V2_CORE_SOURCES)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS_GUI)
+
 memory-test: tests_memory.exe
 	./tests_memory.exe
 
@@ -81,12 +85,16 @@ debugger-test: tests_debugger.exe
 cpu-v2-test: tests_cpu_v2.exe
 	./tests_cpu_v2.exe
 
+# Run V2 GUI integration tests
+gui-v2-test: tests_gui_v2_integration.exe
+	./tests_gui_v2_integration.exe
+
 # Build and test
 cpu-v2: diocpu_v2.exe tests_cpu_v2.exe
 
 gui-v2: diocpu_v2_gui.exe
 
 clean:
-	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe test_v2_cpu_state.exe diocpu_v2.exe tests_cpu_v2.exe diocpu_v2_gui.exe *.o
+	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe test_v2_cpu_state.exe diocpu_v2.exe tests_cpu_v2.exe diocpu_v2_gui.exe tests_gui_v2_integration.exe *.o
 
-.PHONY: all cli gui test clean memory-test stack-test decoder-test assembler-test debugger-test cpu-v2 cpu-v2-test gui-v2
+.PHONY: all cli gui test clean memory-test stack-test decoder-test assembler-test debugger-test cpu-v2 cpu-v2-test gui-v2 gui-v2-test
