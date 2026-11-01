@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 #include "cpu.h"
-#include "assembler.h"
+#include "assembler_dio8.h"
 
 void print_cpu_state(const CPU *cpu) {
     printf("PC: 0x%02X | ", cpu->pc);

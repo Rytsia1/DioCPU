@@ -1,40 +1,42 @@
-#ifndef ASSEMBLER_H
-#define ASSEMBLER_H
+#ifndef DIOCPU_ASSEMBLER_H
+#define DIOCPU_ASSEMBLER_H
 
-#include <stdbool.h>
-#include <stddef.h>
+#include "memory.h"
+
 #include <stdint.h>
-#include <stdio.h>
 
-#include "cpu.h"
+typedef enum {
+    ASSEMBLER_STATUS_OK = 0,
+    ASSEMBLER_STATUS_INVALID_ARGUMENT,
+    ASSEMBLER_STATUS_OUT_OF_MEMORY,
+    ASSEMBLER_STATUS_SYNTAX_ERROR,
+    ASSEMBLER_STATUS_UNKNOWN_MNEMONIC,
+    ASSEMBLER_STATUS_DUPLICATE_LABEL,
+    ASSEMBLER_STATUS_UNDEFINED_LABEL,
+    ASSEMBLER_STATUS_INVALID_REGISTER,
+    ASSEMBLER_STATUS_INVALID_NUMBER,
+    ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE,
+    ASSEMBLER_STATUS_BRANCH_OUT_OF_RANGE,
+    ASSEMBLER_STATUS_PROGRAM_TOO_LARGE,
+    ASSEMBLER_STATUS_TOO_MANY_LABELS
+} AssemblerStatus;
 
-#define MAX_LABELS 32
-#define LABEL_NAME_SIZE 32
+typedef struct {
+    uint32_t code_size;
+    uint32_t instruction_count;
+    uint32_t error_line;
 
-typedef struct
-{
-    char name[LABEL_NAME_SIZE];
-    uint8_t address;
-} Label;
+    AssemblerStatus status;
+} AssemblerResult;
 
-typedef struct
-{
-    uint8_t opcode;
-    uint8_t operand1;
-    uint8_t operand2;
-} AssembledInstruction;
+AssemblerStatus assembler_assemble(
+    const char *source,
+    Memory *memory,
+    AssemblerResult *result
+);
 
-char *trim(char *text);
-char *clean_line(char *line);
-int find_label(const Label labels[], int label_count, const char *name);
-int parse_register(const char *text);
-int parse_number(const char *text);
-int parse_instruction(char *line, AssembledInstruction *instruction, const Label labels[], int label_count);
-int first_pass(FILE *file, Label labels[], int *label_count);
-int second_pass(FILE *file, CPU *cpu, const Label labels[], int label_count);
-
-bool assemble_file(const char *filename, uint8_t *buffer, size_t buffer_size, size_t *program_size);
-bool assemble_and_load(CPU *cpu, const char *filename);
-void disassemble_instruction(const uint8_t *memory, uint16_t address, char *buffer, size_t buffer_size);
+const char *assembler_status_string(
+    AssemblerStatus status
+);
 
 #endif

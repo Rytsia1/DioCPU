@@ -8,12 +8,12 @@ cli: dio_cpu.exe
 
 gui: dio8_gui.exe
 
-test: tests_cpu.exe tests_alu.exe tests_memory.exe
+test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe
 
-dio_cpu.exe: src/main.c src/cpu.c src/assembler.c
+dio_cpu.exe: src/main.c src/cpu.c src/assembler_dio8.c
 	$(CC) -Wall -Wextra -Wpedantic -I./src -o $@ $^
 
-dio8_gui.exe: src/gui.c src/cpu.c src/assembler.c
+dio8_gui.exe: src/gui.c src/cpu.c src/assembler_dio8.c
 	$(CC) -Wall -Wextra -Wpedantic -I./src -o $@ $^ $(LIBS_GUI)
 
 tests_cpu.exe: tests/tests_cpu.c src/cpu.c
@@ -25,10 +25,34 @@ tests_alu.exe: tests/tests_alu.c src/alu.c src/alu.h
 tests_memory.exe: tests/tests_memory.c src/memory.c src/memory.h
 	$(CC) $(CFLAGS) -o $@ tests/tests_memory.c src/memory.c
 
+tests_stack.exe: tests/tests_stack.c src/stack.c src/memory.c src/stack.h src/memory.h
+	$(CC) $(CFLAGS) -o $@ tests/tests_stack.c src/stack.c src/memory.c
+
+tests_decoder.exe: tests/tests_decoder.c src/decoder.c src/memory.c src/decoder.h src/memory.h
+	$(CC) $(CFLAGS) -o $@ tests/tests_decoder.c src/decoder.c src/memory.c
+
+tests_assembler.exe: tests/tests_assembler.c src/assembler.c src/decoder.c src/memory.c
+	$(CC) $(CFLAGS) -o $@ tests/tests_assembler.c src/assembler.c src/decoder.c src/memory.c
+
+tests_debugger.exe: tests/tests_debugger.c src/debugger.c src/decoder.c src/memory.c
+	$(CC) $(CFLAGS) -o $@ tests/tests_debugger.c src/debugger.c src/decoder.c src/memory.c
+
 memory-test: tests_memory.exe
 	./tests_memory.exe
 
-clean:
-	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe test_v2_cpu_state.exe *.o
+stack-test: tests_stack.exe
+	./tests_stack.exe
 
-.PHONY: all cli gui test clean memory-test
+decoder-test: tests_decoder.exe
+	./tests_decoder.exe
+
+assembler-test: tests_assembler.exe
+	./tests_assembler.exe
+
+debugger-test: tests_debugger.exe
+	./tests_debugger.exe
+
+clean:
+	rm -f dio_cpu.exe dio8_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe test_v2_cpu_state.exe *.o
+
+.PHONY: all cli gui test clean memory-test stack-test decoder-test assembler-test debugger-test

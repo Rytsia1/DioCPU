@@ -1,6 +1,6 @@
 #include "raylib.h"
 #include "cpu.h"
-#include "assembler.h"
+#include "assembler_dio8.h"
 
 #include <stdio.h>
 #include <string.h>
