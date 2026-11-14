@@ -5,6 +5,7 @@
 #include "datapath.h"
 #include "memory.h"
 #include "microop.h"
+#include "pipeline.h"
 
 #include <stdint.h>
 
@@ -93,6 +94,7 @@ typedef struct {
     DatapathState datapath;
     MicroOpContext uop;
     CycleEngine cycle;
+    PipelineState pipeline;
 
     Memory memory;
 
@@ -115,6 +117,15 @@ CPUStatus cpu_run(
     DioCPU *cpu,
     uint64_t max_steps,
     uint64_t *steps_executed
+);
+
+/* Pipelined Execution & Control (M5) */
+CPUStatus cpu_set_pipeline_forwarding(DioCPU *cpu, bool enabled);
+CPUStatus cpu_pipeline_step_cycle(DioCPU *cpu);
+CPUStatus cpu_pipeline_run(
+    DioCPU *cpu,
+    uint64_t max_cycles,
+    uint64_t *cycles_executed
 );
 
 /* Interrupt & Exception Control */

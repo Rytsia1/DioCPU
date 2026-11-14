@@ -257,6 +257,7 @@ CPUStatus cpu_init(DioCPU *cpu) {
     return CPU_STATUS_INVALID_ARGUMENT;
   }
 
+  cpu->pipeline.initialized = false;
   return cpu_reset(cpu);
 }
 
@@ -289,6 +290,7 @@ CPUStatus cpu_reset(DioCPU *cpu) {
   datapath_reset(&cpu->datapath);
   microop_context_reset(&cpu->uop);
   cycle_engine_reset(&cpu->cycle);
+  pipeline_reset(&cpu->pipeline, 0u);
 
   return CPU_STATUS_OK;
 }
@@ -952,6 +954,787 @@ CPUStatus cpu_run(DioCPU *cpu, uint64_t max_steps, uint64_t *steps_executed) {
 
   *steps_executed = cpu->instructions_executed - initial_count;
 
+  return CPU_STATUS_STEP_LIMIT_REACHED;
+}
+
+static bool pipe_is_empty(const PipelineState *p) {
+  return !p->if_id.valid && !p->id_ex.valid && !p->ex_mem.valid &&
+         !p->mem_wb.valid;
+}
+
+static bool pipe_has_enabled_irq(const DioCPU *cpu) {
+  if ((cpu->flags & CPU_FLAG_IF) == 0u) {
+    return false;
+  }
+
+  for (uint32_t w = 0; w < DIOCPU_IRQ_WORDS; w++) {
+    if (cpu->irq_pending[w] != 0u) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void pipe_clear_all(PipelineState *p, uint32_t fetch_pc) {
+  memset(&p->if_id, 0, sizeof(p->if_id));
+  memset(&p->id_ex, 0, sizeof(p->id_ex));
+  memset(&p->ex_mem, 0, sizeof(p->ex_mem));
+  memset(&p->mem_wb, 0, sizeof(p->mem_wb));
+  p->ex_cycles_remaining = 0u;
+  p->mem_cycles_remaining = 0u;
+  p->fetch_pc = fetch_pc;
+}
+
+static bool pipe_slot_serializes_if(const DecodedInstruction *ir,
+                                    const ControlSignals *ctrl,
+                                    uint8_t fault) {
+  if (fault != (uint8_t)CPU_FAULT_NONE) {
+    return false;
+  }
+  PipelineRegUsage usage;
+  pipeline_collect_usage(ir, ctrl, &usage);
+  return usage.serializes_frontend;
+}
+
+static void pipe_record_slot(PipelineSlotSummary *slot, bool valid,
+                             bool stalled, bool flushed, bool forwarded,
+                             uint32_t pc, InstructionOpcode opcode) {
+  slot->valid = valid;
+  slot->stalled = stalled;
+  slot->flushed = flushed;
+  slot->forwarded = forwarded;
+  slot->pc = pc;
+  slot->opcode = opcode;
+}
+
+static void pipe_build_ex_operands(const DioCPU *cpu,
+                                   const PipelineIDEXLatch *ex,
+                                   const PipelineEXMEMLatch *cur_ex_mem,
+                                   const PipelineMEMWBLatch *cur_mem_wb,
+                                   uint16_t eff_gpr[CPU_GPR_COUNT],
+                                   uint16_t *eff_flags, bool *out_forwarded) {
+  memcpy(eff_gpr, cpu->gpr, sizeof(uint16_t) * CPU_GPR_COUNT);
+  *eff_flags = cpu->flags;
+  *out_forwarded = false;
+
+  if (!cpu->pipeline.config.forwarding_enabled) {
+    return;
+  }
+
+  PipelineRegUsage cons;
+  pipeline_collect_usage(&ex->ir, &ex->ctrl, &cons);
+
+  uint16_t wb_write_mask = 0u;
+  bool wb_writes_flags = false;
+  if (cur_mem_wb->valid && cur_mem_wb->fault == (uint8_t)CPU_FAULT_NONE) {
+    if (cur_mem_wb->ctrl.reg_write_a) {
+      wb_write_mask |= (uint16_t)(1u << cur_mem_wb->ir.reg_a);
+    }
+    if (cur_mem_wb->ctrl.reg_write_b) {
+      wb_write_mask |= (uint16_t)(1u << cur_mem_wb->ir.reg_b);
+    }
+    wb_writes_flags = cur_mem_wb->ctrl.flags_write_alu;
+  }
+
+  uint16_t mem_write_mask = 0u;
+  bool mem_writes_flags = false;
+  if (cur_ex_mem->valid && cur_ex_mem->fault == (uint8_t)CPU_FAULT_NONE) {
+    if (cur_ex_mem->ctrl.reg_write_a) {
+      eff_gpr[cur_ex_mem->ir.reg_a] = cur_ex_mem->wb_value;
+      mem_write_mask |= (uint16_t)(1u << cur_ex_mem->ir.reg_a);
+    }
+    if (cur_ex_mem->ctrl.reg_write_b) {
+      eff_gpr[cur_ex_mem->ir.reg_b] = cur_ex_mem->wb_rem;
+      mem_write_mask |= (uint16_t)(1u << cur_ex_mem->ir.reg_b);
+    }
+    if (cur_ex_mem->ctrl.flags_write_alu) {
+      *eff_flags = (*eff_flags & (uint16_t)~CPU_FLAGS_DEFINED_MASK) |
+                   (cur_ex_mem->alu_flags & CPU_FLAGS_DEFINED_MASK);
+      mem_writes_flags = true;
+    }
+  }
+
+  if ((cons.read_gpr_mask & (mem_write_mask | wb_write_mask)) != 0u ||
+      (cons.reads_flags && (mem_writes_flags || wb_writes_flags))) {
+    *out_forwarded = true;
+  }
+}
+
+static bool pipe_step_wb(DioCPU *cpu, const PipelineMEMWBLatch *wb,
+                         CPUStatus *out_status) {
+  PipelineState *p = &cpu->pipeline;
+  if (!wb->valid) {
+    return false;
+  }
+
+  pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_WB], true, false, false, false,
+                   wb->pc, wb->ir.opcode);
+
+  if (wb->fault != (uint8_t)CPU_FAULT_NONE) {
+    cpu->pc = wb->pc;
+    *out_status = raise_fault(cpu, (CPUFault)wb->fault);
+    pipe_clear_all(p, cpu->pc);
+    return true;
+  }
+
+  if (wb->ctrl.reg_write_a) {
+    cpu->gpr[wb->ir.reg_a] = wb->wb_value;
+  }
+  if (wb->ctrl.reg_write_b) {
+    cpu->gpr[wb->ir.reg_b] = wb->wb_rem;
+  }
+
+  if (wb->ctrl.is_interrupt && wb->ctrl.is_return) {
+    cpu->flags = wb->restored_flags & CPU_FLAGS_ALL_MASK;
+    if (cpu->interrupt_nesting > 0u) {
+      cpu->interrupt_nesting--;
+    }
+  } else {
+    if (wb->ctrl.flags_write_alu) {
+      cpu->flags = (cpu->flags & (uint16_t)~CPU_FLAGS_DEFINED_MASK) |
+                   (wb->alu_flags & CPU_FLAGS_DEFINED_MASK);
+    }
+    if (wb->ctrl.flags_write_system && !wb->ctrl.is_interrupt) {
+      if (wb->ir.opcode == DIOCPU_OP_CLI) {
+        cpu->flags &= (uint16_t)~CPU_FLAG_IF;
+      } else if (wb->ir.opcode == DIOCPU_OP_STI) {
+        cpu->flags |= CPU_FLAG_IF;
+      }
+    }
+  }
+
+  if (wb->ctrl.sets_ivtr) {
+    cpu->ivtr = wb->ir.absolute_address;
+  }
+
+  cpu->instructions_executed++;
+  p->stats.instructions_retired++;
+  cpu->pc = wb->committed_next_pc;
+
+  if (wb->ctrl.is_halt) {
+    cpu->state = CPU_STATE_HALTED;
+    pipe_clear_all(p, cpu->pc);
+    *out_status = CPU_STATUS_HALTED;
+    return true;
+  }
+
+  return false;
+}
+
+static void pipe_step_mem(DioCPU *cpu, const PipelineEXMEMLatch *ex,
+                          PipelineEXMEMLatch *next_ex_mem,
+                          PipelineMEMWBLatch *next_mem_wb, bool *out_mem_stall,
+                          bool *out_mem_redirect, uint32_t *out_redirect_pc) {
+  PipelineState *p = &cpu->pipeline;
+  *out_mem_stall = false;
+  *out_mem_redirect = false;
+  *out_redirect_pc = 0u;
+
+  if (!ex->valid) {
+    return;
+  }
+
+  bool does_mem = ex->ctrl.mem_read || ex->ctrl.mem_write ||
+                  ex->ctrl.stack_push || ex->ctrl.stack_pop ||
+                  (ex->ctrl.is_interrupt && !ex->ctrl.is_return);
+
+  if (ex->fault == (uint8_t)CPU_FAULT_NONE && does_mem) {
+    if (p->mem_cycles_remaining == 0u) {
+      uint8_t lat = (p->config.mem_stage_latency > 0u)
+                        ? p->config.mem_stage_latency
+                        : 1u;
+      if (lat > 1u) {
+        p->mem_cycles_remaining = (uint8_t)(lat - 1u);
+        *out_mem_stall = true;
+      }
+    } else {
+      p->mem_cycles_remaining--;
+      if (p->mem_cycles_remaining > 0u) {
+        *out_mem_stall = true;
+      }
+    }
+
+    if (*out_mem_stall) {
+      *next_ex_mem = *ex;
+      p->stats.structural_mem_stalls++;
+      p->stats.stall_cycles++;
+      p->stats.bubbles++;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, true, false,
+                       false, ex->pc, ex->ir.opcode);
+      return;
+    }
+  }
+
+  memset(next_mem_wb, 0, sizeof(*next_mem_wb));
+  next_mem_wb->valid = true;
+  next_mem_wb->pc = ex->pc;
+  next_mem_wb->ir = ex->ir;
+  next_mem_wb->ctrl = ex->ctrl;
+  next_mem_wb->fault = ex->fault;
+  next_mem_wb->wb_value = ex->wb_value;
+  next_mem_wb->wb_rem = ex->wb_rem;
+  next_mem_wb->alu_flags = ex->alu_flags;
+  next_mem_wb->committed_next_pc = ex->committed_next_pc;
+
+  pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, false, false,
+                   false, ex->pc, ex->ir.opcode);
+
+  if (ex->fault != (uint8_t)CPU_FAULT_NONE) {
+    return;
+  }
+
+  if (ex->ctrl.mem_read) {
+    int addr_ok = ex->ctrl.mem_is_stack_frame
+                      ? valid_stack_data_address(cpu, ex->effective_addr)
+                      : valid_general_data_address(ex->effective_addr);
+    uint16_t val = 0u;
+    if (!ex->effective_addr_valid || !addr_ok ||
+        memory_data_read16(&cpu->memory, ex->effective_addr, &val) !=
+            MEMORY_STATUS_OK) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
+      return;
+    }
+    cpu->mar = ex->effective_addr;
+    next_mem_wb->wb_value = val;
+    return;
+  }
+
+  if (ex->ctrl.mem_write) {
+    int addr_ok = ex->ctrl.mem_is_stack_frame
+                      ? valid_stack_data_address(cpu, ex->effective_addr)
+                      : valid_general_data_address(ex->effective_addr);
+    if (!ex->effective_addr_valid || !addr_ok ||
+        memory_data_write16(&cpu->memory, ex->effective_addr,
+                            ex->store_value) != MEMORY_STATUS_OK) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
+      return;
+    }
+    cpu->mar = ex->effective_addr;
+    return;
+  }
+
+  if (ex->ctrl.is_interrupt && !ex->ctrl.is_return) {
+    /* Software INT imm8 */
+    if (cpu->interrupt_nesting >= DIOCPU_MAX_INTERRUPT_NESTING) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_STACK_OVERFLOW;
+      return;
+    }
+    uint32_t handler_pc = 0u;
+    int has_handler = 0;
+    if (!lookup_ivt_handler(cpu, ex->ir.immediate8, &handler_pc,
+                            &has_handler) ||
+        !has_handler) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_UNHANDLED_INTERRUPT;
+      return;
+    }
+
+    uint32_t saved_sp = cpu->sp;
+    StackStatus st = stack_call(&cpu->memory, &cpu->sp, ex->ir.next_pc);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    st = stack_push16(&cpu->memory, &cpu->sp, cpu->flags);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+
+    cpu->flags &= (uint16_t)~CPU_FLAG_IF;
+    cpu->mar = cpu->sp;
+    cpu->interrupt_count++;
+    cpu->interrupt_nesting++;
+    cpu->last_interrupt_vector = ex->ir.immediate8;
+    cpu->fault = CPU_FAULT_NONE;
+
+    next_mem_wb->committed_next_pc = handler_pc;
+    *out_mem_redirect = true;
+    *out_redirect_pc = handler_pc;
+    return;
+  }
+
+  if (ex->ctrl.is_interrupt && ex->ctrl.is_return) {
+    /* IRET */
+    uint32_t saved_sp = cpu->sp;
+    uint16_t popped_flags = 0u;
+    StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &popped_flags);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    uint32_t ret_old_sp = cpu->sp;
+    uint32_t ret_pc = 0u;
+    st = stack_ret(&cpu->memory, &cpu->sp, &ret_pc);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    if (!valid_address(ret_pc)) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+      return;
+    }
+    cpu->mar = ret_old_sp;
+    next_mem_wb->restored_flags = popped_flags & CPU_FLAGS_ALL_MASK;
+    next_mem_wb->committed_next_pc = ret_pc;
+    *out_mem_redirect = true;
+    *out_redirect_pc = ret_pc;
+    return;
+  }
+
+  if (ex->ctrl.stack_push) {
+    StackStatus st =
+        ex->ctrl.stack_is_32bit
+            ? stack_call(&cpu->memory, &cpu->sp, ex->ir.next_pc)
+            : stack_push16(&cpu->memory, &cpu->sp, ex->store_value);
+    if (st != STACK_STATUS_OK) {
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    cpu->mar = cpu->sp;
+    return;
+  }
+
+  if (ex->ctrl.stack_pop) {
+    uint32_t old_sp = cpu->sp;
+    if (ex->ctrl.stack_is_32bit) {
+      uint32_t ret_pc = 0u;
+      StackStatus st = stack_ret(&cpu->memory, &cpu->sp, &ret_pc);
+      if (st != STACK_STATUS_OK) {
+        next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+        return;
+      }
+      if (!valid_address(ret_pc)) {
+        next_mem_wb->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+        return;
+      }
+      cpu->mar = old_sp;
+      next_mem_wb->committed_next_pc = ret_pc;
+      *out_mem_redirect = true;
+      *out_redirect_pc = ret_pc;
+    } else {
+      uint16_t val = 0u;
+      StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &val);
+      if (st != STACK_STATUS_OK) {
+        next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+        return;
+      }
+      cpu->mar = old_sp;
+      next_mem_wb->wb_value = val;
+    }
+  }
+}
+
+static void pipe_step_ex(DioCPU *cpu, const PipelineIDEXLatch *id_ex,
+                         const PipelineEXMEMLatch *cur_ex_mem,
+                         const PipelineMEMWBLatch *cur_mem_wb,
+                         bool mem_stall, bool mem_redirect,
+                         PipelineIDEXLatch *next_id_ex,
+                         PipelineEXMEMLatch *next_ex_mem, bool *out_ex_stall,
+                         bool *out_ex_redirect, uint32_t *out_redirect_pc) {
+  PipelineState *p = &cpu->pipeline;
+  *out_ex_stall = false;
+  *out_ex_redirect = false;
+  *out_redirect_pc = 0u;
+
+  if (mem_redirect) {
+    p->ex_cycles_remaining = 0u;
+    if (id_ex->valid) {
+      p->stats.bubbles++;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_EX], true, false, true,
+                       false, id_ex->pc, id_ex->ir.opcode);
+    }
+    return;
+  }
+
+  if (mem_stall) {
+    if (id_ex->valid) {
+      *next_id_ex = *id_ex;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_EX], true, true, false,
+                       false, id_ex->pc, id_ex->ir.opcode);
+    }
+    return;
+  }
+
+  if (!id_ex->valid) {
+    return;
+  }
+
+  if (id_ex->fault != (uint8_t)CPU_FAULT_NONE) {
+    memset(next_ex_mem, 0, sizeof(*next_ex_mem));
+    next_ex_mem->valid = true;
+    next_ex_mem->pc = id_ex->pc;
+    next_ex_mem->ir = id_ex->ir;
+    next_ex_mem->ctrl = id_ex->ctrl;
+    next_ex_mem->fault = id_ex->fault;
+    pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_EX], true, false, false,
+                     false, id_ex->pc, id_ex->ir.opcode);
+    return;
+  }
+
+  uint8_t ex_lat = 1u;
+  if (id_ex->ctrl.alu_enable) {
+    if (id_ex->ctrl.alu_op == ALU_MUL || id_ex->ctrl.alu_op == ALU_MULS) {
+      ex_lat = 2u;
+    } else if (id_ex->ctrl.alu_op == ALU_DIV ||
+               id_ex->ctrl.alu_op == ALU_DIVS) {
+      ex_lat = 4u;
+    }
+  }
+
+  if (ex_lat > 1u) {
+    if (p->ex_cycles_remaining == 0u) {
+      p->ex_cycles_remaining = (uint8_t)(ex_lat - 1u);
+      *out_ex_stall = true;
+    } else {
+      p->ex_cycles_remaining--;
+      if (p->ex_cycles_remaining > 0u) {
+        *out_ex_stall = true;
+      }
+    }
+  }
+
+  if (*out_ex_stall) {
+    *next_id_ex = *id_ex;
+    p->stats.structural_ex_stalls++;
+    p->stats.stall_cycles++;
+    p->stats.bubbles++;
+    pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_EX], true, true, false,
+                     false, id_ex->pc, id_ex->ir.opcode);
+    return;
+  }
+
+  uint16_t eff_gpr[CPU_GPR_COUNT];
+  uint16_t eff_flags = 0u;
+  bool forwarded = false;
+  pipe_build_ex_operands(cpu, id_ex, cur_ex_mem, cur_mem_wb, eff_gpr,
+                         &eff_flags, &forwarded);
+  if (forwarded) {
+    p->stats.forwards++;
+  }
+
+  DatapathState dp;
+  datapath_reset(&dp);
+  dp.valid = true;
+  dp.ir_pc = id_ex->pc;
+  dp.ir = id_ex->ir;
+  dp.ctrl = id_ex->ctrl;
+
+  if (dp.ctrl.is_branch) {
+    bool taken = control_unit_eval_branch(dp.ir.opcode, eff_flags) != 0;
+    dp.ctrl.branch_taken = taken;
+    dp.ctrl.pc_src = taken ? PC_SRC_REL8_TAKEN : PC_SRC_NEXT_PC;
+  }
+
+  memset(next_ex_mem, 0, sizeof(*next_ex_mem));
+  next_ex_mem->valid = true;
+  next_ex_mem->pc = id_ex->pc;
+  next_ex_mem->ir = dp.ir;
+  next_ex_mem->ctrl = dp.ctrl;
+  next_ex_mem->alu_flags = eff_flags & CPU_FLAGS_DEFINED_MASK;
+  next_ex_mem->committed_next_pc = dp.ir.next_pc;
+
+  pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_EX], true, false, false,
+                   forwarded, id_ex->pc, id_ex->ir.opcode);
+
+  if (dp.ctrl.sets_ivtr && !valid_ivt_base(dp.ir.absolute_address)) {
+    next_ex_mem->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
+    return;
+  }
+
+  if (!dp.ctrl.is_halt && !dp.ctrl.is_jump && !dp.ctrl.is_return &&
+      !dp.ctrl.is_branch) {
+    if (!valid_next_pc(dp.ir.next_pc)) {
+      next_ex_mem->fault =
+          (uint8_t)(dp.ctrl.is_call ? CPU_FAULT_INVALID_INSTRUCTION
+                                    : CPU_FAULT_INSTRUCTION_FETCH_FAULT);
+      return;
+    }
+  }
+
+  datapath_read_operands(&dp, eff_gpr, CPU_GPR_COUNT, cpu->sp);
+
+  next_ex_mem->effective_addr = dp.effective_addr;
+  next_ex_mem->effective_addr_valid = dp.effective_addr_valid;
+  next_ex_mem->agu_raw_addr = dp.agu_raw_addr;
+
+  if (dp.ctrl.alu_enable) {
+    if ((dp.ir.opcode == DIOCPU_OP_DIV || dp.ir.opcode == DIOCPU_OP_DIVS) &&
+        dp.ir.reg_a == dp.ir.reg_b) {
+      next_ex_mem->fault = (uint8_t)CPU_FAULT_INVALID_INSTRUCTION;
+      return;
+    }
+    uint16_t new_alu_flags = eff_flags & CPU_FLAGS_DEFINED_MASK;
+    ALUStatus alu_st = datapath_run_alu(&dp, eff_flags, &new_alu_flags);
+    if (alu_st != ALU_STATUS_OK) {
+      next_ex_mem->fault = (uint8_t)map_alu_fault(alu_st);
+      return;
+    }
+    next_ex_mem->alu_flags = new_alu_flags;
+  }
+
+  if (dp.ctrl.reg_write_a && dp.ctrl.wb_src != WB_SRC_MEM_DATA) {
+    next_ex_mem->wb_value =
+        datapath_select_writeback(&dp, eff_gpr, CPU_GPR_COUNT);
+  }
+  if (dp.ctrl.reg_write_b) {
+    next_ex_mem->wb_rem = dp.alu_rem;
+  }
+
+  if (dp.ctrl.mem_write) {
+    next_ex_mem->store_value = eff_gpr[dp.ir.reg_a];
+  } else if (dp.ctrl.stack_push && !dp.ctrl.stack_is_32bit) {
+    next_ex_mem->store_value = dp.alu_in_a;
+  }
+
+  if (dp.ctrl.is_jump || dp.ctrl.is_call ||
+      (dp.ctrl.is_branch && dp.ctrl.branch_taken)) {
+    uint32_t target_pc = 0u;
+    if (!datapath_resolve_next_pc(&dp, eff_gpr, CPU_GPR_COUNT, dp.ir_pc, 0u, 0u,
+                                  &target_pc)) {
+      next_ex_mem->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+      return;
+    }
+    next_ex_mem->committed_next_pc = target_pc;
+    *out_ex_redirect = true;
+    *out_redirect_pc = target_pc;
+    p->stats.control_hazard_flushes++;
+  } else if (dp.ctrl.is_halt) {
+    uint32_t hlt_next_pc = dp.ir_pc;
+    (void)datapath_resolve_next_pc(&dp, eff_gpr, CPU_GPR_COUNT, dp.ir_pc, 0u,
+                                   0u, &hlt_next_pc);
+    next_ex_mem->committed_next_pc = hlt_next_pc;
+  }
+}
+
+CPUStatus cpu_set_pipeline_forwarding(DioCPU *cpu, bool enabled) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  cpu->pipeline.config.forwarding_enabled = enabled;
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_pipeline_step_cycle(DioCPU *cpu) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (cpu->state == CPU_STATE_HALTED) {
+    return CPU_STATUS_HALTED;
+  }
+
+  if (cpu->state == CPU_STATE_FAULTED) {
+    return CPU_STATUS_FAULTED;
+  }
+
+  PipelineState *p = &cpu->pipeline;
+  if (!p->initialized) {
+    pipeline_reset(p, cpu->pc);
+  }
+
+  p->stats.cycles++;
+  memset(p->stage_snapshot, 0, sizeof(p->stage_snapshot));
+
+  /* Handle multi-cycle hardware IRQ entry once pipeline is drained */
+  if (p->irq_entry_active) {
+    if (p->irq_cycles_remaining > 0u) {
+      p->irq_cycles_remaining--;
+      p->stats.stall_cycles++;
+      return CPU_STATUS_OK;
+    }
+    p->irq_entry_active = false;
+    CPUFault irq_fault = CPU_FAULT_NONE;
+    if (!enter_interrupt(cpu, p->pending_irq_vector, p->fetch_pc,
+                         &irq_fault)) {
+      return raise_fault(cpu, irq_fault);
+    }
+    p->fetch_pc = cpu->pc;
+    return CPU_STATUS_OK;
+  }
+
+  PipelineIFIDLatch cur_if_id = p->if_id;
+  PipelineIDEXLatch cur_id_ex = p->id_ex;
+  PipelineEXMEMLatch cur_ex_mem = p->ex_mem;
+  PipelineMEMWBLatch cur_mem_wb = p->mem_wb;
+
+  /* Step WB first; faults or HLT flush younger stages cleanly */
+  CPUStatus wb_status = CPU_STATUS_OK;
+  if (pipe_step_wb(cpu, &cur_mem_wb, &wb_status)) {
+    return wb_status;
+  }
+
+  PipelineIFIDLatch next_if_id = {0};
+  PipelineIDEXLatch next_id_ex = {0};
+  PipelineEXMEMLatch next_ex_mem = {0};
+  PipelineMEMWBLatch next_mem_wb = {0};
+
+  bool mem_stall = false;
+  bool mem_redirect = false;
+  uint32_t mem_redirect_pc = 0u;
+  pipe_step_mem(cpu, &cur_ex_mem, &next_ex_mem, &next_mem_wb, &mem_stall,
+                &mem_redirect, &mem_redirect_pc);
+
+  if (mem_redirect) {
+    p->stats.control_hazard_flushes++;
+  }
+
+  bool ex_stall = false;
+  bool ex_redirect = false;
+  uint32_t ex_redirect_pc = 0u;
+  pipe_step_ex(cpu, &cur_id_ex, &cur_ex_mem, &cur_mem_wb, mem_stall,
+               mem_redirect, &next_id_ex, &next_ex_mem, &ex_stall, &ex_redirect,
+               &ex_redirect_pc);
+
+  bool id_stall = false;
+  if (mem_redirect || ex_redirect) {
+    if (cur_if_id.valid) {
+      p->stats.bubbles++;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_ID], true, false, true,
+                       false, cur_if_id.pc, cur_if_id.ir.opcode);
+    }
+  } else if (mem_stall || ex_stall) {
+    next_if_id = cur_if_id;
+    if (cur_if_id.valid) {
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_ID], true, true, false,
+                       false, cur_if_id.pc, cur_if_id.ir.opcode);
+    }
+  } else if (cur_if_id.valid) {
+    PipelineIDEXLatch decoded_id = {0};
+    decoded_id.valid = true;
+    decoded_id.pc = cur_if_id.pc;
+    decoded_id.ir = cur_if_id.ir;
+    decoded_id.fault = cur_if_id.fault;
+
+    if (decoded_id.fault == (uint8_t)CPU_FAULT_NONE) {
+      if (control_unit_decode(&cur_if_id.ir, cpu->flags, &decoded_id.ctrl) !=
+          CONTROL_UNIT_OK) {
+        decoded_id.fault = (uint8_t)CPU_FAULT_INVALID_INSTRUCTION;
+      }
+    }
+
+    bool load_use = false;
+    bool sys_stall = false;
+    if (pipeline_detect_data_hazard(&decoded_id, &cur_id_ex, &cur_ex_mem,
+                                    &cur_mem_wb, p->config.forwarding_enabled,
+                                    &load_use, &sys_stall)) {
+      id_stall = true;
+      next_if_id = cur_if_id;
+      p->stats.stall_cycles++;
+      p->stats.bubbles++;
+      if (load_use) {
+        p->stats.load_use_stalls++;
+        p->stats.data_hazard_stalls++;
+      } else if (sys_stall) {
+        p->stats.control_stalls++;
+      } else {
+        p->stats.data_hazard_stalls++;
+      }
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_ID], true, true, false,
+                       false, cur_if_id.pc, cur_if_id.ir.opcode);
+    } else {
+      next_id_ex = decoded_id;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_ID], true, false, false,
+                       false, cur_if_id.pc, cur_if_id.ir.opcode);
+    }
+  }
+
+  /* Step IF according to cascade: mem_redirect > ex_redirect > stalls > hold */
+  if (mem_redirect) {
+    p->fetch_pc = mem_redirect_pc;
+    p->stats.bubbles++;
+  } else if (ex_redirect) {
+    p->fetch_pc = ex_redirect_pc;
+    p->stats.bubbles++;
+  } else if (mem_stall || ex_stall || id_stall) {
+    pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], cur_if_id.valid, true,
+                     false, false, p->fetch_pc, DIOCPU_OP_NOP);
+  } else {
+    bool serialize_hold =
+        (next_id_ex.valid &&
+         pipe_slot_serializes_if(&next_id_ex.ir, &next_id_ex.ctrl,
+                                 next_id_ex.fault)) ||
+        (next_ex_mem.valid &&
+         pipe_slot_serializes_if(&next_ex_mem.ir, &next_ex_mem.ctrl,
+                                 next_ex_mem.fault)) ||
+        (next_mem_wb.valid &&
+         pipe_slot_serializes_if(&next_mem_wb.ir, &next_mem_wb.ctrl,
+                                 next_mem_wb.fault));
+
+    if (!serialize_hold && !pipe_has_enabled_irq(cpu)) {
+      DecodedInstruction fetched = {0};
+      DecoderStatus dst = decoder_decode(&cpu->memory, p->fetch_pc, &fetched);
+      next_if_id.valid = true;
+      next_if_id.pc = p->fetch_pc;
+      if (dst == DECODER_STATUS_OK) {
+        next_if_id.ir = fetched;
+        next_if_id.fault = (uint8_t)CPU_FAULT_NONE;
+        p->fetch_pc = fetched.next_pc;
+        pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, false, false,
+                         false, next_if_id.pc, fetched.opcode);
+      } else {
+        next_if_id.fault = (uint8_t)map_decoder_fault(dst);
+        pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, false, false,
+                         false, next_if_id.pc, DIOCPU_OP_NOP);
+      }
+    } else if (serialize_hold && !(next_id_ex.valid && next_id_ex.ctrl.is_halt) &&
+               !(next_ex_mem.valid && next_ex_mem.ctrl.is_halt) &&
+               !(next_mem_wb.valid && next_mem_wb.ctrl.is_halt)) {
+      p->stats.control_stalls++;
+    }
+  }
+
+  p->if_id = next_if_id;
+  p->id_ex = next_id_ex;
+  p->ex_mem = next_ex_mem;
+  p->mem_wb = next_mem_wb;
+
+  /* If pipeline just drained and an enabled IRQ is pending, enter 6-cycle IRQ sequence */
+  if (pipe_is_empty(p) && pipe_has_enabled_irq(cpu)) {
+    uint8_t vec = 0u;
+    if (find_pending_irq(cpu, &vec)) {
+      p->irq_entry_active = true;
+      p->irq_cycles_remaining = 5u;
+      p->pending_irq_vector = vec;
+    }
+  }
+
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_pipeline_run(DioCPU *cpu, uint64_t max_cycles,
+                           uint64_t *cycles_executed) {
+  if (cpu == NULL || cycles_executed == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  *cycles_executed = 0u;
+
+  if (cpu->state == CPU_STATE_HALTED) {
+    return CPU_STATUS_HALTED;
+  }
+
+  if (cpu->state == CPU_STATE_FAULTED) {
+    return CPU_STATUS_FAULTED;
+  }
+
+  uint64_t start_cycles = cpu->pipeline.stats.cycles;
+
+  for (uint64_t i = 0; i < max_cycles; i++) {
+    CPUStatus st = cpu_pipeline_step_cycle(cpu);
+    if (st != CPU_STATUS_OK) {
+      *cycles_executed = cpu->pipeline.stats.cycles - start_cycles;
+      return st;
+    }
+  }
+
+  *cycles_executed = cpu->pipeline.stats.cycles - start_cycles;
   return CPU_STATUS_STEP_LIMIT_REACHED;
 }
 
