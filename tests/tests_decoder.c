@@ -358,6 +358,81 @@ static int test_invalid_arguments(void)
     return 1;
 }
 
+static int test_m1_formats_and_isa_table(void)
+{
+    Memory memory;
+    CHECK(setup(&memory));
+
+    /* INT 0x21 */
+    memory.instruction[0x00900] = DIOCPU_OP_INT;
+    memory.instruction[0x00901] = 0x21;
+
+    /* SHLI R4, 3 */
+    memory.instruction[0x00902] = DIOCPU_OP_SHLI;
+    memory.instruction[0x00903] = 0x04;
+    memory.instruction[0x00904] = 0x03;
+
+    /* LOADR R1, [R2 - 4] */
+    memory.instruction[0x00905] = DIOCPU_OP_LOADR;
+    memory.instruction[0x00906] = 0x12;
+    memory.instruction[0x00907] = 0xFC;
+    memory.instruction[0x00908] = 0xFF;
+
+    /* LOADX R5, [R6 + R7] */
+    memory.instruction[0x00909] = DIOCPU_OP_LOADX;
+    memory.instruction[0x0090A] = 0x56;
+    memory.instruction[0x0090B] = 0x07;
+
+    /* STORESP R8, [SP + 6] */
+    memory.instruction[0x0090C] = DIOCPU_OP_STORESP;
+    memory.instruction[0x0090D] = 0x08;
+    memory.instruction[0x0090E] = 0x06;
+    memory.instruction[0x0090F] = 0x00;
+
+    DecodedInstruction inst;
+
+    CHECK(decoder_decode(&memory, 0x00900, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.format == INSTRUCTION_FORMAT_IMMEDIATE8);
+    CHECK(inst.immediate8 == 0x21);
+    CHECK(inst.length == 2);
+
+    CHECK(decoder_decode(&memory, 0x00902, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.format == INSTRUCTION_FORMAT_REGISTER_IMMEDIATE8);
+    CHECK(inst.reg_a == 4);
+    CHECK(inst.immediate8 == 3);
+    CHECK(inst.length == 3);
+
+    CHECK(decoder_decode(&memory, 0x00905, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.format == INSTRUCTION_FORMAT_REGISTER_INDIRECT_OFFSET);
+    CHECK(inst.reg_a == 1);
+    CHECK(inst.reg_b == 2);
+    CHECK(inst.offset16 == -4);
+    CHECK(inst.length == 4);
+
+    CHECK(decoder_decode(&memory, 0x00909, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.format == INSTRUCTION_FORMAT_REGISTER_INDEXED);
+    CHECK(inst.reg_a == 5);
+    CHECK(inst.reg_b == 6);
+    CHECK(inst.reg_c == 7);
+    CHECK(inst.length == 3);
+
+    CHECK(decoder_decode(&memory, 0x0090C, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.format == INSTRUCTION_FORMAT_REGISTER_SP_OFFSET);
+    CHECK(inst.reg_a == 8);
+    CHECK(inst.offset16 == 6);
+    CHECK(inst.length == 4);
+
+    /* Reserved upper bits on LOADX third byte must fail */
+    memory.instruction[0x00920] = DIOCPU_OP_LOADX;
+    memory.instruction[0x00921] = 0x12;
+    memory.instruction[0x00922] = 0xF3;
+    CHECK(decoder_decode(&memory, 0x00920, &inst) == DECODER_STATUS_INVALID_INSTRUCTION);
+
+    CHECK(isa_lookup_mnemonic("IRET")->opcode == DIOCPU_OP_IRET);
+    CHECK(strcmp(isa_opcode_name(DIOCPU_OP_JG), "JG") == 0);
+
+    return 1;
+}
 
 int main(void)
 {
@@ -418,7 +493,12 @@ int main(void)
         passed++;
     }
 
+    if (test_m1_formats_and_isa_table()) {
+        printf("[PASS] test_m1_formats_and_isa_table\n");
+        passed++;
+    }
+
     printf("\nDecoder tests: %d passed.\n", passed);
 
-    return (passed == 11) ? 0 : 1;
+    return (passed == 12) ? 0 : 1;
 }

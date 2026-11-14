@@ -422,6 +422,106 @@ ALUResult alu_execute(
         }
 
         /* ---------------------------------------------
+         * SHL (Logical Shift Left)
+         * --------------------------------------------- */
+
+        case ALU_SHL:
+        {
+            bool carry = false;
+            bool overflow = false;
+
+            if (b == 0u) {
+                result = a;
+            } else if (b < 16u) {
+                result = (uint16_t)(a << b);
+                carry = ((a >> (16u - b)) & 1u) != 0u;
+                if (b == 1u) {
+                    overflow = ((a ^ result) & 0x8000u) != 0u;
+                }
+            } else if (b == 16u) {
+                result = 0u;
+                carry = (a & 1u) != 0u;
+            } else {
+                result = 0u;
+            }
+
+            flags = alu_update_arithmetic_flags(
+                flags,
+                result,
+                carry,
+                overflow
+            );
+
+            break;
+        }
+
+        /* ---------------------------------------------
+         * SHR (Logical Shift Right)
+         * --------------------------------------------- */
+
+        case ALU_SHR:
+        {
+            bool carry = false;
+            bool overflow = false;
+
+            if (b == 0u) {
+                result = a;
+            } else if (b < 16u) {
+                result = (uint16_t)(a >> b);
+                carry = ((a >> (b - 1u)) & 1u) != 0u;
+                if (b == 1u) {
+                    overflow = (a & 0x8000u) != 0u;
+                }
+            } else if (b == 16u) {
+                result = 0u;
+                carry = (a & 0x8000u) != 0u;
+            } else {
+                result = 0u;
+            }
+
+            flags = alu_update_arithmetic_flags(
+                flags,
+                result,
+                carry,
+                overflow
+            );
+
+            break;
+        }
+
+        /* ---------------------------------------------
+         * SAR (Arithmetic Shift Right)
+         * --------------------------------------------- */
+
+        case ALU_SAR:
+        {
+            bool sign_bit = (a & 0x8000u) != 0u;
+            bool carry = false;
+
+            if (b == 0u) {
+                result = a;
+            } else if (b < 16u) {
+                uint16_t sign_fill = sign_bit
+                    ? (uint16_t)(0xFFFFu << (16u - b))
+                    : 0u;
+                result = (uint16_t)((a >> b) | sign_fill);
+                carry = ((a >> (b - 1u)) & 1u) != 0u;
+            } else {
+                result = sign_bit ? 0xFFFFu : 0u;
+                carry = sign_bit;
+            }
+
+            flags = alu_update_arithmetic_flags(
+                flags,
+                result,
+                carry,
+                false
+            );
+
+            break;
+        }
+
+        /* ---------------------------------------------
          * Invalid operation
          * --------------------------------------------- */
 

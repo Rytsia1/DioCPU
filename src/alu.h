@@ -23,7 +23,10 @@ typedef enum {
     ALU_OR,
     ALU_XOR,
     ALU_NOT,
-    ALU_CMP
+    ALU_CMP,
+    ALU_SHL,
+    ALU_SHR,
+    ALU_SAR
 } ALUOperation;
 
 typedef enum {

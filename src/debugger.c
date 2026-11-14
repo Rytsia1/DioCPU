@@ -2,46 +2,6 @@
 
 #include <stdint.h>
 
-
-static const char *opcode_name(InstructionOpcode opcode)
-{
-    switch (opcode) {
-
-        case DIOCPU_OP_NOP: return "NOP";
-        case DIOCPU_OP_HLT: return "HLT";
-        case DIOCPU_OP_JMP: return "JMP";
-        case DIOCPU_OP_CALL: return "CALL";
-        case DIOCPU_OP_RET: return "RET";
-
-        case DIOCPU_OP_LOADI: return "LOADI";
-        case DIOCPU_OP_LOAD: return "LOAD";
-        case DIOCPU_OP_STORE: return "STORE";
-        case DIOCPU_OP_PUSH: return "PUSH";
-        case DIOCPU_OP_POP: return "POP";
-
-        case DIOCPU_OP_ADD: return "ADD";
-        case DIOCPU_OP_SUB: return "SUB";
-        case DIOCPU_OP_MUL: return "MUL";
-        case DIOCPU_OP_MULS: return "MULS";
-        case DIOCPU_OP_DIV: return "DIV";
-        case DIOCPU_OP_DIVS: return "DIVS";
-
-        case DIOCPU_OP_AND: return "AND";
-        case DIOCPU_OP_OR: return "OR";
-        case DIOCPU_OP_XOR: return "XOR";
-        case DIOCPU_OP_NOT: return "NOT";
-
-        case DIOCPU_OP_CMP: return "CMP";
-
-        case DIOCPU_OP_JZ: return "JZ";
-        case DIOCPU_OP_JNZ: return "JNZ";
-        case DIOCPU_OP_JC: return "JC";
-        case DIOCPU_OP_JNC: return "JNC";
-
-        default: return "UNKNOWN";
-    }
-}
-
 static int print_instruction(
     const Memory *memory,
     const DecodedInstruction *instruction,
@@ -83,21 +43,17 @@ static int print_instruction(
         return 0;
     }
 
-    const char *name = opcode_name(instruction->opcode);
+    const char *name = isa_opcode_name(instruction->opcode);
 
     switch (instruction->format) {
 
         case INSTRUCTION_FORMAT_NONE:
-
             if (fprintf(output, "%s", name) < 0) {
                 return 0;
             }
-
             break;
 
-
         case INSTRUCTION_FORMAT_REGISTER:
-
             if (fprintf(
                     output,
                     "%s R%u",
@@ -106,12 +62,9 @@ static int print_instruction(
                 ) < 0) {
                 return 0;
             }
-
             break;
 
-
         case INSTRUCTION_FORMAT_REGISTER_REGISTER:
-
             if (fprintf(
                     output,
                     "%s R%u, R%u",
@@ -121,12 +74,9 @@ static int print_instruction(
                 ) < 0) {
                 return 0;
             }
-
             break;
 
-
         case INSTRUCTION_FORMAT_REGISTER_IMMEDIATE16:
-
             if (fprintf(
                     output,
                     "%s R%u, 0x%04X",
@@ -136,12 +86,9 @@ static int print_instruction(
                 ) < 0) {
                 return 0;
             }
-
             break;
 
-
         case INSTRUCTION_FORMAT_REGISTER_ABSOLUTE18:
-
             if (fprintf(
                     output,
                     "%s R%u, [0x%05X]",
@@ -151,12 +98,9 @@ static int print_instruction(
                 ) < 0) {
                 return 0;
             }
-
             break;
 
-
         case INSTRUCTION_FORMAT_ABSOLUTE18:
-
             if (fprintf(
                     output,
                     "%s 0x%05X",
@@ -165,9 +109,112 @@ static int print_instruction(
                 ) < 0) {
                 return 0;
             }
-
             break;
 
+        case INSTRUCTION_FORMAT_IMMEDIATE8:
+            if (fprintf(
+                    output,
+                    "%s 0x%02X",
+                    name,
+                    (unsigned int)instruction->immediate8
+                ) < 0) {
+                return 0;
+            }
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_IMMEDIATE8:
+            if (fprintf(
+                    output,
+                    "%s R%u, %u",
+                    name,
+                    instruction->reg_a,
+                    (unsigned int)instruction->immediate8
+                ) < 0) {
+                return 0;
+            }
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_INDIRECT_OFFSET:
+            if (instruction->offset16 == 0) {
+                if (fprintf(
+                        output,
+                        "%s R%u, [R%u]",
+                        name,
+                        instruction->reg_a,
+                        instruction->reg_b
+                    ) < 0) {
+                    return 0;
+                }
+            } else if (instruction->offset16 > 0) {
+                if (fprintf(
+                        output,
+                        "%s R%u, [R%u + %d]",
+                        name,
+                        instruction->reg_a,
+                        instruction->reg_b,
+                        (int)instruction->offset16
+                    ) < 0) {
+                    return 0;
+                }
+            } else {
+                if (fprintf(
+                        output,
+                        "%s R%u, [R%u - %d]",
+                        name,
+                        instruction->reg_a,
+                        instruction->reg_b,
+                        -(int)instruction->offset16
+                    ) < 0) {
+                    return 0;
+                }
+            }
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_INDEXED:
+            if (fprintf(
+                    output,
+                    "%s R%u, [R%u + R%u]",
+                    name,
+                    instruction->reg_a,
+                    instruction->reg_b,
+                    instruction->reg_c
+                ) < 0) {
+                return 0;
+            }
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_SP_OFFSET:
+            if (instruction->offset16 == 0) {
+                if (fprintf(
+                        output,
+                        "%s R%u, [SP]",
+                        name,
+                        instruction->reg_a
+                    ) < 0) {
+                    return 0;
+                }
+            } else if (instruction->offset16 > 0) {
+                if (fprintf(
+                        output,
+                        "%s R%u, [SP + %d]",
+                        name,
+                        instruction->reg_a,
+                        (int)instruction->offset16
+                    ) < 0) {
+                    return 0;
+                }
+            } else {
+                if (fprintf(
+                        output,
+                        "%s R%u, [SP - %d]",
+                        name,
+                        instruction->reg_a,
+                        -(int)instruction->offset16
+                    ) < 0) {
+                    return 0;
+                }
+            }
+            break;
 
         case INSTRUCTION_FORMAT_RELATIVE8:
         {
@@ -202,7 +249,6 @@ static int print_instruction(
 
             break;
         }
-
 
         default:
             return 0;

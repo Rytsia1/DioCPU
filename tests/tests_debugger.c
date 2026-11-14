@@ -192,6 +192,35 @@ static int test_invalid_arguments(Memory *memory)
     return 1;
 }
 
+static int test_m1_disassembly(Memory *memory)
+{
+    CHECK(memory_init(memory) == MEMORY_STATUS_OK);
+
+    const uint8_t program[] = {
+        DIOCPU_OP_INT, 0x20,
+        DIOCPU_OP_SHLI, 0x01, 0x03,
+        DIOCPU_OP_LOADR, 0x12, 0xFC, 0xFF,
+        DIOCPU_OP_LOADX, 0x34, 0x05,
+        DIOCPU_OP_LOADSP, 0x06, 0x02, 0x00,
+        DIOCPU_OP_IRET
+    };
+
+    for (size_t i = 0; i < sizeof(program); i++) {
+        CHECK(memory_instruction_write8(memory, (uint32_t)i, program[i]) == MEMORY_STATUS_OK);
+    }
+
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+
+    DebuggerResult result;
+    CHECK(debugger_disassemble(memory, 0, sizeof(program), output, &result) == DEBUGGER_STATUS_OK);
+    CHECK(result.instruction_count == 6);
+    CHECK(result.next_pc == sizeof(program));
+
+    fclose(output);
+    return 1;
+}
+
 
 #define RUN_TEST(test_function)                           \
     do {                                                  \
@@ -213,6 +242,7 @@ int main(void)
     RUN_TEST(test_invalid_opcode);
     RUN_TEST(test_incomplete_instruction);
     RUN_TEST(test_invalid_arguments);
+    RUN_TEST(test_m1_disassembly);
 
     printf("\nDebugger tests: %u passed.\n", passed);
 

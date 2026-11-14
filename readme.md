@@ -17,27 +17,31 @@ DioCPU is a custom 16-bit Harvard architecture computer system implemented in po
   - Program Counter (`PC`): 18-bit instruction address pointer.
   - Stack Pointer (`SP`): 18-bit stack pointer (top of memory: `0x3FFFE`).
   - Memory Address Register (`MAR`): 18-bit bus address register.
-  - Flags Register (`FLAGS`): 16-bit status register (`ZF`: Zero, `CF`: Carry, `SF`: Sign, `OF`: Overflow).
+  - Interrupt Vector Table Register (`IVTR`): 18-bit base pointer (default: `0x2FC00`).
+  - Flags Register (`FLAGS`): 16-bit status & control register (`ZF`: Zero, `CF`: Carry, `SF`: Sign, `OF`: Overflow, `IF`: Interrupt Enable).
 - **ALU (Arithmetic Logic Unit)**:
-  - Arithmetic: `ADD`, `SUB`, `CMP`, `MUL`, `MULS`, `DIV`, `DIVS`.
-  - Logic: `AND`, `OR`, `XOR`, `NOT`.
-- **Stack Subsystem**:
-  - Full-descending stack with 16-bit word push/pop.
-  - 32-bit (4-byte) aligned return address storage for 18-bit `CALL`/`RET`.
+  - Arithmetic: `ADD`, `ADDI`, `SUB`, `SUBI`, `INC`, `DEC`, `CMP`, `CMPI`, `MUL`, `MULS`, `DIV`, `DIVS`.
+  - Logic & Shifts: `AND`, `OR`, `XOR`, `NOT`, `SHL`, `SHR`, `SAR`, `SHLI`, `SHRI`, `SARI`.
+- **Stack & Interrupt Subsystem**:
+  - Full-descending stack with 16-bit word push/pop and stack-frame access (`LOADSP`, `STORESP`).
+  - 32-bit (4-byte) aligned return address storage for 18-bit `CALL`/`CALLR`/`RET` and `INT`/`IRET`.
+  - 256-entry Interrupt Vector Table (IVT) supporting software traps (`INT`), maskable hardware IRQs (`CLI`/`STI`), and fault trapping.
   - Hardware boundary checks: automatic overflow and underflow protection.
 
 ---
 
 ## 2. Instruction Set Architecture (ISA)
 
+See [docs/ISA_SPEC.md](docs/ISA_SPEC.md) and [docs/ARCHITECTURE_AUDIT.md](docs/ARCHITECTURE_AUDIT.md) for full encoding and architecture details.
+
 | Category | Opcodes | Description |
 | :--- | :--- | :--- |
-| **System** | `NOP`, `HLT` | No operation, halt execution engine |
-| **Data Transfer** | `LOADI`, `LOAD`, `STORE` | Immediate load, memory load & store |
-| **Arithmetic** | `ADD`, `SUB`, `CMP`, `MUL`, `MULS`, `DIV`, `DIVS` | Unsigned & signed arithmetic operations |
-| **Logic** | `AND`, `OR`, `XOR`, `NOT` | Bitwise bit manipulation |
-| **Stack** | `PUSH`, `POP`, `CALL`, `RET` | LIFO stack operations and subroutine linkages |
-| **Control Flow** | `JMP`, `JZ`, `JNZ`, `JC`, `JNC`, `JS`, `JNS`, `JO`, `JNO` | Unconditional and flag-conditional jumps |
+| **System & Interrupts** | `NOP`, `HLT`, `CLI`, `STI`, `INT`, `IRET`, `SETIVT` | Execution control, interrupt masking, traps, and IVT configuration |
+| **Data Transfer & Addressing** | `LOADI`, `MOV`, `LOAD`, `STORE`, `LOADR`, `STORER`, `LOADX`, `STOREX`, `LOADSP`, `STORESP`, `LEA` | Immediate, direct `[abs18]`, register-indirect `[Rb ± disp16]`, indexed `[Rb + Rc]`, and stack-relative `[SP ± disp16]` |
+| **Arithmetic** | `ADD`, `ADDI`, `SUB`, `SUBI`, `INC`, `DEC`, `CMP`, `CMPI`, `MUL`, `MULS`, `DIV`, `DIVS` | Unsigned, signed, and immediate arithmetic operations |
+| **Logic & Shifts** | `AND`, `OR`, `XOR`, `NOT`, `SHL`, `SHR`, `SAR`, `SHLI`, `SHRI`, `SARI` | Bitwise logic, logical shifts, and arithmetic shifts |
+| **Stack** | `PUSH`, `POP`, `CALL`, `CALLR`, `RET` | LIFO stack operations and direct/indirect subroutine linkages |
+| **Control Flow** | `JMP`, `JMPR`, `JZ`, `JNZ`, `JC`, `JNC`, `JS`, `JNS`, `JO`, `JNO`, `JL`, `JGE`, `JLE`, `JG` | Direct/indirect jumps and full unsigned/signed conditional branches |
 
 ---
 

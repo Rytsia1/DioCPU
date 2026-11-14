@@ -258,6 +258,98 @@ static int test_comments_and_case(Memory *memory)
     return 1;
 }
 
+static int test_m1_addressing_and_extended_isa(Memory *memory)
+{
+    CHECK(memory_init(memory) == MEMORY_STATUS_OK);
+
+    const char *source =
+        "    CLI\n"
+        "    SETIVT 0x2FC00\n"
+        "    MOV R1, R2\n"
+        "    LOAD R3, [R1]\n"
+        "    LOAD R4, [R1 + 8]\n"
+        "    STORE R4, [R1 - 4]\n"
+        "    LOAD R5, [R1 + R2]\n"
+        "    STORE R5, [SP + 2]\n"
+        "    LEA R6, [R1 + 10]\n"
+        "    ADD R1, 5\n"
+        "    SHL R1, 2\n"
+        "    CMP R1, 20\n"
+        "    JL DONE\n"
+        "    JMP R6\n"
+        "    CALL R6\n"
+        "    INT 0x20\n"
+        "    STI\n"
+        "DONE:\n"
+        "    IRET\n";
+
+    AssemblerResult result;
+    CHECK(assembler_assemble(source, memory, &result) == ASSEMBLER_STATUS_OK);
+    CHECK(result.instruction_count == 18);
+
+    DecodedInstruction inst;
+    uint32_t pc = 0;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_CLI);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_SETIVT);
+    CHECK(inst.absolute_address == 0x2FC00);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_MOV);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_LOADR);
+    CHECK(inst.offset16 == 0);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_LOADR);
+    CHECK(inst.offset16 == 8);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_STORER);
+    CHECK(inst.offset16 == -4);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_LOADX);
+    CHECK(inst.reg_c == 2);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_STORESP);
+    CHECK(inst.offset16 == 2);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_LEA);
+    CHECK(inst.offset16 == 10);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_ADDI);
+    CHECK(inst.immediate16 == 5);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_SHLI);
+    CHECK(inst.immediate8 == 2);
+    pc = inst.next_pc;
+
+    CHECK(decoder_decode(memory, pc, &inst) == DECODER_STATUS_OK);
+    CHECK(inst.opcode == DIOCPU_OP_CMPI);
+    CHECK(inst.immediate16 == 20);
+
+    return 1;
+}
+
 
 #define RUN_TEST(test_function)                           \
     do {                                                  \
@@ -282,6 +374,7 @@ int main(void)
     RUN_TEST(test_invalid_immediate);
     RUN_TEST(test_branch_range);
     RUN_TEST(test_comments_and_case);
+    RUN_TEST(test_m1_addressing_and_extended_isa);
 
     printf("\nAssembler tests: %u passed.\n", passed);
 

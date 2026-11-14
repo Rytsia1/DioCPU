@@ -462,6 +462,38 @@ static void test_reserved_flags_zero(void)
     );
 }
 
+static void test_shifts(void)
+{
+    ALUResult r = alu_execute(ALU_SHL, 0x8001, 1, 0);
+    ASSERT_EQ(r.status, ALU_STATUS_OK);
+    ASSERT_EQ(r.result, 0x0002);
+    ASSERT_FLAG(r.flags, CPU_FLAG_CF, true);
+    ASSERT_FLAG(r.flags, CPU_FLAG_OF, true);
+
+    r = alu_execute(ALU_SHL, 0x0001, 16, 0);
+    ASSERT_EQ(r.result, 0x0000);
+    ASSERT_FLAG(r.flags, CPU_FLAG_ZF, true);
+    ASSERT_FLAG(r.flags, CPU_FLAG_CF, true);
+
+    r = alu_execute(ALU_SHR, 0x8003, 1, 0);
+    ASSERT_EQ(r.result, 0x4001);
+    ASSERT_FLAG(r.flags, CPU_FLAG_CF, true);
+    ASSERT_FLAG(r.flags, CPU_FLAG_OF, true);
+
+    r = alu_execute(ALU_SAR, 0x8004, 2, 0);
+    ASSERT_EQ(r.result, 0xE001);
+    ASSERT_FLAG(r.flags, CPU_FLAG_SF, true);
+    ASSERT_FLAG(r.flags, CPU_FLAG_CF, false);
+
+    r = alu_execute(ALU_SAR, 0x8000, 20, 0);
+    ASSERT_EQ(r.result, 0xFFFF);
+    ASSERT_FLAG(r.flags, CPU_FLAG_CF, true);
+
+    r = alu_execute(ALU_SHL, 0x1234, 0, 0);
+    ASSERT_EQ(r.result, 0x1234);
+    ASSERT_FLAG(r.flags, CPU_FLAG_CF, false);
+}
+
 /* ---------------------------------------------------------
  * Main
  * --------------------------------------------------------- */
@@ -503,6 +535,7 @@ int main(void)
     RUN_TEST(test_not);
 
     RUN_TEST(test_reserved_flags_zero);
+    RUN_TEST(test_shifts);
 
     printf(
         "\nResult: %d/%d tests passed\n",

@@ -19,10 +19,23 @@
 #ifndef CPU_FLAG_OF
 #define CPU_FLAG_OF (1u << 3)
 #endif
+#ifndef CPU_FLAG_IF
+#define CPU_FLAG_IF (1u << 4)
+#endif
 
 #ifndef CPU_FLAGS_DEFINED_MASK
 #define CPU_FLAGS_DEFINED_MASK 0x000F
 #endif
+
+#define CPU_FLAGS_SYSTEM_MASK CPU_FLAG_IF
+#define CPU_FLAGS_ALL_MASK    (CPU_FLAGS_DEFINED_MASK | CPU_FLAGS_SYSTEM_MASK)
+
+#define DIOCPU_DEFAULT_IVT_BASE  0x2FC00u
+#define DIOCPU_IVT_VECTOR_COUNT  256u
+#define DIOCPU_IVT_ENTRY_SIZE    4u
+#define DIOCPU_IVT_PRESENT_BIT   0x80000000u
+
+#define DIOCPU_IRQ_WORDS         (DIOCPU_IVT_VECTOR_COUNT / 32u)
 
 typedef enum {
     CPU_STATE_RUNNING = 0,
@@ -39,7 +52,8 @@ typedef enum {
     CPU_FAULT_ARITHMETIC_OVERFLOW,
     CPU_FAULT_STACK_OVERFLOW,
     CPU_FAULT_STACK_UNDERFLOW,
-    CPU_FAULT_INSTRUCTION_FETCH_FAULT
+    CPU_FAULT_INSTRUCTION_FETCH_FAULT,
+    CPU_FAULT_UNHANDLED_INTERRUPT
 } CPUFault;
 
 typedef enum {
@@ -56,6 +70,7 @@ typedef struct {
     uint32_t pc;
     uint32_t sp;
     uint32_t mar;
+    uint32_t ivtr;
 
     uint16_t flags;
 
@@ -65,6 +80,11 @@ typedef struct {
     uint32_t fault_pc;
 
     uint64_t instructions_executed;
+
+    uint32_t irq_pending[DIOCPU_IRQ_WORDS];
+    uint32_t interrupt_count;
+    uint32_t interrupt_nesting;
+    uint8_t last_interrupt_vector;
 
     Memory memory;
 
@@ -78,6 +98,15 @@ CPUStatus cpu_run(
     DioCPU *cpu,
     uint64_t max_steps,
     uint64_t *steps_executed
+);
+
+/* Interrupt & Exception Control */
+CPUStatus cpu_raise_irq(DioCPU *cpu, uint8_t vector);
+CPUStatus cpu_clear_irq(DioCPU *cpu, uint8_t vector);
+CPUStatus cpu_register_interrupt_handler(
+    DioCPU *cpu,
+    uint8_t vector,
+    uint32_t handler_pc
 );
 
 /* String Representation Helpers */

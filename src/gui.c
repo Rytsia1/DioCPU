@@ -399,10 +399,14 @@ static bool gui_get_alu_operation(
     switch (opcode) {
 
         case DIOCPU_OP_ADD:
+        case DIOCPU_OP_ADDI:
+        case DIOCPU_OP_INC:
             *operation = ALU_ADD;
             return true;
 
         case DIOCPU_OP_SUB:
+        case DIOCPU_OP_SUBI:
+        case DIOCPU_OP_DEC:
             *operation = ALU_SUB;
             return true;
 
@@ -438,7 +442,23 @@ static bool gui_get_alu_operation(
             *operation = ALU_NOT;
             return true;
 
+        case DIOCPU_OP_SHL:
+        case DIOCPU_OP_SHLI:
+            *operation = ALU_SHL;
+            return true;
+
+        case DIOCPU_OP_SHR:
+        case DIOCPU_OP_SHRI:
+            *operation = ALU_SHR;
+            return true;
+
+        case DIOCPU_OP_SAR:
+        case DIOCPU_OP_SARI:
+            *operation = ALU_SAR;
+            return true;
+
         case DIOCPU_OP_CMP:
+        case DIOCPU_OP_CMPI:
             *operation = ALU_CMP;
             return true;
 
@@ -463,6 +483,9 @@ static const char *gui_alu_operation_name(
         case ALU_OR:   return "OR";
         case ALU_XOR:  return "XOR";
         case ALU_NOT:  return "NOT";
+        case ALU_SHL:  return "SHL";
+        case ALU_SHR:  return "SHR";
+        case ALU_SAR:  return "SAR";
         case ALU_CMP:  return "CMP";
 
         default:
@@ -555,10 +578,13 @@ static void prepare_alu_visualization(
     gui->alu_reg_b = reg_b;
 
     gui->alu_is_unary =
-        gui->decoded.opcode == DIOCPU_OP_NOT;
+        gui->decoded.opcode == DIOCPU_OP_NOT ||
+        gui->decoded.opcode == DIOCPU_OP_INC ||
+        gui->decoded.opcode == DIOCPU_OP_DEC;
 
     gui->alu_is_compare =
-        gui->decoded.opcode == DIOCPU_OP_CMP;
+        gui->decoded.opcode == DIOCPU_OP_CMP ||
+        gui->decoded.opcode == DIOCPU_OP_CMPI;
 
     gui->alu_is_division =
         gui->decoded.opcode == DIOCPU_OP_DIV ||
@@ -568,9 +594,18 @@ static void prepare_alu_visualization(
 
     gui->alu_input_a = cpu->gpr[reg_a];
 
-    gui->alu_input_b = gui->alu_is_unary
-        ? 0
-        : cpu->gpr[reg_b];
+    if (gui->decoded.opcode == DIOCPU_OP_NOT) {
+        gui->alu_input_b = 0;
+    } else if (gui->decoded.opcode == DIOCPU_OP_INC ||
+               gui->decoded.opcode == DIOCPU_OP_DEC) {
+        gui->alu_input_b = 1;
+    } else if (gui->decoded.format == INSTRUCTION_FORMAT_REGISTER_IMMEDIATE16) {
+        gui->alu_input_b = gui->decoded.immediate16;
+    } else if (gui->decoded.format == INSTRUCTION_FORMAT_REGISTER_IMMEDIATE8) {
+        gui->alu_input_b = (uint16_t)gui->decoded.immediate8;
+    } else {
+        gui->alu_input_b = cpu->gpr[reg_b];
+    }
 
     /* Simpan kondisi sebelum eksekusi. */
 
@@ -935,6 +970,7 @@ static void prepare_stack_event(
             break;
 
         case DIOCPU_OP_CALL:
+        case DIOCPU_OP_CALLR:
             event_type = GUI_STACK_EVENT_CALL;
             break;
 
@@ -1002,7 +1038,7 @@ static void prepare_stack_event(
      * CALL
      */
 
-    else if (opcode == DIOCPU_OP_CALL) {
+    else if (opcode == DIOCPU_OP_CALL || opcode == DIOCPU_OP_CALLR) {
 
         gui->stack_event_address =
             cpu->sp >= DIOCPU_STACK_BOTTOM + 4u
@@ -1428,40 +1464,7 @@ static void update_state_tracking(
 
 static const char *get_opcode_name(InstructionOpcode opcode)
 {
-    switch (opcode) {
-        case DIOCPU_OP_NOP:   return "NOP";
-        case DIOCPU_OP_HLT:   return "HLT";
-        case DIOCPU_OP_JMP:   return "JMP";
-        case DIOCPU_OP_CALL:  return "CALL";
-        case DIOCPU_OP_RET:   return "RET";
-
-        case DIOCPU_OP_LOADI: return "LOADI";
-        case DIOCPU_OP_LOAD:  return "LOAD";
-        case DIOCPU_OP_STORE: return "STORE";
-        case DIOCPU_OP_PUSH:  return "PUSH";
-        case DIOCPU_OP_POP:   return "POP";
-
-        case DIOCPU_OP_ADD:   return "ADD";
-        case DIOCPU_OP_SUB:   return "SUB";
-        case DIOCPU_OP_MUL:   return "MUL";
-        case DIOCPU_OP_MULS:  return "MULS";
-        case DIOCPU_OP_DIV:   return "DIV";
-        case DIOCPU_OP_DIVS:  return "DIVS";
-
-        case DIOCPU_OP_AND:   return "AND";
-        case DIOCPU_OP_OR:    return "OR";
-        case DIOCPU_OP_XOR:   return "XOR";
-        case DIOCPU_OP_NOT:   return "NOT";
-
-        case DIOCPU_OP_CMP:   return "CMP";
-
-        case DIOCPU_OP_JZ:    return "JZ";
-        case DIOCPU_OP_JNZ:   return "JNZ";
-        case DIOCPU_OP_JC:    return "JC";
-        case DIOCPU_OP_JNC:   return "JNC";
-
-        default:              return "UNKNOWN";
-    }
+    return isa_opcode_name(opcode);
 }
 
 static void format_instruction(
@@ -1526,6 +1529,96 @@ static void format_instruction(
                 name,
                 (unsigned int)instruction->absolute_address
             );
+            break;
+
+        case INSTRUCTION_FORMAT_IMMEDIATE8:
+            snprintf(
+                buffer,
+                size,
+                "%s 0x%02X",
+                name,
+                (unsigned int)instruction->immediate8
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_IMMEDIATE8:
+            snprintf(
+                buffer,
+                size,
+                "%s R%u, %u",
+                name,
+                (unsigned int)instruction->reg_a,
+                (unsigned int)instruction->immediate8
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_INDIRECT_OFFSET:
+            if (instruction->offset16 == 0) {
+                snprintf(
+                    buffer,
+                    size,
+                    "%s R%u, [R%u]",
+                    name,
+                    (unsigned int)instruction->reg_a,
+                    (unsigned int)instruction->reg_b
+                );
+            } else if (instruction->offset16 > 0) {
+                snprintf(
+                    buffer,
+                    size,
+                    "%s R%u, [R%u + %d]",
+                    name,
+                    (unsigned int)instruction->reg_a,
+                    (unsigned int)instruction->reg_b,
+                    (int)instruction->offset16
+                );
+            } else {
+                snprintf(
+                    buffer,
+                    size,
+                    "%s R%u, [R%u - %d]",
+                    name,
+                    (unsigned int)instruction->reg_a,
+                    (unsigned int)instruction->reg_b,
+                    -(int)instruction->offset16
+                );
+            }
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_INDEXED:
+            snprintf(
+                buffer,
+                size,
+                "%s R%u, [R%u + R%u]",
+                name,
+                (unsigned int)instruction->reg_a,
+                (unsigned int)instruction->reg_b,
+                (unsigned int)instruction->reg_c
+            );
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_SP_OFFSET:
+            if (instruction->offset16 == 0) {
+                snprintf(buffer, size, "%s R%u, [SP]", name, (unsigned int)instruction->reg_a);
+            } else if (instruction->offset16 > 0) {
+                snprintf(
+                    buffer,
+                    size,
+                    "%s R%u, [SP + %d]",
+                    name,
+                    (unsigned int)instruction->reg_a,
+                    (int)instruction->offset16
+                );
+            } else {
+                snprintf(
+                    buffer,
+                    size,
+                    "%s R%u, [SP - %d]",
+                    name,
+                    (unsigned int)instruction->reg_a,
+                    -(int)instruction->offset16
+                );
+            }
             break;
 
         case INSTRUCTION_FORMAT_RELATIVE8:

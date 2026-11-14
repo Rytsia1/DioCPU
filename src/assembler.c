@@ -3,16 +3,33 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ASSEMBLER_MAX_LABELS 1024
 #define ASSEMBLER_MAX_LABEL_LENGTH 63
+#define ASSEMBLER_LINE_SCRATCH 512
 
 typedef struct {
     char name[ASSEMBLER_MAX_LABEL_LENGTH + 1];
     uint32_t address;
 } AssemblerLabel;
+
+typedef enum {
+    MEM_MODE_ABS18 = 0,
+    MEM_MODE_REG_OFFSET,
+    MEM_MODE_INDEXED,
+    MEM_MODE_SP_OFFSET
+} MemoryOperandMode;
+
+typedef struct {
+    MemoryOperandMode mode;
+    uint8_t base_reg;
+    uint8_t index_reg;
+    int16_t offset16;
+    uint32_t abs18;
+} ParsedMemoryOperand;
 
 static char *trim(char *text)
 {
@@ -32,7 +49,6 @@ static char *trim(char *text)
     return text;
 }
 
-
 static void uppercase(char *text)
 {
     while (*text) {
@@ -40,7 +56,6 @@ static void uppercase(char *text)
         text++;
     }
 }
-
 
 static void remove_comment(char *line)
 {
@@ -51,7 +66,6 @@ static void remove_comment(char *line)
         }
     }
 }
-
 
 static char *next_line(char **cursor)
 {
@@ -77,7 +91,6 @@ static char *next_line(char **cursor)
 
     return line;
 }
-
 
 static int split_instruction(
     char *line,
@@ -137,7 +150,6 @@ static int valid_label_name(const char *name)
     return 1;
 }
 
-
 static int find_label(
     const AssemblerLabel *labels,
     size_t label_count,
@@ -152,7 +164,6 @@ static int find_label(
 
     return -1;
 }
-
 
 static AssemblerStatus extract_label(
     char **line,
@@ -195,141 +206,6 @@ static AssemblerStatus extract_label(
     *line = trim(colon + 1);
 
     return ASSEMBLER_STATUS_OK;
-}
-
-static int lookup_mnemonic(
-    const char *name,
-    InstructionOpcode *opcode
-)
-{
-#define MATCH(name_text, opcode_value) \
-    if (strcmp(name, name_text) == 0) { \
-        *opcode = opcode_value; \
-        return 1; \
-    }
-
-    MATCH("NOP", DIOCPU_OP_NOP)
-    MATCH("HLT", DIOCPU_OP_HLT)
-    MATCH("JMP", DIOCPU_OP_JMP)
-    MATCH("CALL", DIOCPU_OP_CALL)
-    MATCH("RET", DIOCPU_OP_RET)
-
-    MATCH("LOADI", DIOCPU_OP_LOADI)
-    MATCH("LOAD", DIOCPU_OP_LOAD)
-    MATCH("STORE", DIOCPU_OP_STORE)
-    MATCH("PUSH", DIOCPU_OP_PUSH)
-    MATCH("POP", DIOCPU_OP_POP)
-
-    MATCH("ADD", DIOCPU_OP_ADD)
-    MATCH("SUB", DIOCPU_OP_SUB)
-    MATCH("MUL", DIOCPU_OP_MUL)
-    MATCH("MULS", DIOCPU_OP_MULS)
-    MATCH("DIV", DIOCPU_OP_DIV)
-    MATCH("DIVS", DIOCPU_OP_DIVS)
-
-    MATCH("AND", DIOCPU_OP_AND)
-    MATCH("OR", DIOCPU_OP_OR)
-    MATCH("XOR", DIOCPU_OP_XOR)
-    MATCH("NOT", DIOCPU_OP_NOT)
-
-    MATCH("CMP", DIOCPU_OP_CMP)
-
-    MATCH("JZ", DIOCPU_OP_JZ)
-    MATCH("JNZ", DIOCPU_OP_JNZ)
-    MATCH("JC", DIOCPU_OP_JC)
-    MATCH("JNC", DIOCPU_OP_JNC)
-
-#undef MATCH
-
-    return 0;
-}
-
-static uint8_t instruction_length(InstructionOpcode opcode)
-{
-    switch (opcode) {
-
-        case DIOCPU_OP_NOP:
-        case DIOCPU_OP_HLT:
-        case DIOCPU_OP_RET:
-            return 1;
-
-        case DIOCPU_OP_PUSH:
-        case DIOCPU_OP_POP:
-        case DIOCPU_OP_NOT:
-
-        case DIOCPU_OP_ADD:
-        case DIOCPU_OP_SUB:
-        case DIOCPU_OP_MUL:
-        case DIOCPU_OP_MULS:
-        case DIOCPU_OP_DIV:
-        case DIOCPU_OP_DIVS:
-        case DIOCPU_OP_AND:
-        case DIOCPU_OP_OR:
-        case DIOCPU_OP_XOR:
-        case DIOCPU_OP_CMP:
-
-        case DIOCPU_OP_JZ:
-        case DIOCPU_OP_JNZ:
-        case DIOCPU_OP_JC:
-        case DIOCPU_OP_JNC:
-            return 2;
-
-        case DIOCPU_OP_LOADI:
-            return 4;
-
-        case DIOCPU_OP_JMP:
-        case DIOCPU_OP_CALL:
-            return 4;
-
-        case DIOCPU_OP_LOAD:
-        case DIOCPU_OP_STORE:
-            return 5;
-
-        default:
-            return 0;
-    }
-}
-
-
-static unsigned int operand_count(InstructionOpcode opcode)
-{
-    switch (opcode) {
-
-        case DIOCPU_OP_NOP:
-        case DIOCPU_OP_HLT:
-        case DIOCPU_OP_RET:
-            return 0;
-
-        case DIOCPU_OP_PUSH:
-        case DIOCPU_OP_POP:
-        case DIOCPU_OP_NOT:
-        case DIOCPU_OP_JMP:
-        case DIOCPU_OP_CALL:
-        case DIOCPU_OP_JZ:
-        case DIOCPU_OP_JNZ:
-        case DIOCPU_OP_JC:
-        case DIOCPU_OP_JNC:
-            return 1;
-
-        case DIOCPU_OP_LOADI:
-        case DIOCPU_OP_LOAD:
-        case DIOCPU_OP_STORE:
-
-        case DIOCPU_OP_ADD:
-        case DIOCPU_OP_SUB:
-        case DIOCPU_OP_MUL:
-        case DIOCPU_OP_MULS:
-        case DIOCPU_OP_DIV:
-        case DIOCPU_OP_DIVS:
-        case DIOCPU_OP_AND:
-        case DIOCPU_OP_OR:
-        case DIOCPU_OP_XOR:
-        case DIOCPU_OP_CMP:
-            return 2;
-
-        default:
-            return 0;
-    }
 }
 
 static AssemblerStatus split_operands(
@@ -390,7 +266,6 @@ static AssemblerStatus split_operands(
     return ASSEMBLER_STATUS_SYNTAX_ERROR;
 }
 
-
 static AssemblerStatus parse_integer(
     const char *text,
     long *value
@@ -421,7 +296,6 @@ static AssemblerStatus parse_integer(
 
     return ASSEMBLER_STATUS_OK;
 }
-
 
 static AssemblerStatus parse_register(
     const char *text,
@@ -455,11 +329,24 @@ static AssemblerStatus parse_register(
     return ASSEMBLER_STATUS_OK;
 }
 
+static int is_register_token(const char *text)
+{
+    uint8_t dummy = 0;
+    return parse_register(text, &dummy) == ASSEMBLER_STATUS_OK;
+}
+
+static int is_sp_token(const char *text)
+{
+    return text != NULL &&
+           (text[0] == 'S' || text[0] == 's') &&
+           (text[1] == 'P' || text[1] == 'p') &&
+           text[2] == '\0';
+}
+
 static int is_label_identifier(const char *text)
 {
     return valid_label_name(text);
 }
-
 
 static AssemblerStatus resolve_address(
     const char *text,
@@ -501,38 +388,220 @@ static AssemblerStatus resolve_address(
     return ASSEMBLER_STATUS_OK;
 }
 
-
-static AssemblerStatus parse_memory_address(
-    char *text,
+static AssemblerStatus parse_memory_operand(
+    const char *text,
     const AssemblerLabel *labels,
     size_t label_count,
-    uint32_t *address
+    int resolve_symbols,
+    ParsedMemoryOperand *out
 )
 {
-    size_t length = strlen(text);
+    char buf[ASSEMBLER_LINE_SCRATCH];
+    size_t len = strlen(text);
 
-    if (length < 3 ||
-        text[0] != '[' ||
-        text[length - 1] != ']') {
+    if (len >= sizeof(buf) || len < 3 ||
+        text[0] != '[' || text[len - 1] != ']') {
         return ASSEMBLER_STATUS_SYNTAX_ERROR;
     }
 
-    text[length - 1] = '\0';
+    memcpy(buf, text + 1, len - 2);
+    buf[len - 2] = '\0';
 
-    char *inside = trim(text + 1);
-
+    char *inside = trim(buf);
     if (*inside == '\0') {
         return ASSEMBLER_STATUS_SYNTAX_ERROR;
     }
 
-    return resolve_address(
-        inside,
-        labels,
-        label_count,
-        address
-    );
+    char *plus = strchr(inside, '+');
+    char *minus = strchr(inside, '-');
+    char *op_pos = NULL;
+    int sign = 1;
+
+    if (plus != NULL && minus != NULL) {
+        return ASSEMBLER_STATUS_SYNTAX_ERROR;
+    }
+    if (plus != NULL) {
+        op_pos = plus;
+        sign = 1;
+    } else if (minus != NULL) {
+        op_pos = minus;
+        sign = -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    if (op_pos == NULL) {
+        uint8_t reg = 0;
+
+        if (is_sp_token(inside)) {
+            out->mode = MEM_MODE_SP_OFFSET;
+            out->offset16 = 0;
+            return ASSEMBLER_STATUS_OK;
+        }
+
+        if (parse_register(inside, &reg) == ASSEMBLER_STATUS_OK) {
+            out->mode = MEM_MODE_REG_OFFSET;
+            out->base_reg = reg;
+            out->offset16 = 0;
+            return ASSEMBLER_STATUS_OK;
+        }
+
+        out->mode = MEM_MODE_ABS18;
+        if (!resolve_symbols) {
+            return ASSEMBLER_STATUS_OK;
+        }
+        return resolve_address(inside, labels, label_count, &out->abs18);
+    }
+
+    *op_pos = '\0';
+    char *left = trim(inside);
+    char *right = trim(op_pos + 1);
+
+    if (*left == '\0' || *right == '\0') {
+        return ASSEMBLER_STATUS_SYNTAX_ERROR;
+    }
+
+    uint8_t base = 0;
+    uint8_t idx = 0;
+
+    if (is_sp_token(left)) {
+        long val = 0;
+        AssemblerStatus st = parse_integer(right, &val);
+        if (st != ASSEMBLER_STATUS_OK) {
+            return st;
+        }
+        val *= sign;
+        if (val < -32768 || val > 32767) {
+            return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
+        }
+        out->mode = MEM_MODE_SP_OFFSET;
+        out->offset16 = (int16_t)val;
+        return ASSEMBLER_STATUS_OK;
+    }
+
+    if (parse_register(left, &base) == ASSEMBLER_STATUS_OK) {
+        if (sign == 1 && parse_register(right, &idx) == ASSEMBLER_STATUS_OK) {
+            out->mode = MEM_MODE_INDEXED;
+            out->base_reg = base;
+            out->index_reg = idx;
+            return ASSEMBLER_STATUS_OK;
+        }
+
+        long val = 0;
+        AssemblerStatus st = parse_integer(right, &val);
+        if (st != ASSEMBLER_STATUS_OK) {
+            return st;
+        }
+        val *= sign;
+        if (val < -32768 || val > 32767) {
+            return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
+        }
+        out->mode = MEM_MODE_REG_OFFSET;
+        out->base_reg = base;
+        out->offset16 = (int16_t)val;
+        return ASSEMBLER_STATUS_OK;
+    }
+
+    return ASSEMBLER_STATUS_SYNTAX_ERROR;
 }
 
+static AssemblerStatus resolve_instruction_form(
+    const char *mnemonic,
+    const char *operand_text,
+    const ISAInstructionInfo **out_info
+)
+{
+    const ISAInstructionInfo *base = isa_lookup_mnemonic(mnemonic);
+    if (base == NULL) {
+        return ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
+    }
+
+    char scratch[ASSEMBLER_LINE_SCRATCH];
+    size_t op_len = strlen(operand_text);
+    if (op_len >= sizeof(scratch)) {
+        return ASSEMBLER_STATUS_SYNTAX_ERROR;
+    }
+    memcpy(scratch, operand_text, op_len + 1u);
+
+    char *a = NULL;
+    char *b = NULL;
+
+    /* Check overloaded mnemonics that select addressing mode by operand shape. */
+    if (base->opcode == DIOCPU_OP_JMP || base->opcode == DIOCPU_OP_CALL) {
+        AssemblerStatus st = split_operands(scratch, 1, &a, &b);
+        if (st != ASSEMBLER_STATUS_OK) {
+            return st;
+        }
+        if (is_register_token(a)) {
+            InstructionOpcode target = (base->opcode == DIOCPU_OP_JMP)
+                ? DIOCPU_OP_JMPR
+                : DIOCPU_OP_CALLR;
+            *out_info = isa_lookup_opcode(target);
+            return ASSEMBLER_STATUS_OK;
+        }
+        *out_info = base;
+        return ASSEMBLER_STATUS_OK;
+    }
+
+    if (base->opcode == DIOCPU_OP_LOAD || base->opcode == DIOCPU_OP_STORE) {
+        AssemblerStatus st = split_operands(scratch, 2, &a, &b);
+        if (st != ASSEMBLER_STATUS_OK) {
+            return st;
+        }
+        ParsedMemoryOperand mem;
+        st = parse_memory_operand(b, NULL, 0, 0, &mem);
+        if (st != ASSEMBLER_STATUS_OK) {
+            return st;
+        }
+        int is_load = (base->opcode == DIOCPU_OP_LOAD);
+        InstructionOpcode chosen = base->opcode;
+
+        switch (mem.mode) {
+            case MEM_MODE_ABS18:
+                chosen = is_load ? DIOCPU_OP_LOAD : DIOCPU_OP_STORE;
+                break;
+            case MEM_MODE_REG_OFFSET:
+                chosen = is_load ? DIOCPU_OP_LOADR : DIOCPU_OP_STORER;
+                break;
+            case MEM_MODE_INDEXED:
+                chosen = is_load ? DIOCPU_OP_LOADX : DIOCPU_OP_STOREX;
+                break;
+            case MEM_MODE_SP_OFFSET:
+                chosen = is_load ? DIOCPU_OP_LOADSP : DIOCPU_OP_STORESP;
+                break;
+        }
+        *out_info = isa_lookup_opcode(chosen);
+        return ASSEMBLER_STATUS_OK;
+    }
+
+    if (base->opcode == DIOCPU_OP_ADD ||
+        base->opcode == DIOCPU_OP_SUB ||
+        base->opcode == DIOCPU_OP_CMP ||
+        base->opcode == DIOCPU_OP_SHL ||
+        base->opcode == DIOCPU_OP_SHR ||
+        base->opcode == DIOCPU_OP_SAR) {
+        AssemblerStatus st = split_operands(scratch, 2, &a, &b);
+        if (st != ASSEMBLER_STATUS_OK) {
+            return st;
+        }
+        if (!is_register_token(b)) {
+            InstructionOpcode imm_op = base->opcode;
+            if (base->opcode == DIOCPU_OP_ADD) imm_op = DIOCPU_OP_ADDI;
+            else if (base->opcode == DIOCPU_OP_SUB) imm_op = DIOCPU_OP_SUBI;
+            else if (base->opcode == DIOCPU_OP_CMP) imm_op = DIOCPU_OP_CMPI;
+            else if (base->opcode == DIOCPU_OP_SHL) imm_op = DIOCPU_OP_SHLI;
+            else if (base->opcode == DIOCPU_OP_SHR) imm_op = DIOCPU_OP_SHRI;
+            else if (base->opcode == DIOCPU_OP_SAR) imm_op = DIOCPU_OP_SARI;
+            *out_info = isa_lookup_opcode(imm_op);
+            return ASSEMBLER_STATUS_OK;
+        }
+        *out_info = base;
+        return ASSEMBLER_STATUS_OK;
+    }
+
+    *out_info = base;
+    return ASSEMBLER_STATUS_OK;
+}
 
 static AssemblerStatus resolve_branch_offset(
     const char *text,
@@ -624,23 +693,19 @@ static AssemblerStatus first_pass(
             return ASSEMBLER_STATUS_SYNTAX_ERROR;
         }
 
-        (void)operands;
-
         uppercase(mnemonic);
 
-        InstructionOpcode opcode;
+        const ISAInstructionInfo *info = NULL;
+        status = resolve_instruction_form(mnemonic, operands, &info);
 
-        if (!lookup_mnemonic(mnemonic, &opcode)) {
+        if (status != ASSEMBLER_STATUS_OK || info == NULL) {
             *error_line = line_number;
-            return ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
+            return (status != ASSEMBLER_STATUS_OK)
+                ? status
+                : ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
         }
 
-        uint8_t length = instruction_length(opcode);
-
-        if (length == 0) {
-            *error_line = line_number;
-            return ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
-        }
+        uint8_t length = info->length;
 
         if (pc > DIOCPU_MEMORY_SIZE - length) {
             *error_line = line_number;
@@ -667,6 +732,15 @@ static void emit_byte(
     (*pc)++;
 }
 
+static void emit_uint16(
+    uint8_t *image,
+    uint32_t *pc,
+    uint16_t value
+)
+{
+    emit_byte(image, pc, (uint8_t)(value & 0xFFu));
+    emit_byte(image, pc, (uint8_t)(value >> 8u));
+}
 
 static void emit_address18(
     uint8_t *image,
@@ -706,10 +780,12 @@ static AssemblerStatus encode_instruction(
 
     uppercase(mnemonic);
 
-    InstructionOpcode opcode;
-
-    if (!lookup_mnemonic(mnemonic, &opcode)) {
-        return ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
+    const ISAInstructionInfo *info = NULL;
+    AssemblerStatus status = resolve_instruction_form(mnemonic, operand_text, &info);
+    if (status != ASSEMBLER_STATUS_OK || info == NULL) {
+        return (status != ASSEMBLER_STATUS_OK)
+            ? status
+            : ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
     }
 
     uint32_t instruction_pc = *pc;
@@ -717,9 +793,9 @@ static AssemblerStatus encode_instruction(
     char *a = NULL;
     char *b = NULL;
 
-    AssemblerStatus status = split_operands(
+    status = split_operands(
         operand_text,
-        operand_count(opcode),
+        info->operand_count,
         &a,
         &b
     );
@@ -728,161 +804,95 @@ static AssemblerStatus encode_instruction(
         return status;
     }
 
-    emit_byte(image, pc, (uint8_t)opcode);
+    emit_byte(image, pc, (uint8_t)info->opcode);
 
-    uint8_t reg_a;
-    uint8_t reg_b;
+    uint8_t reg_a = 0;
+    uint8_t reg_b = 0;
+    uint32_t address = 0;
+    int32_t offset = 0;
+    long immediate = 0;
 
-    uint32_t address;
-    int32_t offset;
+    switch (info->format) {
 
-    long immediate;
-
-
-    switch (opcode) {
-
-        case DIOCPU_OP_NOP:
-        case DIOCPU_OP_HLT:
-        case DIOCPU_OP_RET:
+        case INSTRUCTION_FORMAT_NONE:
             break;
 
-
-        case DIOCPU_OP_PUSH:
-        case DIOCPU_OP_POP:
-        case DIOCPU_OP_NOT:
-
+        case INSTRUCTION_FORMAT_REGISTER:
             status = parse_register(a, &reg_a);
-
             if (status != ASSEMBLER_STATUS_OK) {
                 return status;
             }
-
             emit_byte(image, pc, reg_a);
-
             break;
 
-
-        case DIOCPU_OP_ADD:
-        case DIOCPU_OP_SUB:
-        case DIOCPU_OP_MUL:
-        case DIOCPU_OP_MULS:
-        case DIOCPU_OP_DIV:
-        case DIOCPU_OP_DIVS:
-        case DIOCPU_OP_AND:
-        case DIOCPU_OP_OR:
-        case DIOCPU_OP_XOR:
-        case DIOCPU_OP_CMP:
-
+        case INSTRUCTION_FORMAT_REGISTER_REGISTER:
             status = parse_register(a, &reg_a);
-
             if (status != ASSEMBLER_STATUS_OK) {
                 return status;
             }
-
             status = parse_register(b, &reg_b);
-
             if (status != ASSEMBLER_STATUS_OK) {
                 return status;
             }
-
-            emit_byte(
-                image,
-                pc,
-                (uint8_t)((reg_a << 4u) | reg_b)
-            );
-
+            emit_byte(image, pc, (uint8_t)((reg_a << 4u) | reg_b));
             break;
 
-
-        case DIOCPU_OP_LOADI:
-
+        case INSTRUCTION_FORMAT_REGISTER_IMMEDIATE16:
             status = parse_register(a, &reg_a);
-
             if (status != ASSEMBLER_STATUS_OK) {
                 return status;
             }
-
-            status = parse_integer(b, &immediate);
-
-            if (status != ASSEMBLER_STATUS_OK) {
-                return status;
+            if (info->opcode == DIOCPU_OP_LOADI && is_label_identifier(b)) {
+                uint32_t label_addr = 0;
+                status = resolve_address(b, labels, label_count, &label_addr);
+                if (status != ASSEMBLER_STATUS_OK) {
+                    return status;
+                }
+                if (label_addr > 0xFFFFu) {
+                    return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
+                }
+                immediate = (long)label_addr;
+            } else {
+                status = parse_integer(b, &immediate);
+                if (status != ASSEMBLER_STATUS_OK) {
+                    return status;
+                }
+                if (immediate < -32768 || immediate > 65535) {
+                    return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
+                }
             }
-
-            if (immediate < -32768 || immediate > 65535) {
-                return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
-            }
-
-            {
-                uint16_t value = (uint16_t)immediate;
-
-                emit_byte(image, pc, reg_a);
-
-                emit_byte(
-                    image,
-                    pc,
-                    (uint8_t)(value & 0xFFu)
-                );
-
-                emit_byte(
-                    image,
-                    pc,
-                    (uint8_t)(value >> 8u)
-                );
-            }
-
-            break;
-
-
-        case DIOCPU_OP_LOAD:
-        case DIOCPU_OP_STORE:
-
-            status = parse_register(a, &reg_a);
-
-            if (status != ASSEMBLER_STATUS_OK) {
-                return status;
-            }
-
-            status = parse_memory_address(
-                b,
-                labels,
-                label_count,
-                &address
-            );
-
-            if (status != ASSEMBLER_STATUS_OK) {
-                return status;
-            }
-
             emit_byte(image, pc, reg_a);
-            emit_address18(image, pc, address);
-
+            emit_uint16(image, pc, (uint16_t)immediate);
             break;
 
-
-        case DIOCPU_OP_JMP:
-        case DIOCPU_OP_CALL:
-
-            status = resolve_address(
-                a,
-                labels,
-                label_count,
-                &address
-            );
-
+        case INSTRUCTION_FORMAT_REGISTER_ABSOLUTE18:
+        {
+            status = parse_register(a, &reg_a);
             if (status != ASSEMBLER_STATUS_OK) {
                 return status;
             }
+            ParsedMemoryOperand mem;
+            status = parse_memory_operand(b, labels, label_count, 1, &mem);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            if (mem.mode != MEM_MODE_ABS18) {
+                return ASSEMBLER_STATUS_SYNTAX_ERROR;
+            }
+            emit_byte(image, pc, reg_a);
+            emit_address18(image, pc, mem.abs18);
+            break;
+        }
 
+        case INSTRUCTION_FORMAT_ABSOLUTE18:
+            status = resolve_address(a, labels, label_count, &address);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
             emit_address18(image, pc, address);
-
             break;
 
-
-        case DIOCPU_OP_JZ:
-        case DIOCPU_OP_JNZ:
-        case DIOCPU_OP_JC:
-        case DIOCPU_OP_JNC:
-
+        case INSTRUCTION_FORMAT_RELATIVE8:
             status = resolve_branch_offset(
                 a,
                 labels,
@@ -890,15 +900,95 @@ static AssemblerStatus encode_instruction(
                 instruction_pc,
                 &offset
             );
-
             if (status != ASSEMBLER_STATUS_OK) {
                 return status;
             }
-
             emit_byte(image, pc, (uint8_t)offset);
-
             break;
 
+        case INSTRUCTION_FORMAT_IMMEDIATE8:
+            status = parse_integer(a, &immediate);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            if (immediate < 0 || immediate > 255) {
+                return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
+            }
+            emit_byte(image, pc, (uint8_t)immediate);
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_IMMEDIATE8:
+            status = parse_register(a, &reg_a);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            status = parse_integer(b, &immediate);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            if (immediate < 0 || immediate > 255) {
+                return ASSEMBLER_STATUS_OPERAND_OUT_OF_RANGE;
+            }
+            emit_byte(image, pc, reg_a);
+            emit_byte(image, pc, (uint8_t)immediate);
+            break;
+
+        case INSTRUCTION_FORMAT_REGISTER_INDIRECT_OFFSET:
+        {
+            status = parse_register(a, &reg_a);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            ParsedMemoryOperand mem;
+            status = parse_memory_operand(b, labels, label_count, 1, &mem);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            if (mem.mode != MEM_MODE_REG_OFFSET) {
+                return ASSEMBLER_STATUS_SYNTAX_ERROR;
+            }
+            emit_byte(image, pc, (uint8_t)((reg_a << 4u) | mem.base_reg));
+            emit_uint16(image, pc, (uint16_t)mem.offset16);
+            break;
+        }
+
+        case INSTRUCTION_FORMAT_REGISTER_INDEXED:
+        {
+            status = parse_register(a, &reg_a);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            ParsedMemoryOperand mem;
+            status = parse_memory_operand(b, labels, label_count, 1, &mem);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            if (mem.mode != MEM_MODE_INDEXED) {
+                return ASSEMBLER_STATUS_SYNTAX_ERROR;
+            }
+            emit_byte(image, pc, (uint8_t)((reg_a << 4u) | mem.base_reg));
+            emit_byte(image, pc, mem.index_reg);
+            break;
+        }
+
+        case INSTRUCTION_FORMAT_REGISTER_SP_OFFSET:
+        {
+            status = parse_register(a, &reg_a);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            ParsedMemoryOperand mem;
+            status = parse_memory_operand(b, labels, label_count, 1, &mem);
+            if (status != ASSEMBLER_STATUS_OK) {
+                return status;
+            }
+            if (mem.mode != MEM_MODE_SP_OFFSET) {
+                return ASSEMBLER_STATUS_SYNTAX_ERROR;
+            }
+            emit_byte(image, pc, reg_a);
+            emit_uint16(image, pc, (uint16_t)mem.offset16);
+            break;
+        }
 
         default:
             return ASSEMBLER_STATUS_UNKNOWN_MNEMONIC;
@@ -1073,7 +1163,6 @@ AssemblerStatus assembler_assemble(
 
     return status;
 }
-
 
 const char *assembler_status_string(AssemblerStatus status)
 {
