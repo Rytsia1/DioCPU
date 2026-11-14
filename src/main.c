@@ -3,6 +3,7 @@
 #include "assembler.h"
 #include "control_unit.h"
 #include "debugger.h"
+#include "microop.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,16 +89,21 @@ static void print_cpu_state(const DioCPU *cpu)
 
     printf("\nInstructions executed: %llu\n",
            (unsigned long long)cpu->instructions_executed);
+    printf("Micro-ops executed   : %llu\n",
+           (unsigned long long)cpu->uop.microops_executed);
     printf("Interrupts serviced  : %u\n",
            (unsigned int)cpu->interrupt_count);
 
     if (cpu->datapath.valid) {
         char ctrl_buf[192];
+        char uop_buf[192];
         control_unit_format_signals(&cpu->datapath.ctrl, ctrl_buf, sizeof(ctrl_buf));
+        microop_format_sequence(&cpu->uop.sequence, uop_buf, sizeof(uop_buf));
         printf("Last IR              : %s @ 0x%05X\n",
                isa_opcode_name(cpu->datapath.ir.opcode),
                (unsigned int)cpu->datapath.ir_pc);
         printf("Last Control Signals : %s\n", ctrl_buf);
+        printf("Last Micro-op Seq    : %s\n", uop_buf);
     }
 
     if (cpu->state == CPU_STATE_FAULTED) {

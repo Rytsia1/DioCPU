@@ -3,6 +3,7 @@
 
 #include "datapath.h"
 #include "memory.h"
+#include "microop.h"
 
 #include <stdint.h>
 
@@ -88,6 +89,7 @@ typedef struct {
     uint8_t last_interrupt_vector;
 
     DatapathState datapath;
+    MicroOpContext uop;
 
     Memory memory;
 
@@ -96,6 +98,7 @@ typedef struct {
 /* Core Lifecycle & Execution Functions */
 CPUStatus cpu_init(DioCPU *cpu);
 CPUStatus cpu_reset(DioCPU *cpu);
+CPUStatus cpu_microop_step(DioCPU *cpu);
 CPUStatus cpu_step(DioCPU *cpu);
 CPUStatus cpu_run(
     DioCPU *cpu,
