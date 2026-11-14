@@ -1,6 +1,7 @@
 #include "cpu.h"
 
 #include "assembler.h"
+#include "control_unit.h"
 #include "debugger.h"
 
 #include <stdio.h>
@@ -69,6 +70,7 @@ static void print_cpu_state(const DioCPU *cpu)
     printf("PC    : 0x%05X\n", (unsigned int)cpu->pc);
     printf("SP    : 0x%05X\n", (unsigned int)cpu->sp);
     printf("MAR   : 0x%05X\n", (unsigned int)cpu->mar);
+    printf("IVTR  : 0x%05X\n", (unsigned int)cpu->ivtr);
 
     printf("FLAGS : 0x%04X\n", (unsigned int)cpu->flags);
 
@@ -86,6 +88,17 @@ static void print_cpu_state(const DioCPU *cpu)
 
     printf("\nInstructions executed: %llu\n",
            (unsigned long long)cpu->instructions_executed);
+    printf("Interrupts serviced  : %u\n",
+           (unsigned int)cpu->interrupt_count);
+
+    if (cpu->datapath.valid) {
+        char ctrl_buf[192];
+        control_unit_format_signals(&cpu->datapath.ctrl, ctrl_buf, sizeof(ctrl_buf));
+        printf("Last IR              : %s @ 0x%05X\n",
+               isa_opcode_name(cpu->datapath.ir.opcode),
+               (unsigned int)cpu->datapath.ir_pc);
+        printf("Last Control Signals : %s\n", ctrl_buf);
+    }
 
     if (cpu->state == CPU_STATE_FAULTED) {
 

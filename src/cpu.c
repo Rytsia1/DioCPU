@@ -1,6 +1,8 @@
 #include "cpu.h"
 
 #include "alu.h"
+#include "control_unit.h"
+#include "datapath.h"
 #include "decoder.h"
 #include "stack.h"
 
@@ -67,15 +69,15 @@ static int valid_ivt_base(uint32_t ivtr)
 static int fault_to_vector(CPUFault fault, uint8_t *vector)
 {
     switch (fault) {
-        case CPU_FAULT_INVALID_OPCODE:        *vector = 0x01u; return 1;
-        case CPU_FAULT_INVALID_INSTRUCTION:   *vector = 0x02u; return 1;
-        case CPU_FAULT_MEMORY_ACCESS_FAULT:   *vector = 0x03u; return 1;
-        case CPU_FAULT_DIVIDE_BY_ZERO:        *vector = 0x04u; return 1;
-        case CPU_FAULT_ARITHMETIC_OVERFLOW:   *vector = 0x05u; return 1;
-        case CPU_FAULT_STACK_OVERFLOW:        *vector = 0x06u; return 1;
-        case CPU_FAULT_STACK_UNDERFLOW:       *vector = 0x07u; return 1;
+        case CPU_FAULT_INVALID_OPCODE:          *vector = 0x01u; return 1;
+        case CPU_FAULT_INVALID_INSTRUCTION:     *vector = 0x02u; return 1;
+        case CPU_FAULT_MEMORY_ACCESS_FAULT:     *vector = 0x03u; return 1;
+        case CPU_FAULT_DIVIDE_BY_ZERO:          *vector = 0x04u; return 1;
+        case CPU_FAULT_ARITHMETIC_OVERFLOW:     *vector = 0x05u; return 1;
+        case CPU_FAULT_STACK_OVERFLOW:          *vector = 0x06u; return 1;
+        case CPU_FAULT_STACK_UNDERFLOW:         *vector = 0x07u; return 1;
         case CPU_FAULT_INSTRUCTION_FETCH_FAULT: *vector = 0x08u; return 1;
-        default:                              return 0;
+        default:                                return 0;
     }
 }
 
@@ -120,24 +122,12 @@ static int lookup_ivt_handler(
 static CPUFault map_stack_fault(StackStatus status)
 {
     switch (status) {
-
-        case STACK_STATUS_OVERFLOW:
-            return CPU_FAULT_STACK_OVERFLOW;
-
-        case STACK_STATUS_UNDERFLOW:
-            return CPU_FAULT_STACK_UNDERFLOW;
-
-        case STACK_STATUS_INVALID_RETURN_ADDRESS:
-            return CPU_FAULT_INVALID_INSTRUCTION;
-
-        case STACK_STATUS_MEMORY_ERROR:
-            return CPU_FAULT_MEMORY_ACCESS_FAULT;
-
-        case STACK_STATUS_INVALID_STACK_POINTER:
-            return CPU_FAULT_MEMORY_ACCESS_FAULT;
-
-        default:
-            return CPU_FAULT_INVALID_INSTRUCTION;
+        case STACK_STATUS_OVERFLOW:              return CPU_FAULT_STACK_OVERFLOW;
+        case STACK_STATUS_UNDERFLOW:             return CPU_FAULT_STACK_UNDERFLOW;
+        case STACK_STATUS_INVALID_RETURN_ADDRESS:return CPU_FAULT_INVALID_INSTRUCTION;
+        case STACK_STATUS_MEMORY_ERROR:          return CPU_FAULT_MEMORY_ACCESS_FAULT;
+        case STACK_STATUS_INVALID_STACK_POINTER: return CPU_FAULT_MEMORY_ACCESS_FAULT;
+        default:                                 return CPU_FAULT_INVALID_INSTRUCTION;
     }
 }
 
@@ -188,10 +178,7 @@ static int enter_interrupt(
     return 1;
 }
 
-static CPUStatus raise_fault(
-    DioCPU *cpu,
-    CPUFault fault
-)
+static CPUStatus raise_fault(DioCPU *cpu, CPUFault fault)
 {
     uint8_t vec = 0;
 
@@ -206,6 +193,7 @@ static CPUStatus raise_fault(
         if (lookup_ivt_handler(cpu, vec, &handler_pc, &has_handler) && has_handler) {
             CPUFault trap_fault = CPU_FAULT_NONE;
             if (enter_interrupt(cpu, vec, cpu->pc, &trap_fault)) {
+                cpu->datapath.next_pc_target = cpu->pc;
                 return CPU_STATUS_OK;
             }
         }
@@ -218,195 +206,23 @@ static CPUStatus raise_fault(
     return CPU_STATUS_FAULTED;
 }
 
-static CPUFault map_decoder_fault(
-    DecoderStatus status
-)
+static CPUFault map_decoder_fault(DecoderStatus status)
 {
     switch (status) {
-
-        case DECODER_STATUS_INVALID_OPCODE:
-            return CPU_FAULT_INVALID_OPCODE;
-
-        case DECODER_STATUS_INVALID_INSTRUCTION:
-            return CPU_FAULT_INVALID_INSTRUCTION;
-
-        case DECODER_STATUS_INSTRUCTION_FETCH_FAULT:
-            return CPU_FAULT_INSTRUCTION_FETCH_FAULT;
-
-        default:
-            return CPU_FAULT_INVALID_INSTRUCTION;
-    }
-}
-
-static int get_alu_operation(
-    InstructionOpcode opcode,
-    ALUOperation *operation
-)
-{
-    switch (opcode) {
-
-        case DIOCPU_OP_ADD:
-        case DIOCPU_OP_ADDI:
-        case DIOCPU_OP_INC:
-            *operation = ALU_ADD;
-            return 1;
-
-        case DIOCPU_OP_SUB:
-        case DIOCPU_OP_SUBI:
-        case DIOCPU_OP_DEC:
-            *operation = ALU_SUB;
-            return 1;
-
-        case DIOCPU_OP_MUL:
-            *operation = ALU_MUL;
-            return 1;
-
-        case DIOCPU_OP_MULS:
-            *operation = ALU_MULS;
-            return 1;
-
-        case DIOCPU_OP_DIV:
-            *operation = ALU_DIV;
-            return 1;
-
-        case DIOCPU_OP_DIVS:
-            *operation = ALU_DIVS;
-            return 1;
-
-        case DIOCPU_OP_AND:
-            *operation = ALU_AND;
-            return 1;
-
-        case DIOCPU_OP_OR:
-            *operation = ALU_OR;
-            return 1;
-
-        case DIOCPU_OP_XOR:
-            *operation = ALU_XOR;
-            return 1;
-
-        case DIOCPU_OP_NOT:
-            *operation = ALU_NOT;
-            return 1;
-
-        case DIOCPU_OP_SHL:
-        case DIOCPU_OP_SHLI:
-            *operation = ALU_SHL;
-            return 1;
-
-        case DIOCPU_OP_SHR:
-        case DIOCPU_OP_SHRI:
-            *operation = ALU_SHR;
-            return 1;
-
-        case DIOCPU_OP_SAR:
-        case DIOCPU_OP_SARI:
-            *operation = ALU_SAR;
-            return 1;
-
-        case DIOCPU_OP_CMP:
-        case DIOCPU_OP_CMPI:
-            *operation = ALU_CMP;
-            return 1;
-
-        default:
-            return 0;
+        case DECODER_STATUS_INVALID_OPCODE:          return CPU_FAULT_INVALID_OPCODE;
+        case DECODER_STATUS_INVALID_INSTRUCTION:     return CPU_FAULT_INVALID_INSTRUCTION;
+        case DECODER_STATUS_INSTRUCTION_FETCH_FAULT: return CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+        default:                                     return CPU_FAULT_INVALID_INSTRUCTION;
     }
 }
 
 static CPUFault map_alu_fault(ALUStatus status)
 {
     switch (status) {
-
-        case ALU_STATUS_DIVIDE_BY_ZERO:
-            return CPU_FAULT_DIVIDE_BY_ZERO;
-
-        case ALU_STATUS_ARITHMETIC_OVERFLOW:
-            return CPU_FAULT_ARITHMETIC_OVERFLOW;
-
-        case ALU_STATUS_INVALID_OPERATION:
-            return CPU_FAULT_INVALID_INSTRUCTION;
-
-        default:
-            return CPU_FAULT_INVALID_INSTRUCTION;
-    }
-}
-
-static CPUStatus execute_alu_instruction(
-    DioCPU *cpu,
-    const DecodedInstruction *instruction,
-    uint16_t operand_b
-)
-{
-    if (!valid_next_pc(instruction->next_pc)) {
-        return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-    }
-
-    if ((instruction->opcode == DIOCPU_OP_DIV ||
-         instruction->opcode == DIOCPU_OP_DIVS) &&
-        instruction->reg_a == instruction->reg_b) {
-        return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
-    }
-
-    ALUOperation operation;
-    if (!get_alu_operation(instruction->opcode, &operation)) {
-        return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
-    }
-
-    uint16_t a = cpu->gpr[instruction->reg_a];
-
-    ALUResult result = alu_execute(
-        operation,
-        a,
-        operand_b,
-        cpu->flags & CPU_FLAGS_DEFINED_MASK
-    );
-
-    if (result.status != ALU_STATUS_OK) {
-        return raise_fault(cpu, map_alu_fault(result.status));
-    }
-
-    if (instruction->opcode == DIOCPU_OP_CMP ||
-        instruction->opcode == DIOCPU_OP_CMPI) {
-        /* CMP / CMPI updates FLAGS only. */
-    } else if (instruction->opcode == DIOCPU_OP_DIV ||
-               instruction->opcode == DIOCPU_OP_DIVS) {
-        cpu->gpr[instruction->reg_a] = result.result;
-        cpu->gpr[instruction->reg_b] = result.remainder;
-    } else {
-        cpu->gpr[instruction->reg_a] = result.result;
-    }
-
-    cpu->flags = (cpu->flags & (uint16_t)~CPU_FLAGS_DEFINED_MASK) |
-                 (result.flags & CPU_FLAGS_DEFINED_MASK);
-
-    cpu->pc = instruction->next_pc;
-    cpu->instructions_executed++;
-
-    return CPU_STATUS_OK;
-}
-
-static int evaluate_branch_condition(InstructionOpcode opcode, uint16_t flags)
-{
-    int zf = (flags & CPU_FLAG_ZF) != 0;
-    int cf = (flags & CPU_FLAG_CF) != 0;
-    int sf = (flags & CPU_FLAG_SF) != 0;
-    int of = (flags & CPU_FLAG_OF) != 0;
-
-    switch (opcode) {
-        case DIOCPU_OP_JZ:  return zf;
-        case DIOCPU_OP_JNZ: return !zf;
-        case DIOCPU_OP_JC:  return cf;
-        case DIOCPU_OP_JNC: return !cf;
-        case DIOCPU_OP_JS:  return sf;
-        case DIOCPU_OP_JNS: return !sf;
-        case DIOCPU_OP_JO:  return of;
-        case DIOCPU_OP_JNO: return !of;
-        case DIOCPU_OP_JL:  return sf != of;
-        case DIOCPU_OP_JGE: return sf == of;
-        case DIOCPU_OP_JLE: return zf || (sf != of);
-        case DIOCPU_OP_JG:  return !zf && (sf == of);
-        default:            return 0;
+        case ALU_STATUS_DIVIDE_BY_ZERO:     return CPU_FAULT_DIVIDE_BY_ZERO;
+        case ALU_STATUS_ARITHMETIC_OVERFLOW:return CPU_FAULT_ARITHMETIC_OVERFLOW;
+        case ALU_STATUS_INVALID_OPERATION:  return CPU_FAULT_INVALID_INSTRUCTION;
+        default:                            return CPU_FAULT_INVALID_INSTRUCTION;
     }
 }
 
@@ -417,7 +233,6 @@ CPUStatus cpu_init(DioCPU *cpu)
     }
 
     MemoryStatus status = memory_init(&cpu->memory);
-
     if (status != MEMORY_STATUS_OK) {
         return CPU_STATUS_INVALID_ARGUMENT;
     }
@@ -451,6 +266,8 @@ CPUStatus cpu_reset(DioCPU *cpu)
     cpu->interrupt_count = 0;
     cpu->interrupt_nesting = 0;
     cpu->last_interrupt_vector = 0;
+
+    datapath_reset(&cpu->datapath);
 
     return CPU_STATUS_OK;
 }
@@ -496,6 +313,39 @@ CPUStatus cpu_register_interrupt_handler(
     return CPU_STATUS_OK;
 }
 
+static int service_pending_irq(DioCPU *cpu, CPUStatus *out_status)
+{
+    if ((cpu->flags & CPU_FLAG_IF) == 0u) {
+        return 0;
+    }
+
+    for (uint32_t w = 0; w < DIOCPU_IRQ_WORDS; w++) {
+        if (cpu->irq_pending[w] == 0u) {
+            continue;
+        }
+        for (uint32_t bit = 0; bit < 32u; bit++) {
+            if ((cpu->irq_pending[w] & (1u << bit)) != 0u) {
+                uint8_t vec = (uint8_t)((w << 5u) | bit);
+                cpu->irq_pending[w] &= ~(1u << bit);
+
+                CPUFault irq_fault = CPU_FAULT_NONE;
+                if (!enter_interrupt(cpu, vec, cpu->pc, &irq_fault)) {
+                    *out_status = raise_fault(cpu, irq_fault);
+                    return 1;
+                }
+
+                cpu->datapath.valid = false;
+                cpu->datapath.next_pc_target = cpu->pc;
+                cpu->instructions_executed++;
+                *out_status = CPU_STATUS_OK;
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 CPUStatus cpu_step(DioCPU *cpu)
 {
     if (cpu == NULL) {
@@ -510,477 +360,242 @@ CPUStatus cpu_step(DioCPU *cpu)
         return CPU_STATUS_FAULTED;
     }
 
-    /* Service pending maskable hardware interrupts before next fetch. */
-    if ((cpu->flags & CPU_FLAG_IF) != 0u) {
-        for (uint32_t w = 0; w < DIOCPU_IRQ_WORDS; w++) {
-            if (cpu->irq_pending[w] != 0u) {
-                for (uint32_t bit = 0; bit < 32u; bit++) {
-                    if ((cpu->irq_pending[w] & (1u << bit)) != 0u) {
-                        uint8_t vec = (uint8_t)((w << 5u) | bit);
-                        cpu->irq_pending[w] &= ~(1u << bit);
-
-                        CPUFault irq_fault = CPU_FAULT_NONE;
-                        if (!enter_interrupt(cpu, vec, cpu->pc, &irq_fault)) {
-                            return raise_fault(cpu, irq_fault);
-                        }
-
-                        cpu->instructions_executed++;
-                        return CPU_STATUS_OK;
-                    }
-                }
-            }
-        }
+    CPUStatus irq_status = CPU_STATUS_OK;
+    if (service_pending_irq(cpu, &irq_status)) {
+        return irq_status;
     }
 
-    DecodedInstruction instruction = {0};
+    DatapathState *dp = &cpu->datapath;
 
-    DecoderStatus decoder_status = decoder_decode(
+    /* Stage 1: Fetch, Decode, and Control Signal Generation */
+    DecoderStatus decoder_status = datapath_fetch_decode(
         &cpu->memory,
         cpu->pc,
-        &instruction
+        cpu->flags,
+        dp
     );
 
     if (decoder_status != DECODER_STATUS_OK) {
-        return raise_fault(
-            cpu,
-            map_decoder_fault(decoder_status)
-        );
+        return raise_fault(cpu, map_decoder_fault(decoder_status));
     }
 
-    switch (instruction.opcode) {
+    /* Stage 2: Register File Read & Address Generation Unit (AGU) */
+    datapath_read_operands(dp, cpu->gpr, CPU_GPR_COUNT, cpu->sp);
 
-        case DIOCPU_OP_NOP:
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
+    const ControlSignals *ctrl = &dp->ctrl;
+    const DecodedInstruction *instr = &dp->ir;
 
-        case DIOCPU_OP_HLT:
-            if (valid_next_pc(instruction.next_pc)) {
-                cpu->pc = instruction.next_pc;
-            }
-            cpu->state = CPU_STATE_HALTED;
-            cpu->instructions_executed++;
-            return CPU_STATUS_HALTED;
+    /* Sequential next_pc validation for non-retiring-control-flow opcodes */
+    if (!ctrl->is_halt &&
+        !ctrl->is_jump &&
+        !ctrl->is_return &&
+        !ctrl->is_branch) {
+        if (!valid_next_pc(instr->next_pc)) {
+            return raise_fault(
+                cpu,
+                ctrl->is_call ? CPU_FAULT_INVALID_INSTRUCTION : CPU_FAULT_INSTRUCTION_FETCH_FAULT
+            );
+        }
+    }
 
-        case DIOCPU_OP_CLI:
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
+    /* Stage 3: Execute, Memory, Stack, and Interrupt Control */
+    if (ctrl->is_halt) {
+        uint32_t next_pc = cpu->pc;
+        (void)datapath_resolve_next_pc(dp, cpu->gpr, CPU_GPR_COUNT, cpu->pc, 0, 0, &next_pc);
+        dp->next_pc_target = next_pc;
+        cpu->pc = next_pc;
+        cpu->state = CPU_STATE_HALTED;
+        cpu->instructions_executed++;
+        return CPU_STATUS_HALTED;
+    }
+
+    if (ctrl->sets_ivtr) {
+        if (!valid_ivt_base(instr->absolute_address)) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+        cpu->ivtr = instr->absolute_address;
+    }
+
+    if (ctrl->is_interrupt && !ctrl->is_return) {
+        /* Software INT imm8 */
+        CPUFault trap_fault = CPU_FAULT_NONE;
+        if (!enter_interrupt(cpu, instr->immediate8, instr->next_pc, &trap_fault)) {
+            return raise_fault(cpu, trap_fault);
+        }
+        dp->next_pc_target = cpu->pc;
+        cpu->instructions_executed++;
+        return CPU_STATUS_OK;
+    }
+
+    if (ctrl->is_return && ctrl->is_interrupt) {
+        /* IRET */
+        uint32_t old_sp = cpu->sp;
+        uint16_t saved_flags = 0;
+        uint32_t return_address = 0;
+
+        StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &saved_flags);
+        if (st != STACK_STATUS_OK) {
+            cpu->sp = old_sp;
+            return raise_fault(cpu, map_stack_fault(st));
+        }
+
+        st = stack_ret(&cpu->memory, &cpu->sp, &return_address);
+        if (st != STACK_STATUS_OK) {
+            cpu->sp = old_sp;
+            return raise_fault(cpu, map_stack_fault(st));
+        }
+
+        dp->mdr = saved_flags;
+        dp->bus_addr = old_sp;
+        dp->next_pc_target = return_address;
+        cpu->flags = saved_flags & CPU_FLAGS_ALL_MASK;
+        cpu->mar = old_sp;
+        cpu->pc = return_address;
+        if (cpu->interrupt_nesting > 0u) {
+            cpu->interrupt_nesting--;
+        }
+        cpu->instructions_executed++;
+        return CPU_STATUS_OK;
+    }
+
+    if (ctrl->flags_write_system && !ctrl->is_interrupt) {
+        if (instr->opcode == DIOCPU_OP_CLI) {
             cpu->flags &= (uint16_t)~CPU_FLAG_IF;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_STI:
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
+        } else if (instr->opcode == DIOCPU_OP_STI) {
             cpu->flags |= CPU_FLAG_IF;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_SETIVT:
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-            if (!valid_ivt_base(instruction.absolute_address)) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-            cpu->ivtr = instruction.absolute_address;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_INT:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            CPUFault trap_fault = CPU_FAULT_NONE;
-            if (!enter_interrupt(
-                    cpu,
-                    instruction.immediate8,
-                    instruction.next_pc,
-                    &trap_fault)) {
-                return raise_fault(cpu, trap_fault);
-            }
-
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
         }
-
-        case DIOCPU_OP_IRET:
-        {
-            uint32_t old_sp = cpu->sp;
-            uint16_t saved_flags = 0;
-            uint32_t return_address = 0;
-
-            StackStatus status = stack_pop16(
-                &cpu->memory,
-                &cpu->sp,
-                &saved_flags
-            );
-
-            if (status != STACK_STATUS_OK) {
-                cpu->sp = old_sp;
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            status = stack_ret(
-                &cpu->memory,
-                &cpu->sp,
-                &return_address
-            );
-
-            if (status != STACK_STATUS_OK) {
-                cpu->sp = old_sp;
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            cpu->flags = saved_flags & CPU_FLAGS_ALL_MASK;
-            cpu->mar = old_sp;
-            cpu->pc = return_address;
-            if (cpu->interrupt_nesting > 0u) {
-                cpu->interrupt_nesting--;
-            }
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_LOADI:
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-            cpu->gpr[instruction.reg_a] = instruction.immediate16;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_MOV:
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-            cpu->gpr[instruction.reg_a] = cpu->gpr[instruction.reg_b];
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_LEA:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-            int32_t eff = (int32_t)cpu->gpr[instruction.reg_b] + (int32_t)instruction.offset16;
-            cpu->gpr[instruction.reg_a] = (uint16_t)eff;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_LOAD:
-        case DIOCPU_OP_LOADR:
-        case DIOCPU_OP_LOADX:
-        case DIOCPU_OP_LOADSP:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            int64_t raw_addr = 0;
-            int is_stack_op = (instruction.opcode == DIOCPU_OP_LOADSP);
-
-            if (instruction.opcode == DIOCPU_OP_LOAD) {
-                raw_addr = (int64_t)instruction.absolute_address;
-            } else if (instruction.opcode == DIOCPU_OP_LOADR) {
-                raw_addr = (int64_t)cpu->gpr[instruction.reg_b] + (int64_t)instruction.offset16;
-            } else if (instruction.opcode == DIOCPU_OP_LOADX) {
-                raw_addr = (int64_t)cpu->gpr[instruction.reg_b] + (int64_t)cpu->gpr[instruction.reg_c];
-            } else {
-                raw_addr = (int64_t)cpu->sp + (int64_t)instruction.offset16;
-            }
-
-            if (raw_addr < 0 || raw_addr > (int64_t)DIOCPU_MEMORY_MAX_ADDRESS) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-
-            uint32_t address = (uint32_t)raw_addr;
-            int addr_ok = is_stack_op
-                ? valid_stack_data_address(cpu, address)
-                : valid_general_data_address(address);
-
-            if (!addr_ok) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-
-            uint16_t value = 0;
-            if (memory_data_read16(&cpu->memory, address, &value) != MEMORY_STATUS_OK) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-
-            cpu->gpr[instruction.reg_a] = value;
-            cpu->mar = address;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_STORE:
-        case DIOCPU_OP_STORER:
-        case DIOCPU_OP_STOREX:
-        case DIOCPU_OP_STORESP:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            int64_t raw_addr = 0;
-            int is_stack_op = (instruction.opcode == DIOCPU_OP_STORESP);
-
-            if (instruction.opcode == DIOCPU_OP_STORE) {
-                raw_addr = (int64_t)instruction.absolute_address;
-            } else if (instruction.opcode == DIOCPU_OP_STORER) {
-                raw_addr = (int64_t)cpu->gpr[instruction.reg_b] + (int64_t)instruction.offset16;
-            } else if (instruction.opcode == DIOCPU_OP_STOREX) {
-                raw_addr = (int64_t)cpu->gpr[instruction.reg_b] + (int64_t)cpu->gpr[instruction.reg_c];
-            } else {
-                raw_addr = (int64_t)cpu->sp + (int64_t)instruction.offset16;
-            }
-
-            if (raw_addr < 0 || raw_addr > (int64_t)DIOCPU_MEMORY_MAX_ADDRESS) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-
-            uint32_t address = (uint32_t)raw_addr;
-            int addr_ok = is_stack_op
-                ? valid_stack_data_address(cpu, address)
-                : valid_general_data_address(address);
-
-            if (!addr_ok) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-
-            uint16_t value = cpu->gpr[instruction.reg_a];
-            if (memory_data_write16(&cpu->memory, address, value) != MEMORY_STATUS_OK) {
-                return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
-            }
-
-            cpu->mar = address;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_PUSH:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            StackStatus status = stack_push16(
-                &cpu->memory,
-                &cpu->sp,
-                cpu->gpr[instruction.reg_a]
-            );
-
-            if (status != STACK_STATUS_OK) {
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            cpu->mar = cpu->sp;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_POP:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            uint32_t old_sp = cpu->sp;
-            uint16_t value = 0;
-
-            StackStatus status = stack_pop16(
-                &cpu->memory,
-                &cpu->sp,
-                &value
-            );
-
-            if (status != STACK_STATUS_OK) {
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            cpu->gpr[instruction.reg_a] = value;
-            cpu->mar = old_sp;
-            cpu->pc = instruction.next_pc;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_CALL:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
-            }
-
-            StackStatus status = stack_call(
-                &cpu->memory,
-                &cpu->sp,
-                instruction.next_pc
-            );
-
-            if (status != STACK_STATUS_OK) {
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            cpu->mar = cpu->sp;
-            cpu->pc = instruction.absolute_address;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_CALLR:
-        {
-            if (!valid_next_pc(instruction.next_pc)) {
-                return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
-            }
-
-            uint32_t target = (uint32_t)cpu->gpr[instruction.reg_a];
-            if (!valid_address(target)) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            StackStatus status = stack_call(
-                &cpu->memory,
-                &cpu->sp,
-                instruction.next_pc
-            );
-
-            if (status != STACK_STATUS_OK) {
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            cpu->mar = cpu->sp;
-            cpu->pc = target;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_RET:
-        {
-            uint32_t old_sp = cpu->sp;
-            uint32_t return_address = 0;
-
-            StackStatus status = stack_ret(
-                &cpu->memory,
-                &cpu->sp,
-                &return_address
-            );
-
-            if (status != STACK_STATUS_OK) {
-                return raise_fault(cpu, map_stack_fault(status));
-            }
-
-            cpu->mar = old_sp;
-            cpu->pc = return_address;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        case DIOCPU_OP_ADD:
-        case DIOCPU_OP_SUB:
-        case DIOCPU_OP_MUL:
-        case DIOCPU_OP_MULS:
-        case DIOCPU_OP_DIV:
-        case DIOCPU_OP_DIVS:
-        case DIOCPU_OP_AND:
-        case DIOCPU_OP_OR:
-        case DIOCPU_OP_XOR:
-        case DIOCPU_OP_NOT:
-        case DIOCPU_OP_SHL:
-        case DIOCPU_OP_SHR:
-        case DIOCPU_OP_SAR:
-        case DIOCPU_OP_CMP:
-            return execute_alu_instruction(
-                cpu,
-                &instruction,
-                cpu->gpr[instruction.reg_b]
-            );
-
-        case DIOCPU_OP_ADDI:
-        case DIOCPU_OP_SUBI:
-        case DIOCPU_OP_CMPI:
-            return execute_alu_instruction(
-                cpu,
-                &instruction,
-                instruction.immediate16
-            );
-
-        case DIOCPU_OP_INC:
-        case DIOCPU_OP_DEC:
-            return execute_alu_instruction(
-                cpu,
-                &instruction,
-                1u
-            );
-
-        case DIOCPU_OP_SHLI:
-        case DIOCPU_OP_SHRI:
-        case DIOCPU_OP_SARI:
-            return execute_alu_instruction(
-                cpu,
-                &instruction,
-                (uint16_t)instruction.immediate8
-            );
-
-        case DIOCPU_OP_JMP:
-            cpu->pc = instruction.absolute_address;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_JMPR:
-            cpu->pc = (uint32_t)cpu->gpr[instruction.reg_a];
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-
-        case DIOCPU_OP_JZ:
-        case DIOCPU_OP_JNZ:
-        case DIOCPU_OP_JC:
-        case DIOCPU_OP_JNC:
-        case DIOCPU_OP_JS:
-        case DIOCPU_OP_JNS:
-        case DIOCPU_OP_JO:
-        case DIOCPU_OP_JNO:
-        case DIOCPU_OP_JL:
-        case DIOCPU_OP_JGE:
-        case DIOCPU_OP_JLE:
-        case DIOCPU_OP_JG:
-        {
-            int taken = evaluate_branch_condition(instruction.opcode, cpu->flags);
-            int64_t target = instruction.next_pc;
-
-            if (taken) {
-                target += instruction.relative_offset;
-            }
-
-            if (target < 0 || target > (int64_t)DIOCPU_MEMORY_MAX_ADDRESS) {
-                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
-            }
-
-            cpu->pc = (uint32_t)target;
-            cpu->instructions_executed++;
-            return CPU_STATUS_OK;
-        }
-
-        default:
-            return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
     }
+
+    uint16_t new_alu_flags = cpu->flags & CPU_FLAGS_DEFINED_MASK;
+
+    if (ctrl->alu_enable) {
+        if ((instr->opcode == DIOCPU_OP_DIV || instr->opcode == DIOCPU_OP_DIVS) &&
+            instr->reg_a == instr->reg_b) {
+            return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
+        }
+
+        ALUStatus alu_status = datapath_run_alu(dp, cpu->flags, &new_alu_flags);
+        if (alu_status != ALU_STATUS_OK) {
+            return raise_fault(cpu, map_alu_fault(alu_status));
+        }
+    }
+
+    if (ctrl->mem_read) {
+        if (!dp->effective_addr_valid) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+        int addr_ok = ctrl->mem_is_stack_frame
+            ? valid_stack_data_address(cpu, dp->effective_addr)
+            : valid_general_data_address(dp->effective_addr);
+
+        if (!addr_ok) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+
+        if (memory_data_read16(&cpu->memory, dp->effective_addr, &dp->mdr) != MEMORY_STATUS_OK) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+
+        cpu->mar = dp->effective_addr;
+    }
+
+    if (ctrl->mem_write) {
+        if (!dp->effective_addr_valid) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+        int addr_ok = ctrl->mem_is_stack_frame
+            ? valid_stack_data_address(cpu, dp->effective_addr)
+            : valid_general_data_address(dp->effective_addr);
+
+        if (!addr_ok) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+
+        dp->mdr = cpu->gpr[instr->reg_a];
+
+        if (memory_data_write16(&cpu->memory, dp->effective_addr, dp->mdr) != MEMORY_STATUS_OK) {
+            return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
+        }
+
+        cpu->mar = dp->effective_addr;
+    }
+
+    uint32_t stack_ret_pc = 0;
+
+    if (ctrl->stack_push) {
+        if (ctrl->stack_is_32bit) {
+            uint32_t call_target = 0;
+            if (!datapath_resolve_next_pc(dp, cpu->gpr, CPU_GPR_COUNT, cpu->pc, 0, 0, &call_target)) {
+                return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
+            }
+
+            StackStatus st = stack_call(&cpu->memory, &cpu->sp, instr->next_pc);
+            if (st != STACK_STATUS_OK) {
+                return raise_fault(cpu, map_stack_fault(st));
+            }
+            cpu->mar = cpu->sp;
+            dp->bus_addr = cpu->sp;
+        } else {
+            dp->mdr = dp->alu_in_a;
+            StackStatus st = stack_push16(&cpu->memory, &cpu->sp, dp->mdr);
+            if (st != STACK_STATUS_OK) {
+                return raise_fault(cpu, map_stack_fault(st));
+            }
+            cpu->mar = cpu->sp;
+            dp->bus_addr = cpu->sp;
+        }
+    }
+
+    if (ctrl->stack_pop) {
+        uint32_t old_sp = cpu->sp;
+        if (ctrl->stack_is_32bit) {
+            StackStatus st = stack_ret(&cpu->memory, &cpu->sp, &stack_ret_pc);
+            if (st != STACK_STATUS_OK) {
+                return raise_fault(cpu, map_stack_fault(st));
+            }
+            cpu->mar = old_sp;
+            dp->bus_addr = old_sp;
+        } else {
+            StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &dp->mdr);
+            if (st != STACK_STATUS_OK) {
+                return raise_fault(cpu, map_stack_fault(st));
+            }
+            cpu->mar = old_sp;
+            dp->bus_addr = old_sp;
+        }
+    }
+
+    /* Stage 4: Register Writeback, FLAGS Update, and PC Multiplexer */
+    uint32_t resolved_next_pc = 0;
+    if (!datapath_resolve_next_pc(
+            dp,
+            cpu->gpr,
+            CPU_GPR_COUNT,
+            cpu->pc,
+            stack_ret_pc,
+            0,
+            &resolved_next_pc)) {
+        return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
+    }
+
+    if (ctrl->reg_write_a) {
+        cpu->gpr[instr->reg_a] = datapath_select_writeback(dp, cpu->gpr, CPU_GPR_COUNT);
+    }
+
+    if (ctrl->reg_write_b) {
+        cpu->gpr[instr->reg_b] = dp->alu_rem;
+    }
+
+    if (ctrl->flags_write_alu) {
+        cpu->flags = (cpu->flags & (uint16_t)~CPU_FLAGS_DEFINED_MASK) |
+                     (new_alu_flags & CPU_FLAGS_DEFINED_MASK);
+    }
+
+    dp->next_pc_target = resolved_next_pc;
+    cpu->pc = resolved_next_pc;
+    cpu->instructions_executed++;
+
+    return CPU_STATUS_OK;
 }
 
 CPUStatus cpu_run(
@@ -1027,80 +642,38 @@ CPUStatus cpu_run(
 const char *cpu_fault_string(CPUFault fault)
 {
     switch (fault) {
-
-        case CPU_FAULT_NONE:
-            return "No fault";
-
-        case CPU_FAULT_INVALID_OPCODE:
-            return "Invalid opcode";
-
-        case CPU_FAULT_INVALID_INSTRUCTION:
-            return "Invalid instruction";
-
-        case CPU_FAULT_MEMORY_ACCESS_FAULT:
-            return "Memory access fault";
-
-        case CPU_FAULT_DIVIDE_BY_ZERO:
-            return "Divide by zero";
-
-        case CPU_FAULT_ARITHMETIC_OVERFLOW:
-            return "Arithmetic overflow";
-
-        case CPU_FAULT_STACK_OVERFLOW:
-            return "Stack overflow";
-
-        case CPU_FAULT_STACK_UNDERFLOW:
-            return "Stack underflow";
-
-        case CPU_FAULT_INSTRUCTION_FETCH_FAULT:
-            return "Instruction fetch fault";
-
-        case CPU_FAULT_UNHANDLED_INTERRUPT:
-            return "Unhandled interrupt";
-
-        default:
-            return "Unknown fault";
+        case CPU_FAULT_NONE:                    return "No fault";
+        case CPU_FAULT_INVALID_OPCODE:          return "Invalid opcode";
+        case CPU_FAULT_INVALID_INSTRUCTION:     return "Invalid instruction";
+        case CPU_FAULT_MEMORY_ACCESS_FAULT:     return "Memory access fault";
+        case CPU_FAULT_DIVIDE_BY_ZERO:          return "Divide by zero";
+        case CPU_FAULT_ARITHMETIC_OVERFLOW:     return "Arithmetic overflow";
+        case CPU_FAULT_STACK_OVERFLOW:          return "Stack overflow";
+        case CPU_FAULT_STACK_UNDERFLOW:         return "Stack underflow";
+        case CPU_FAULT_INSTRUCTION_FETCH_FAULT: return "Instruction fetch fault";
+        case CPU_FAULT_UNHANDLED_INTERRUPT:     return "Unhandled interrupt";
+        default:                                return "Unknown fault";
     }
 }
 
 const char *cpu_state_string(CPUState state)
 {
     switch (state) {
-
-        case CPU_STATE_RUNNING:
-            return "RUNNING";
-
-        case CPU_STATE_HALTED:
-            return "HALTED";
-
-        case CPU_STATE_FAULTED:
-            return "FAULTED";
-
-        default:
-            return "UNKNOWN";
+        case CPU_STATE_RUNNING: return "RUNNING";
+        case CPU_STATE_HALTED:  return "HALTED";
+        case CPU_STATE_FAULTED: return "FAULTED";
+        default:                return "UNKNOWN";
     }
 }
 
 const char *cpu_status_string(CPUStatus status)
 {
     switch (status) {
-
-        case CPU_STATUS_OK:
-            return "OK";
-
-        case CPU_STATUS_INVALID_ARGUMENT:
-            return "Invalid argument";
-
-        case CPU_STATUS_HALTED:
-            return "HALTED";
-
-        case CPU_STATUS_FAULTED:
-            return "FAULTED";
-
-        case CPU_STATUS_STEP_LIMIT_REACHED:
-            return "Step limit reached";
-
-        default:
-            return "Unknown status";
+        case CPU_STATUS_OK:                 return "OK";
+        case CPU_STATUS_INVALID_ARGUMENT:   return "Invalid argument";
+        case CPU_STATUS_HALTED:             return "HALTED";
+        case CPU_STATUS_FAULTED:            return "FAULTED";
+        case CPU_STATUS_STEP_LIMIT_REACHED: return "Step limit reached";
+        default:                            return "Unknown status";
     }
 }

@@ -1,6 +1,7 @@
 #ifndef DIOCPU_H
 #define DIOCPU_H
 
+#include "datapath.h"
 #include "memory.h"
 
 #include <stdint.h>
@@ -85,6 +86,8 @@ typedef struct {
     uint32_t interrupt_count;
     uint32_t interrupt_nesting;
     uint8_t last_interrupt_vector;
+
+    DatapathState datapath;
 
     Memory memory;
 

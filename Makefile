@@ -9,7 +9,9 @@ CORE_SOURCES = \
 	src/stack.c \
 	src/decoder.c \
 	src/assembler.c \
-	src/debugger.c
+	src/debugger.c \
+	src/control_unit.c \
+	src/datapath.c
 
 all: cli gui test
 
@@ -49,7 +51,10 @@ tests_debugger.exe: tests/tests_debugger.c src/debugger.c src/decoder.c src/memo
 tests_gui_integration.exe: tests/tests_gui_integration.c $(CORE_SOURCES)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS_GUI)
 
-test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_gui_integration.exe
+tests_datapath.exe: tests/tests_datapath.c $(CORE_SOURCES)
+	$(CC) $(CFLAGS) -o $@ $^
+
+test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_datapath.exe tests_gui_integration.exe
 	./tests_cpu.exe
 	./tests_alu.exe
 	./tests_memory.exe
@@ -57,6 +62,7 @@ test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder
 	./tests_decoder.exe
 	./tests_assembler.exe
 	./tests_debugger.exe
+	./tests_datapath.exe
 	./tests_gui_integration.exe
 
 cpu-test: tests_cpu.exe
@@ -80,10 +86,13 @@ assembler-test: tests_assembler.exe
 debugger-test: tests_debugger.exe
 	./tests_debugger.exe
 
+datapath-test: tests_datapath.exe
+	./tests_datapath.exe
+
 gui-test: tests_gui_integration.exe
 	./tests_gui_integration.exe
 
 clean:
-	rm -f diocpu.exe diocpu_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_gui_integration.exe *.o
+	rm -f diocpu.exe diocpu_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_datapath.exe tests_gui_integration.exe *.o
 
-.PHONY: all cli gui test clean cpu-test alu-test memory-test stack-test decoder-test assembler-test debugger-test gui-test
+.PHONY: all cli gui test clean cpu-test alu-test memory-test stack-test decoder-test assembler-test debugger-test datapath-test gui-test
