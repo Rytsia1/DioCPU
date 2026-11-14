@@ -1,11 +1,14 @@
 #include "cpu.h"
 
 #include "alu.h"
+#include "branch_predictor.h"
+#include "cache.h"
 #include "control_unit.h"
 #include "cycle_engine.h"
 #include "datapath.h"
 #include "decoder.h"
 #include "microop.h"
+#include "pipeline.h"
 #include "stack.h"
 
 #include <stddef.h>
@@ -91,7 +94,182 @@ static int fault_to_vector(CPUFault fault, uint8_t *vector) {
   }
 }
 
-static int lookup_ivt_handler(const DioCPU *cpu, uint8_t vector,
+static uint8_t sum_latency_u8(uint8_t a, uint8_t b) {
+  uint32_t s = (uint32_t)a + (uint32_t)b;
+  return (s > 255u) ? 255u : (uint8_t)s;
+}
+
+static MemoryStatus cpu_mem_data_read16(DioCPU *cpu, uint32_t address,
+                                        uint16_t *value, uint8_t *out_lat) {
+  if (!cpu->cache.enabled) {
+    if (out_lat != NULL) {
+      *out_lat = 2u;
+    }
+    return memory_data_read16(&cpu->memory, address, value);
+  }
+
+  CacheStatus st =
+      cache_dcache_read16(&cpu->cache, &cpu->memory, address, value, out_lat);
+  if (st == CACHE_STATUS_OUT_OF_RANGE) {
+    return MEMORY_STATUS_OUT_OF_RANGE;
+  }
+  return (st == CACHE_STATUS_OK) ? MEMORY_STATUS_OK
+                                 : MEMORY_STATUS_INVALID_ARGUMENT;
+}
+
+static MemoryStatus cpu_mem_data_write16(DioCPU *cpu, uint32_t address,
+                                         uint16_t value, uint8_t *out_lat) {
+  if (!cpu->cache.enabled) {
+    if (out_lat != NULL) {
+      *out_lat = 2u;
+    }
+    return memory_data_write16(&cpu->memory, address, value);
+  }
+
+  CacheStatus st =
+      cache_dcache_write16(&cpu->cache, &cpu->memory, address, value, out_lat);
+  if (st == CACHE_STATUS_OUT_OF_RANGE) {
+    return MEMORY_STATUS_OUT_OF_RANGE;
+  }
+  return (st == CACHE_STATUS_OK) ? MEMORY_STATUS_OK
+                                 : MEMORY_STATUS_INVALID_ARGUMENT;
+}
+
+static StackStatus cpu_validate_sp(uint32_t sp) {
+  if ((sp & 1u) != 0u || sp < DIOCPU_STACK_BOTTOM ||
+      sp > DIOCPU_STACK_INITIAL_SP) {
+    return STACK_STATUS_INVALID_STACK_POINTER;
+  }
+  return STACK_STATUS_OK;
+}
+
+static StackStatus cpu_stack_push16(DioCPU *cpu, uint32_t *sp, uint16_t value,
+                                    uint8_t *out_lat) {
+  if (!cpu->cache.enabled) {
+    if (out_lat != NULL) {
+      *out_lat = 2u;
+    }
+    return stack_push16(&cpu->memory, sp, value);
+  }
+
+  StackStatus v = cpu_validate_sp(*sp);
+  if (v != STACK_STATUS_OK) {
+    return v;
+  }
+  if (*sp < DIOCPU_STACK_BOTTOM + 2u) {
+    return STACK_STATUS_OVERFLOW;
+  }
+  uint32_t new_sp = *sp - 2u;
+  if (cpu_mem_data_write16(cpu, new_sp, value, out_lat) != MEMORY_STATUS_OK) {
+    return STACK_STATUS_MEMORY_ERROR;
+  }
+  *sp = new_sp;
+  return STACK_STATUS_OK;
+}
+
+static StackStatus cpu_stack_pop16(DioCPU *cpu, uint32_t *sp, uint16_t *value,
+                                   uint8_t *out_lat) {
+  if (!cpu->cache.enabled) {
+    if (out_lat != NULL) {
+      *out_lat = 2u;
+    }
+    return stack_pop16(&cpu->memory, sp, value);
+  }
+
+  StackStatus v = cpu_validate_sp(*sp);
+  if (v != STACK_STATUS_OK) {
+    return v;
+  }
+  if (*sp > DIOCPU_STACK_INITIAL_SP - 2u) {
+    return STACK_STATUS_UNDERFLOW;
+  }
+  uint16_t res = 0u;
+  if (cpu_mem_data_read16(cpu, *sp, &res, out_lat) != MEMORY_STATUS_OK) {
+    return STACK_STATUS_MEMORY_ERROR;
+  }
+  *value = res;
+  *sp += 2u;
+  return STACK_STATUS_OK;
+}
+
+static StackStatus cpu_stack_call(DioCPU *cpu, uint32_t *sp, uint32_t ret_addr,
+                                  uint8_t *out_lat) {
+  if (!cpu->cache.enabled) {
+    if (out_lat != NULL) {
+      *out_lat = 2u;
+    }
+    return stack_call(&cpu->memory, sp, ret_addr);
+  }
+
+  if (ret_addr > DIOCPU_MEMORY_MAX_ADDRESS) {
+    return STACK_STATUS_INVALID_RETURN_ADDRESS;
+  }
+  StackStatus v = cpu_validate_sp(*sp);
+  if (v != STACK_STATUS_OK) {
+    return v;
+  }
+  if (*sp < DIOCPU_STACK_BOTTOM + 4u) {
+    return STACK_STATUS_OVERFLOW;
+  }
+  uint32_t new_sp = *sp - 4u;
+  uint8_t l1 = 1u;
+  uint8_t l2 = 1u;
+  if (cpu_mem_data_write16(cpu, new_sp, (uint16_t)(ret_addr & 0xFFFFu), &l1) !=
+          MEMORY_STATUS_OK ||
+      cpu_mem_data_write16(cpu, new_sp + 2u, (uint16_t)(ret_addr >> 16u), &l2) !=
+          MEMORY_STATUS_OK) {
+    return STACK_STATUS_MEMORY_ERROR;
+  }
+  if (out_lat != NULL) {
+    uint8_t miss_extra = (l2 > cpu->cache.dcache.config.hit_latency)
+                             ? (uint8_t)(l2 - cpu->cache.dcache.config.hit_latency)
+                             : 0u;
+    *out_lat = sum_latency_u8(l1, miss_extra);
+  }
+  *sp = new_sp;
+  return STACK_STATUS_OK;
+}
+
+static StackStatus cpu_stack_ret(DioCPU *cpu, uint32_t *sp, uint32_t *ret_addr,
+                                 uint8_t *out_lat) {
+  if (!cpu->cache.enabled) {
+    if (out_lat != NULL) {
+      *out_lat = 2u;
+    }
+    return stack_ret(&cpu->memory, sp, ret_addr);
+  }
+
+  StackStatus v = cpu_validate_sp(*sp);
+  if (v != STACK_STATUS_OK) {
+    return v;
+  }
+  if (*sp > DIOCPU_STACK_INITIAL_SP - 4u) {
+    return STACK_STATUS_UNDERFLOW;
+  }
+  uint16_t low = 0u;
+  uint16_t high = 0u;
+  uint8_t l1 = 1u;
+  uint8_t l2 = 1u;
+  if (cpu_mem_data_read16(cpu, *sp, &low, &l1) != MEMORY_STATUS_OK ||
+      cpu_mem_data_read16(cpu, *sp + 2u, &high, &l2) != MEMORY_STATUS_OK) {
+    return STACK_STATUS_MEMORY_ERROR;
+  }
+  uint32_t result = (uint32_t)low | ((uint32_t)high << 16u);
+  if (result > DIOCPU_MEMORY_MAX_ADDRESS) {
+    return STACK_STATUS_INVALID_RETURN_ADDRESS;
+  }
+  if (out_lat != NULL) {
+    uint8_t miss_extra = (l2 > cpu->cache.dcache.config.hit_latency)
+                             ? (uint8_t)(l2 - cpu->cache.dcache.config.hit_latency)
+                             : 0u;
+    *out_lat = sum_latency_u8(l1, miss_extra);
+  }
+  *ret_addr = result;
+  *sp += 4u;
+  return STACK_STATUS_OK;
+}
+
+static int lookup_ivt_handler(DioCPU *cpu, uint8_t vector,
                               uint32_t *handler_pc, int *has_handler) {
   *handler_pc = 0;
   *has_handler = 0;
@@ -104,8 +282,8 @@ static int lookup_ivt_handler(const DioCPU *cpu, uint8_t vector,
   uint16_t low = 0;
   uint16_t high = 0;
 
-  if (memory_data_read16(&cpu->memory, entry_addr, &low) != MEMORY_STATUS_OK ||
-      memory_data_read16(&cpu->memory, entry_addr + 2u, &high) !=
+  if (cpu_mem_data_read16(cpu, entry_addr, &low, NULL) != MEMORY_STATUS_OK ||
+      cpu_mem_data_read16(cpu, entry_addr + 2u, &high, NULL) !=
           MEMORY_STATUS_OK) {
     return 0;
   }
@@ -160,14 +338,14 @@ static int enter_interrupt(DioCPU *cpu, uint8_t vector, uint32_t return_pc,
 
   uint32_t saved_sp = cpu->sp;
 
-  StackStatus st = stack_call(&cpu->memory, &cpu->sp, return_pc);
+  StackStatus st = cpu_stack_call(cpu, &cpu->sp, return_pc, NULL);
   if (st != STACK_STATUS_OK) {
     cpu->sp = saved_sp;
     *out_fault = map_stack_fault(st);
     return 0;
   }
 
-  st = stack_push16(&cpu->memory, &cpu->sp, cpu->flags);
+  st = cpu_stack_push16(cpu, &cpu->sp, cpu->flags, NULL);
   if (st != STACK_STATUS_OK) {
     cpu->sp = saved_sp;
     *out_fault = map_stack_fault(st);
@@ -258,6 +436,7 @@ CPUStatus cpu_init(DioCPU *cpu) {
   }
 
   cpu->pipeline.initialized = false;
+  (void)cache_subsystem_init(&cpu->cache);
   return cpu_reset(cpu);
 }
 
@@ -291,6 +470,7 @@ CPUStatus cpu_reset(DioCPU *cpu) {
   microop_context_reset(&cpu->uop);
   cycle_engine_reset(&cpu->cycle);
   pipeline_reset(&cpu->pipeline, 0u);
+  cache_subsystem_reset(&cpu->cache);
 
   return CPU_STATUS_OK;
 }
@@ -329,6 +509,7 @@ CPUStatus cpu_register_interrupt_handler(DioCPU *cpu, uint8_t vector,
     return CPU_STATUS_INVALID_ARGUMENT;
   }
 
+  cache_dcache_invalidate_range(&cpu->cache, addr, DIOCPU_IVT_ENTRY_SIZE);
   return CPU_STATUS_OK;
 }
 
@@ -443,7 +624,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
     if (!addr_ok) {
       return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
     }
-    if (memory_data_read16(&cpu->memory, dp->effective_addr, &dp->mdr) !=
+    if (cpu_mem_data_read16(cpu, dp->effective_addr, &dp->mdr, NULL) !=
         MEMORY_STATUS_OK) {
       return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
     }
@@ -462,7 +643,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
       return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
     }
     dp->mdr = cpu->gpr[instr->reg_a];
-    if (memory_data_write16(&cpu->memory, dp->effective_addr, dp->mdr) !=
+    if (cpu_mem_data_write16(cpu, dp->effective_addr, dp->mdr, NULL) !=
         MEMORY_STATUS_OK) {
       return raise_fault(cpu, CPU_FAULT_MEMORY_ACCESS_FAULT);
     }
@@ -472,7 +653,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
 
   case UOP_STACK_PUSH16: {
     dp->mdr = dp->alu_in_a;
-    StackStatus st = stack_push16(&cpu->memory, &cpu->sp, dp->mdr);
+    StackStatus st = cpu_stack_push16(cpu, &cpu->sp, dp->mdr, NULL);
     if (st != STACK_STATUS_OK) {
       return raise_fault(cpu, map_stack_fault(st));
     }
@@ -483,7 +664,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
 
   case UOP_STACK_POP16: {
     uint32_t old_sp = cpu->sp;
-    StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &dp->mdr);
+    StackStatus st = cpu_stack_pop16(cpu, &cpu->sp, &dp->mdr, NULL);
     if (st != STACK_STATUS_OK) {
       return raise_fault(cpu, map_stack_fault(st));
     }
@@ -516,7 +697,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
         return raise_fault(cpu, CPU_FAULT_INSTRUCTION_FETCH_FAULT);
       }
     }
-    StackStatus st = stack_call(&cpu->memory, &cpu->sp, return_pc);
+    StackStatus st = cpu_stack_call(cpu, &cpu->sp, return_pc, NULL);
     if (st != STACK_STATUS_OK) {
       return raise_fault(cpu, map_stack_fault(st));
     }
@@ -526,7 +707,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
   }
 
   case UOP_STACK_PUSH_FLAGS: {
-    StackStatus st = stack_push16(&cpu->memory, &cpu->sp, uop->saved_flags);
+    StackStatus st = cpu_stack_push16(cpu, &cpu->sp, uop->saved_flags, NULL);
     if (st != STACK_STATUS_OK) {
       return raise_fault(cpu, map_stack_fault(st));
     }
@@ -537,7 +718,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
 
   case UOP_STACK_POP_FLAGS: {
     uint32_t old_sp = cpu->sp;
-    StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &dp->mdr);
+    StackStatus st = cpu_stack_pop16(cpu, &cpu->sp, &dp->mdr, NULL);
     if (st != STACK_STATUS_OK) {
       return raise_fault(cpu, map_stack_fault(st));
     }
@@ -549,7 +730,7 @@ static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
 
   case UOP_STACK_POP_PC: {
     uint32_t old_sp = cpu->sp;
-    StackStatus st = stack_ret(&cpu->memory, &cpu->sp, &uop->stack_ret_pc);
+    StackStatus st = cpu_stack_ret(cpu, &cpu->sp, &uop->stack_ret_pc, NULL);
     if (st != STACK_STATUS_OK) {
       return raise_fault(cpu, map_stack_fault(st));
     }
@@ -697,6 +878,76 @@ static CPUStatus issue_uop_on_current_cycle(DioCPU *cpu, uint32_t exec_pc,
   MicroOp op = uop->sequence.ops[uop->step_index];
   uint8_t lat = (op.latency_cycles > 0u) ? op.latency_cycles : 1u;
 
+  if (cpu->cache.enabled) {
+    const DatapathState *dp = &cpu->datapath;
+    const ControlSignals *ctrl = &dp->ctrl;
+    switch (op.kind) {
+    case UOP_MEM_READ:
+      if (dp->effective_addr_valid &&
+          (ctrl->mem_is_stack_frame
+               ? valid_stack_data_address(cpu, dp->effective_addr)
+               : valid_general_data_address(dp->effective_addr))) {
+        lat = cache_unit_peek_latency(&cpu->cache.dcache, dp->effective_addr,
+                                      2u, false);
+      } else {
+        lat = 1u;
+      }
+      break;
+    case UOP_MEM_WRITE:
+      if (dp->effective_addr_valid &&
+          (ctrl->mem_is_stack_frame
+               ? valid_stack_data_address(cpu, dp->effective_addr)
+               : valid_general_data_address(dp->effective_addr))) {
+        lat = cache_unit_peek_latency(&cpu->cache.dcache, dp->effective_addr,
+                                      2u, true);
+      } else {
+        lat = 1u;
+      }
+      break;
+    case UOP_STACK_PUSH16:
+    case UOP_STACK_PUSH_FLAGS:
+      if (cpu_validate_sp(cpu->sp) == STACK_STATUS_OK &&
+          cpu->sp >= DIOCPU_STACK_BOTTOM + 2u) {
+        lat = cache_unit_peek_latency(&cpu->cache.dcache, cpu->sp - 2u, 2u,
+                                      true);
+      } else {
+        lat = 1u;
+      }
+      break;
+    case UOP_STACK_POP16:
+    case UOP_STACK_POP_FLAGS:
+      if (cpu_validate_sp(cpu->sp) == STACK_STATUS_OK &&
+          cpu->sp <= DIOCPU_STACK_INITIAL_SP - 2u) {
+        lat = cache_unit_peek_latency(&cpu->cache.dcache, cpu->sp, 2u, false);
+      } else {
+        lat = 1u;
+      }
+      break;
+    case UOP_STACK_PUSH_PC:
+      if (cpu_validate_sp(cpu->sp) == STACK_STATUS_OK &&
+          cpu->sp >= DIOCPU_STACK_BOTTOM + 4u) {
+        lat = cache_unit_peek_latency(&cpu->cache.dcache, cpu->sp - 4u, 4u,
+                                      true);
+      } else {
+        lat = 1u;
+      }
+      break;
+    case UOP_STACK_POP_PC:
+      if (cpu_validate_sp(cpu->sp) == STACK_STATUS_OK &&
+          cpu->sp <= DIOCPU_STACK_INITIAL_SP - 4u) {
+        lat = cache_unit_peek_latency(&cpu->cache.dcache, cpu->sp, 4u, false);
+      } else {
+        lat = 1u;
+      }
+      break;
+    default:
+      break;
+    }
+    if (lat == 0u) {
+      lat = 1u;
+    }
+  }
+
   ce->active_uop = op;
   ce->active_uop.latency_cycles = lat;
   ce->active_pc = exec_pc;
@@ -759,6 +1010,13 @@ CPUStatus cpu_cycle_step(DioCPU *cpu) {
     }
 
     ce->uop_in_flight = false;
+    if (ce->active_uop.kind == UOP_FETCH_DECODE) {
+      ce->current_stage = CYCLE_STAGE_FETCH;
+      cycle_engine_record_tick(ce, ce->active_pc, ce->active_uop,
+                               ce->uop_cycles_elapsed, false, true, false,
+                               uop->sequence.is_irq_sequence);
+      return CPU_STATUS_OK;
+    }
     return finish_uop_on_current_cycle(cpu, prev_instrs);
   }
 
@@ -795,14 +1053,37 @@ CPUStatus cpu_cycle_step(DioCPU *cpu) {
 
     if (!uop->sequence.is_irq_sequence) {
       MicroOp fetch_op = uop->sequence.ops[0];
+      uint8_t if_lat =
+          (fetch_op.latency_cycles > 0u) ? fetch_op.latency_cycles : 1u;
+      if (cpu->cache.enabled) {
+        uint32_t fetch_len = (dp->ir.next_pc > dp->ir_pc)
+                                 ? (dp->ir.next_pc - dp->ir_pc)
+                                 : 1u;
+        uint8_t cache_lat = 1u;
+        if (cache_icache_fetch(&cpu->cache, &cpu->memory, dp->ir_pc, fetch_len,
+                               &cache_lat) == CACHE_STATUS_OK &&
+            cache_lat > 0u) {
+          if_lat = cache_lat;
+        }
+      }
+      fetch_op.latency_cycles = if_lat;
       ce->active_uop = fetch_op;
       ce->active_pc = dp->ir_pc;
       ce->uop_cycles_elapsed = 1u;
-      ce->uop_cycles_remaining = 0u;
-      ce->uop_in_flight = false;
       ce->current_stage = CYCLE_STAGE_FETCH;
-      cycle_engine_record_tick(ce, dp->ir_pc, fetch_op, 1u, false, true, false,
-                               false);
+      if (if_lat > 1u) {
+        ce->uop_cycles_remaining = (uint8_t)(if_lat - 1u);
+        ce->uop_in_flight = true;
+        ce->busy_stall_cycles++;
+        ce->current_cycle_stalled = true;
+        cycle_engine_record_tick(ce, dp->ir_pc, fetch_op, 1u, true, false,
+                                 false, false);
+      } else {
+        ce->uop_cycles_remaining = 0u;
+        ce->uop_in_flight = false;
+        cycle_engine_record_tick(ce, dp->ir_pc, fetch_op, 1u, false, true,
+                                 false, false);
+      }
       return CPU_STATUS_OK;
     }
 
@@ -983,6 +1264,10 @@ static void pipe_clear_all(PipelineState *p, uint32_t fetch_pc) {
   memset(&p->mem_wb, 0, sizeof(p->mem_wb));
   p->ex_cycles_remaining = 0u;
   p->mem_cycles_remaining = 0u;
+  p->if_miss_cycles_remaining = 0u;
+  p->mem_cache_accessed = false;
+  p->mem_pending_redirect = false;
+  p->mem_pending_redirect_pc = 0u;
   p->fetch_pc = fetch_pc;
 }
 
@@ -1122,6 +1407,201 @@ static bool pipe_step_wb(DioCPU *cpu, const PipelineMEMWBLatch *wb,
   return false;
 }
 
+static void pipe_execute_mem_body(DioCPU *cpu, const PipelineEXMEMLatch *ex,
+                                  PipelineMEMWBLatch *next_mem_wb,
+                                  bool *out_mem_redirect,
+                                  uint32_t *out_redirect_pc,
+                                  uint8_t *out_cache_lat) {
+  memset(next_mem_wb, 0, sizeof(*next_mem_wb));
+  next_mem_wb->valid = true;
+  next_mem_wb->pc = ex->pc;
+  next_mem_wb->ir = ex->ir;
+  next_mem_wb->ctrl = ex->ctrl;
+  next_mem_wb->fault = ex->fault;
+  next_mem_wb->wb_value = ex->wb_value;
+  next_mem_wb->wb_rem = ex->wb_rem;
+  next_mem_wb->alu_flags = ex->alu_flags;
+  next_mem_wb->committed_next_pc = ex->committed_next_pc;
+
+  *out_mem_redirect = false;
+  *out_redirect_pc = 0u;
+  *out_cache_lat = 1u;
+
+  if (ex->fault != (uint8_t)CPU_FAULT_NONE) {
+    return;
+  }
+
+  if (ex->ctrl.mem_read) {
+    int addr_ok = ex->ctrl.mem_is_stack_frame
+                      ? valid_stack_data_address(cpu, ex->effective_addr)
+                      : valid_general_data_address(ex->effective_addr);
+    uint16_t val = 0u;
+    uint8_t lat = 1u;
+    if (!ex->effective_addr_valid || !addr_ok ||
+        cpu_mem_data_read16(cpu, ex->effective_addr, &val, &lat) !=
+            MEMORY_STATUS_OK) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
+      return;
+    }
+    cpu->mar = ex->effective_addr;
+    next_mem_wb->wb_value = val;
+    *out_cache_lat = (lat > 0u) ? lat : 1u;
+    return;
+  }
+
+  if (ex->ctrl.mem_write) {
+    int addr_ok = ex->ctrl.mem_is_stack_frame
+                      ? valid_stack_data_address(cpu, ex->effective_addr)
+                      : valid_general_data_address(ex->effective_addr);
+    uint8_t lat = 1u;
+    if (!ex->effective_addr_valid || !addr_ok ||
+        cpu_mem_data_write16(cpu, ex->effective_addr, ex->store_value, &lat) !=
+            MEMORY_STATUS_OK) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
+      return;
+    }
+    cpu->mar = ex->effective_addr;
+    *out_cache_lat = (lat > 0u) ? lat : 1u;
+    return;
+  }
+
+  if (ex->ctrl.is_interrupt && !ex->ctrl.is_return) {
+    /* Software INT imm8 */
+    if (cpu->interrupt_nesting >= DIOCPU_MAX_INTERRUPT_NESTING) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_STACK_OVERFLOW;
+      return;
+    }
+    uint32_t handler_pc = 0u;
+    int has_handler = 0;
+    if (!lookup_ivt_handler(cpu, ex->ir.immediate8, &handler_pc,
+                            &has_handler) ||
+        !has_handler) {
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_UNHANDLED_INTERRUPT;
+      return;
+    }
+
+    uint32_t saved_sp = cpu->sp;
+    uint8_t l1 = 1u;
+    uint8_t l2 = 1u;
+    StackStatus st = cpu_stack_call(cpu, &cpu->sp, ex->ir.next_pc, &l1);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    st = cpu_stack_push16(cpu, &cpu->sp, cpu->flags, &l2);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+
+    uint8_t miss_extra = (l2 > cpu->cache.dcache.config.hit_latency)
+                             ? (uint8_t)(l2 - cpu->cache.dcache.config.hit_latency)
+                             : 0u;
+    *out_cache_lat = sum_latency_u8(l1, miss_extra);
+
+    cpu->flags &= (uint16_t)~CPU_FLAG_IF;
+    cpu->mar = cpu->sp;
+    cpu->interrupt_count++;
+    cpu->interrupt_nesting++;
+    cpu->last_interrupt_vector = ex->ir.immediate8;
+    cpu->fault = CPU_FAULT_NONE;
+
+    next_mem_wb->committed_next_pc = handler_pc;
+    *out_mem_redirect = true;
+    *out_redirect_pc = handler_pc;
+    return;
+  }
+
+  if (ex->ctrl.is_interrupt && ex->ctrl.is_return) {
+    /* IRET */
+    uint32_t saved_sp = cpu->sp;
+    uint16_t popped_flags = 0u;
+    uint8_t l1 = 1u;
+    uint8_t l2 = 1u;
+    StackStatus st = cpu_stack_pop16(cpu, &cpu->sp, &popped_flags, &l1);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    uint32_t ret_old_sp = cpu->sp;
+    uint32_t ret_pc = 0u;
+    st = cpu_stack_ret(cpu, &cpu->sp, &ret_pc, &l2);
+    if (st != STACK_STATUS_OK) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    if (!valid_address(ret_pc)) {
+      cpu->sp = saved_sp;
+      next_mem_wb->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+      return;
+    }
+
+    uint8_t miss_extra = (l2 > cpu->cache.dcache.config.hit_latency)
+                             ? (uint8_t)(l2 - cpu->cache.dcache.config.hit_latency)
+                             : 0u;
+    *out_cache_lat = sum_latency_u8(l1, miss_extra);
+
+    cpu->mar = ret_old_sp;
+    next_mem_wb->restored_flags = popped_flags & CPU_FLAGS_ALL_MASK;
+    next_mem_wb->committed_next_pc = ret_pc;
+    *out_mem_redirect = true;
+    *out_redirect_pc = ret_pc;
+    return;
+  }
+
+  if (ex->ctrl.stack_push) {
+    uint8_t lat = 1u;
+    StackStatus st =
+        ex->ctrl.stack_is_32bit
+            ? cpu_stack_call(cpu, &cpu->sp, ex->ir.next_pc, &lat)
+            : cpu_stack_push16(cpu, &cpu->sp, ex->store_value, &lat);
+    if (st != STACK_STATUS_OK) {
+      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+      return;
+    }
+    cpu->mar = cpu->sp;
+    *out_cache_lat = (lat > 0u) ? lat : 1u;
+    return;
+  }
+
+  if (ex->ctrl.stack_pop) {
+    uint32_t old_sp = cpu->sp;
+    if (ex->ctrl.stack_is_32bit) {
+      uint32_t ret_pc = 0u;
+      uint8_t lat = 1u;
+      StackStatus st = cpu_stack_ret(cpu, &cpu->sp, &ret_pc, &lat);
+      if (st != STACK_STATUS_OK) {
+        next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+        return;
+      }
+      if (!valid_address(ret_pc)) {
+        next_mem_wb->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+        return;
+      }
+      cpu->mar = old_sp;
+      next_mem_wb->committed_next_pc = ret_pc;
+      *out_mem_redirect = true;
+      *out_redirect_pc = ret_pc;
+      *out_cache_lat = (lat > 0u) ? lat : 1u;
+    } else {
+      uint16_t val = 0u;
+      uint8_t lat = 1u;
+      StackStatus st = cpu_stack_pop16(cpu, &cpu->sp, &val, &lat);
+      if (st != STACK_STATUS_OK) {
+        next_mem_wb->fault = (uint8_t)map_stack_fault(st);
+        return;
+      }
+      cpu->mar = old_sp;
+      next_mem_wb->wb_value = val;
+      *out_cache_lat = (lat > 0u) ? lat : 1u;
+    }
+  }
+}
+
 static void pipe_step_mem(DioCPU *cpu, const PipelineEXMEMLatch *ex,
                           PipelineEXMEMLatch *next_ex_mem,
                           PipelineMEMWBLatch *next_mem_wb, bool *out_mem_stall,
@@ -1138,6 +1618,72 @@ static void pipe_step_mem(DioCPU *cpu, const PipelineEXMEMLatch *ex,
   bool does_mem = ex->ctrl.mem_read || ex->ctrl.mem_write ||
                   ex->ctrl.stack_push || ex->ctrl.stack_pop ||
                   (ex->ctrl.is_interrupt && !ex->ctrl.is_return);
+
+  if (cpu->cache.enabled) {
+    if (ex->fault == (uint8_t)CPU_FAULT_NONE && does_mem) {
+      if (!p->mem_cache_accessed) {
+        uint8_t cache_lat = 1u;
+        bool pend_redirect = false;
+        uint32_t pend_pc = 0u;
+        pipe_execute_mem_body(cpu, ex, &p->mem_pending_wb, &pend_redirect,
+                              &pend_pc, &cache_lat);
+        if (p->mem_pending_wb.fault == (uint8_t)CPU_FAULT_NONE &&
+            cache_lat > 1u) {
+          p->mem_cache_accessed = true;
+          p->mem_cycles_remaining = (uint8_t)(cache_lat - 1u);
+          p->mem_pending_redirect = pend_redirect;
+          p->mem_pending_redirect_pc = pend_pc;
+          *out_mem_stall = true;
+          *next_ex_mem = *ex;
+          p->stats.dcache_stall_cycles++;
+          p->stats.stall_cycles++;
+          p->stats.bubbles++;
+          pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, true,
+                           false, false, ex->pc, ex->ir.opcode);
+          return;
+        }
+        p->mem_cache_accessed = false;
+        p->mem_cycles_remaining = 0u;
+        *next_mem_wb = p->mem_pending_wb;
+        *out_mem_redirect = pend_redirect;
+        *out_redirect_pc = pend_pc;
+        pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, false, false,
+                         false, ex->pc, ex->ir.opcode);
+        return;
+      }
+
+      p->mem_cycles_remaining--;
+      if (p->mem_cycles_remaining > 0u) {
+        *out_mem_stall = true;
+        *next_ex_mem = *ex;
+        p->stats.dcache_stall_cycles++;
+        p->stats.stall_cycles++;
+        p->stats.bubbles++;
+        pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, true, false,
+                         false, ex->pc, ex->ir.opcode);
+        return;
+      }
+
+      p->mem_cache_accessed = false;
+      *next_mem_wb = p->mem_pending_wb;
+      *out_mem_redirect = p->mem_pending_redirect;
+      *out_redirect_pc = p->mem_pending_redirect_pc;
+      p->mem_pending_redirect = false;
+      p->mem_pending_redirect_pc = 0u;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, false, false,
+                       false, ex->pc, ex->ir.opcode);
+      return;
+    }
+
+    p->mem_cache_accessed = false;
+    p->mem_cycles_remaining = 0u;
+    uint8_t unused_lat = 1u;
+    pipe_execute_mem_body(cpu, ex, next_mem_wb, out_mem_redirect,
+                          out_redirect_pc, &unused_lat);
+    pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, false, false,
+                     false, ex->pc, ex->ir.opcode);
+    return;
+  }
 
   if (ex->fault == (uint8_t)CPU_FAULT_NONE && does_mem) {
     if (p->mem_cycles_remaining == 0u) {
@@ -1166,168 +1712,11 @@ static void pipe_step_mem(DioCPU *cpu, const PipelineEXMEMLatch *ex,
     }
   }
 
-  memset(next_mem_wb, 0, sizeof(*next_mem_wb));
-  next_mem_wb->valid = true;
-  next_mem_wb->pc = ex->pc;
-  next_mem_wb->ir = ex->ir;
-  next_mem_wb->ctrl = ex->ctrl;
-  next_mem_wb->fault = ex->fault;
-  next_mem_wb->wb_value = ex->wb_value;
-  next_mem_wb->wb_rem = ex->wb_rem;
-  next_mem_wb->alu_flags = ex->alu_flags;
-  next_mem_wb->committed_next_pc = ex->committed_next_pc;
-
+  uint8_t unused_lat = 1u;
+  pipe_execute_mem_body(cpu, ex, next_mem_wb, out_mem_redirect,
+                        out_redirect_pc, &unused_lat);
   pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_MEM], true, false, false,
                    false, ex->pc, ex->ir.opcode);
-
-  if (ex->fault != (uint8_t)CPU_FAULT_NONE) {
-    return;
-  }
-
-  if (ex->ctrl.mem_read) {
-    int addr_ok = ex->ctrl.mem_is_stack_frame
-                      ? valid_stack_data_address(cpu, ex->effective_addr)
-                      : valid_general_data_address(ex->effective_addr);
-    uint16_t val = 0u;
-    if (!ex->effective_addr_valid || !addr_ok ||
-        memory_data_read16(&cpu->memory, ex->effective_addr, &val) !=
-            MEMORY_STATUS_OK) {
-      next_mem_wb->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
-      return;
-    }
-    cpu->mar = ex->effective_addr;
-    next_mem_wb->wb_value = val;
-    return;
-  }
-
-  if (ex->ctrl.mem_write) {
-    int addr_ok = ex->ctrl.mem_is_stack_frame
-                      ? valid_stack_data_address(cpu, ex->effective_addr)
-                      : valid_general_data_address(ex->effective_addr);
-    if (!ex->effective_addr_valid || !addr_ok ||
-        memory_data_write16(&cpu->memory, ex->effective_addr,
-                            ex->store_value) != MEMORY_STATUS_OK) {
-      next_mem_wb->fault = (uint8_t)CPU_FAULT_MEMORY_ACCESS_FAULT;
-      return;
-    }
-    cpu->mar = ex->effective_addr;
-    return;
-  }
-
-  if (ex->ctrl.is_interrupt && !ex->ctrl.is_return) {
-    /* Software INT imm8 */
-    if (cpu->interrupt_nesting >= DIOCPU_MAX_INTERRUPT_NESTING) {
-      next_mem_wb->fault = (uint8_t)CPU_FAULT_STACK_OVERFLOW;
-      return;
-    }
-    uint32_t handler_pc = 0u;
-    int has_handler = 0;
-    if (!lookup_ivt_handler(cpu, ex->ir.immediate8, &handler_pc,
-                            &has_handler) ||
-        !has_handler) {
-      next_mem_wb->fault = (uint8_t)CPU_FAULT_UNHANDLED_INTERRUPT;
-      return;
-    }
-
-    uint32_t saved_sp = cpu->sp;
-    StackStatus st = stack_call(&cpu->memory, &cpu->sp, ex->ir.next_pc);
-    if (st != STACK_STATUS_OK) {
-      cpu->sp = saved_sp;
-      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-      return;
-    }
-    st = stack_push16(&cpu->memory, &cpu->sp, cpu->flags);
-    if (st != STACK_STATUS_OK) {
-      cpu->sp = saved_sp;
-      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-      return;
-    }
-
-    cpu->flags &= (uint16_t)~CPU_FLAG_IF;
-    cpu->mar = cpu->sp;
-    cpu->interrupt_count++;
-    cpu->interrupt_nesting++;
-    cpu->last_interrupt_vector = ex->ir.immediate8;
-    cpu->fault = CPU_FAULT_NONE;
-
-    next_mem_wb->committed_next_pc = handler_pc;
-    *out_mem_redirect = true;
-    *out_redirect_pc = handler_pc;
-    return;
-  }
-
-  if (ex->ctrl.is_interrupt && ex->ctrl.is_return) {
-    /* IRET */
-    uint32_t saved_sp = cpu->sp;
-    uint16_t popped_flags = 0u;
-    StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &popped_flags);
-    if (st != STACK_STATUS_OK) {
-      cpu->sp = saved_sp;
-      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-      return;
-    }
-    uint32_t ret_old_sp = cpu->sp;
-    uint32_t ret_pc = 0u;
-    st = stack_ret(&cpu->memory, &cpu->sp, &ret_pc);
-    if (st != STACK_STATUS_OK) {
-      cpu->sp = saved_sp;
-      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-      return;
-    }
-    if (!valid_address(ret_pc)) {
-      cpu->sp = saved_sp;
-      next_mem_wb->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
-      return;
-    }
-    cpu->mar = ret_old_sp;
-    next_mem_wb->restored_flags = popped_flags & CPU_FLAGS_ALL_MASK;
-    next_mem_wb->committed_next_pc = ret_pc;
-    *out_mem_redirect = true;
-    *out_redirect_pc = ret_pc;
-    return;
-  }
-
-  if (ex->ctrl.stack_push) {
-    StackStatus st =
-        ex->ctrl.stack_is_32bit
-            ? stack_call(&cpu->memory, &cpu->sp, ex->ir.next_pc)
-            : stack_push16(&cpu->memory, &cpu->sp, ex->store_value);
-    if (st != STACK_STATUS_OK) {
-      next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-      return;
-    }
-    cpu->mar = cpu->sp;
-    return;
-  }
-
-  if (ex->ctrl.stack_pop) {
-    uint32_t old_sp = cpu->sp;
-    if (ex->ctrl.stack_is_32bit) {
-      uint32_t ret_pc = 0u;
-      StackStatus st = stack_ret(&cpu->memory, &cpu->sp, &ret_pc);
-      if (st != STACK_STATUS_OK) {
-        next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-        return;
-      }
-      if (!valid_address(ret_pc)) {
-        next_mem_wb->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
-        return;
-      }
-      cpu->mar = old_sp;
-      next_mem_wb->committed_next_pc = ret_pc;
-      *out_mem_redirect = true;
-      *out_redirect_pc = ret_pc;
-    } else {
-      uint16_t val = 0u;
-      StackStatus st = stack_pop16(&cpu->memory, &cpu->sp, &val);
-      if (st != STACK_STATUS_OK) {
-        next_mem_wb->fault = (uint8_t)map_stack_fault(st);
-        return;
-      }
-      cpu->mar = old_sp;
-      next_mem_wb->wb_value = val;
-    }
-  }
 }
 
 static void pipe_step_ex(DioCPU *cpu, const PipelineIDEXLatch *id_ex,
@@ -1492,18 +1881,31 @@ static void pipe_step_ex(DioCPU *cpu, const PipelineIDEXLatch *id_ex,
     next_ex_mem->store_value = dp.alu_in_a;
   }
 
-  if (dp.ctrl.is_jump || dp.ctrl.is_call ||
-      (dp.ctrl.is_branch && dp.ctrl.branch_taken)) {
-    uint32_t target_pc = 0u;
-    if (!datapath_resolve_next_pc(&dp, eff_gpr, CPU_GPR_COUNT, dp.ir_pc, 0u, 0u,
-                                  &target_pc)) {
-      next_ex_mem->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
-      return;
+  if (dp.ctrl.is_jump || dp.ctrl.is_call || dp.ctrl.is_branch) {
+    bool actual_taken = dp.ctrl.is_jump || dp.ctrl.is_call ||
+                        (dp.ctrl.is_branch && dp.ctrl.branch_taken);
+    uint32_t actual_next_pc = dp.ir.next_pc;
+    if (actual_taken) {
+      if (!datapath_resolve_next_pc(&dp, eff_gpr, CPU_GPR_COUNT, dp.ir_pc, 0u,
+                                    0u, &actual_next_pc)) {
+        next_ex_mem->fault = (uint8_t)CPU_FAULT_INSTRUCTION_FETCH_FAULT;
+        return;
+      }
     }
-    next_ex_mem->committed_next_pc = target_pc;
-    *out_ex_redirect = true;
-    *out_redirect_pc = target_pc;
-    p->stats.control_hazard_flushes++;
+    next_ex_mem->committed_next_pc = actual_next_pc;
+
+    bool pred_matches = (id_ex->predicted_taken == actual_taken) &&
+                        (!actual_taken ||
+                         id_ex->predicted_next_pc == actual_next_pc);
+    if (!pred_matches) {
+      *out_ex_redirect = true;
+      *out_redirect_pc = actual_next_pc;
+      p->stats.control_hazard_flushes++;
+    }
+
+    bp_update(&p->bp, id_ex->pc, &dp.ir, &dp.ctrl, id_ex->predicted_taken,
+              id_ex->predicted_next_pc, id_ex->bp_ghr_snapshot, actual_taken,
+              actual_next_pc);
   } else if (dp.ctrl.is_halt) {
     uint32_t hlt_next_pc = dp.ir_pc;
     (void)datapath_resolve_next_pc(&dp, eff_gpr, CPU_GPR_COUNT, dp.ir_pc, 0u,
@@ -1611,6 +2013,9 @@ CPUStatus cpu_pipeline_step_cycle(DioCPU *cpu) {
     decoded_id.pc = cur_if_id.pc;
     decoded_id.ir = cur_if_id.ir;
     decoded_id.fault = cur_if_id.fault;
+    decoded_id.predicted_taken = cur_if_id.predicted_taken;
+    decoded_id.predicted_next_pc = cur_if_id.predicted_next_pc;
+    decoded_id.bp_ghr_snapshot = cur_if_id.bp_ghr_snapshot;
 
     if (decoded_id.fault == (uint8_t)CPU_FAULT_NONE) {
       if (control_unit_decode(&cur_if_id.ir, cpu->flags, &decoded_id.ctrl) !=
@@ -1645,16 +2050,36 @@ CPUStatus cpu_pipeline_step_cycle(DioCPU *cpu) {
     }
   }
 
-  /* Step IF according to cascade: mem_redirect > ex_redirect > stalls > hold */
+  /* Step IF according to cascade: mem_redirect > ex_redirect > stalls > cache miss > hold */
   if (mem_redirect) {
+    p->if_miss_cycles_remaining = 0u;
     p->fetch_pc = mem_redirect_pc;
     p->stats.bubbles++;
   } else if (ex_redirect) {
+    p->if_miss_cycles_remaining = 0u;
     p->fetch_pc = ex_redirect_pc;
     p->stats.bubbles++;
   } else if (mem_stall || ex_stall || id_stall) {
     pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], cur_if_id.valid, true,
                      false, false, p->fetch_pc, DIOCPU_OP_NOP);
+  } else if (p->if_miss_cycles_remaining > 0u) {
+    p->if_miss_cycles_remaining--;
+    if (p->if_miss_cycles_remaining > 0u) {
+      p->stats.icache_stall_cycles++;
+      p->stats.stall_cycles++;
+      p->stats.bubbles++;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, true, false,
+                       false, p->if_pending_latch.pc,
+                       p->if_pending_latch.ir.opcode);
+    } else {
+      next_if_id = p->if_pending_latch;
+      bp_predict(&p->bp, next_if_id.pc, &next_if_id.ir,
+                 &next_if_id.predicted_taken, &next_if_id.predicted_next_pc,
+                 &next_if_id.bp_ghr_snapshot);
+      p->fetch_pc = next_if_id.predicted_next_pc;
+      pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, false, false,
+                       false, next_if_id.pc, next_if_id.ir.opcode);
+    }
   } else {
     bool serialize_hold =
         (next_id_ex.valid &&
@@ -1670,15 +2095,42 @@ CPUStatus cpu_pipeline_step_cycle(DioCPU *cpu) {
     if (!serialize_hold && !pipe_has_enabled_irq(cpu)) {
       DecodedInstruction fetched = {0};
       DecoderStatus dst = decoder_decode(&cpu->memory, p->fetch_pc, &fetched);
-      next_if_id.valid = true;
-      next_if_id.pc = p->fetch_pc;
       if (dst == DECODER_STATUS_OK) {
-        next_if_id.ir = fetched;
-        next_if_id.fault = (uint8_t)CPU_FAULT_NONE;
-        p->fetch_pc = fetched.next_pc;
-        pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, false, false,
-                         false, next_if_id.pc, fetched.opcode);
+        uint8_t if_lat = 1u;
+        if (cpu->cache.enabled) {
+          uint32_t fetch_len = (fetched.next_pc > p->fetch_pc)
+                                   ? (fetched.next_pc - p->fetch_pc)
+                                   : 1u;
+          (void)cache_icache_fetch(&cpu->cache, &cpu->memory, p->fetch_pc,
+                                   fetch_len, &if_lat);
+        }
+        if (cpu->cache.enabled && if_lat > 1u) {
+          memset(&p->if_pending_latch, 0, sizeof(p->if_pending_latch));
+          p->if_pending_latch.valid = true;
+          p->if_pending_latch.pc = p->fetch_pc;
+          p->if_pending_latch.ir = fetched;
+          p->if_pending_latch.fault = (uint8_t)CPU_FAULT_NONE;
+          p->if_miss_cycles_remaining = (uint8_t)(if_lat - 1u);
+          p->stats.icache_stall_cycles++;
+          p->stats.stall_cycles++;
+          p->stats.bubbles++;
+          pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, true, false,
+                           false, p->fetch_pc, fetched.opcode);
+        } else {
+          next_if_id.valid = true;
+          next_if_id.pc = p->fetch_pc;
+          next_if_id.ir = fetched;
+          next_if_id.fault = (uint8_t)CPU_FAULT_NONE;
+          bp_predict(&p->bp, next_if_id.pc, &next_if_id.ir,
+                     &next_if_id.predicted_taken, &next_if_id.predicted_next_pc,
+                     &next_if_id.bp_ghr_snapshot);
+          p->fetch_pc = next_if_id.predicted_next_pc;
+          pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, false,
+                           false, false, next_if_id.pc, fetched.opcode);
+        }
       } else {
+        next_if_id.valid = true;
+        next_if_id.pc = p->fetch_pc;
         next_if_id.fault = (uint8_t)map_decoder_fault(dst);
         pipe_record_slot(&p->stage_snapshot[PIPE_STAGE_IF], true, false, false,
                          false, next_if_id.pc, DIOCPU_OP_NOP);
@@ -1736,6 +2188,72 @@ CPUStatus cpu_pipeline_run(DioCPU *cpu, uint64_t max_cycles,
 
   *cycles_executed = cpu->pipeline.stats.cycles - start_cycles;
   return CPU_STATUS_STEP_LIMIT_REACHED;
+}
+
+CPUStatus cpu_set_cache_enabled(DioCPU *cpu, bool enabled) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  cpu->cache.enabled = enabled;
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_set_branch_predictor_mode(DioCPU *cpu, BranchPredictorMode mode) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  BranchPredictorConfig cfg = cpu->pipeline.bp.config;
+  if (!bp_config_is_valid(&cfg)) {
+    cfg = bp_default_config();
+  }
+  cfg.mode = mode;
+
+  if (!bp_init(&cpu->pipeline.bp, &cfg)) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_configure_branch_predictor(DioCPU *cpu,
+                                         const BranchPredictorConfig *config) {
+  if (cpu == NULL || config == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (!bp_init(&cpu->pipeline.bp, config)) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_configure_cache(DioCPU *cpu, const CacheConfig *icfg,
+                              const CacheConfig *dcfg) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (cache_subsystem_configure(&cpu->cache, icfg, dcfg) != CACHE_STATUS_OK) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_flush_caches(DioCPU *cpu, uint64_t *out_writebacks) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (cache_dcache_flush(&cpu->cache, &cpu->memory, out_writebacks) !=
+      CACHE_STATUS_OK) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  return CPU_STATUS_OK;
 }
 
 const char *cpu_fault_string(CPUFault fault) {

@@ -13,12 +13,16 @@ void pipeline_reset(PipelineState *pipe, uint32_t initial_pc)
     uint8_t prev_mem_lat = (pipe->initialized && pipe->config.mem_stage_latency > 0u)
                                ? pipe->config.mem_stage_latency
                                : 2u;
+    BranchPredictorConfig prev_bp = pipe->initialized && bp_config_is_valid(&pipe->bp.config)
+                                        ? pipe->bp.config
+                                        : bp_default_config();
 
     memset(pipe, 0, sizeof(*pipe));
     pipe->initialized = true;
     pipe->config.forwarding_enabled = prev_fwd;
     pipe->config.mem_stage_latency = prev_mem_lat;
     pipe->fetch_pc = initial_pc;
+    bp_init(&pipe->bp, &prev_bp);
 }
 
 void pipeline_collect_usage(

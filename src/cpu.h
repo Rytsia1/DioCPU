@@ -1,6 +1,7 @@
 #ifndef DIOCPU_H
 #define DIOCPU_H
 
+#include "cache.h"
 #include "cycle_engine.h"
 #include "datapath.h"
 #include "memory.h"
@@ -95,6 +96,7 @@ typedef struct {
     MicroOpContext uop;
     CycleEngine cycle;
     PipelineState pipeline;
+    CacheSubsystem cache;
 
     Memory memory;
 
@@ -121,12 +123,26 @@ CPUStatus cpu_run(
 
 /* Pipelined Execution & Control (M5) */
 CPUStatus cpu_set_pipeline_forwarding(DioCPU *cpu, bool enabled);
+CPUStatus cpu_set_branch_predictor_mode(DioCPU *cpu, BranchPredictorMode mode);
+CPUStatus cpu_configure_branch_predictor(
+    DioCPU *cpu,
+    const BranchPredictorConfig *config
+);
 CPUStatus cpu_pipeline_step_cycle(DioCPU *cpu);
 CPUStatus cpu_pipeline_run(
     DioCPU *cpu,
     uint64_t max_cycles,
     uint64_t *cycles_executed
 );
+
+/* Cache Subsystem Control (M6) */
+CPUStatus cpu_set_cache_enabled(DioCPU *cpu, bool enabled);
+CPUStatus cpu_configure_cache(
+    DioCPU *cpu,
+    const CacheConfig *icfg,
+    const CacheConfig *dcfg
+);
+CPUStatus cpu_flush_caches(DioCPU *cpu, uint64_t *out_writebacks);
 
 /* Interrupt & Exception Control */
 CPUStatus cpu_raise_irq(DioCPU *cpu, uint8_t vector);

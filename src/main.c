@@ -1,6 +1,8 @@
 #include "cpu.h"
 
 #include "assembler.h"
+#include "branch_predictor.h"
+#include "cache.h"
 #include "control_unit.h"
 #include "cycle_engine.h"
 #include "debugger.h"
@@ -96,11 +98,13 @@ static void print_cpu_state(const DioCPU *cpu)
         char pipe_buf[192];
         pipeline_format_summary(&cpu->pipeline, pipe_buf, sizeof(pipe_buf));
         printf("Pipeline summary     : %s\n", pipe_buf);
-        printf("Pipeline breakdown   : data_stalls=%llu load_use=%llu ex_stalls=%llu mem_stalls=%llu ctrl_stalls=%llu flushes=%llu bubbles=%llu\n",
+        printf("Pipeline breakdown   : data_stalls=%llu load_use=%llu ex_stalls=%llu mem_stalls=%llu icache_stalls=%llu dcache_stalls=%llu ctrl_stalls=%llu flushes=%llu bubbles=%llu\n",
                (unsigned long long)cpu->pipeline.stats.data_hazard_stalls,
                (unsigned long long)cpu->pipeline.stats.load_use_stalls,
                (unsigned long long)cpu->pipeline.stats.structural_ex_stalls,
                (unsigned long long)cpu->pipeline.stats.structural_mem_stalls,
+               (unsigned long long)cpu->pipeline.stats.icache_stall_cycles,
+               (unsigned long long)cpu->pipeline.stats.dcache_stall_cycles,
                (unsigned long long)cpu->pipeline.stats.control_stalls,
                (unsigned long long)cpu->pipeline.stats.control_hazard_flushes,
                (unsigned long long)cpu->pipeline.stats.bubbles);
@@ -115,6 +119,19 @@ static void print_cpu_state(const DioCPU *cpu)
                cycle_engine_cpi(&cpu->cycle, cpu->instructions_executed),
                cycle_engine_ipc(&cpu->cycle, cpu->instructions_executed),
                (unsigned long long)cpu->cycle.last_instruction_cycles);
+    }
+    if (cpu->cache.enabled) {
+        char ic_buf[192];
+        char dc_buf[192];
+        cache_format_stats(&cpu->cache.icache, "I-Cache", ic_buf, sizeof(ic_buf));
+        cache_format_stats(&cpu->cache.dcache, "D-Cache", dc_buf, sizeof(dc_buf));
+        printf("%s\n", ic_buf);
+        printf("%s\n", dc_buf);
+    }
+    if (cpu->pipeline.bp.config.mode != BP_MODE_NONE) {
+        char bp_buf[192];
+        bp_format_stats(&cpu->pipeline.bp, bp_buf, sizeof(bp_buf));
+        printf("%s\n", bp_buf);
     }
     printf("Interrupts serviced  : %u\n",
            (unsigned int)cpu->interrupt_count);
@@ -148,24 +165,85 @@ static void print_cpu_state(const DioCPU *cpu)
 }
 
 
+static bool parse_bp_mode(const char *arg, BranchPredictorMode *out_mode)
+{
+    if (arg == NULL || out_mode == NULL) {
+        return false;
+    }
+
+    if (strcmp(arg, "none") == 0) {
+        *out_mode = BP_MODE_NONE;
+        return true;
+    }
+    if (strcmp(arg, "btfnt") == 0) {
+        *out_mode = BP_MODE_STATIC_BTFNT;
+        return true;
+    }
+    if (strcmp(arg, "1bit") == 0) {
+        *out_mode = BP_MODE_1BIT;
+        return true;
+    }
+    if (strcmp(arg, "2bit") == 0) {
+        *out_mode = BP_MODE_2BIT;
+        return true;
+    }
+    if (strcmp(arg, "gshare") == 0) {
+        *out_mode = BP_MODE_GSHARE;
+        return true;
+    }
+
+    return false;
+}
+
+
 int main(int argc, char **argv)
 {
     bool use_pipeline = false;
     bool forwarding_enabled = true;
+    bool cache_enabled = false;
+    BranchPredictorMode bp_mode = BP_MODE_NONE;
     const char *program_path = NULL;
 
-    if (argc == 2) {
-        program_path = argv[1];
-    } else if (argc == 3 && strcmp(argv[1], "--pipeline") == 0) {
-        use_pipeline = true;
-        forwarding_enabled = true;
-        program_path = argv[2];
-    } else if (argc == 3 && strcmp(argv[1], "--pipeline-no-fwd") == 0) {
-        use_pipeline = true;
-        forwarding_enabled = false;
-        program_path = argv[2];
-    } else {
-        printf("Usage: diocpu.exe [--pipeline|--pipeline-no-fwd] <program.asm>\n");
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--cache") == 0) {
+            cache_enabled = true;
+        } else if (strcmp(arg, "--pipeline") == 0) {
+            use_pipeline = true;
+            forwarding_enabled = true;
+        } else if (strcmp(arg, "--pipeline-no-fwd") == 0) {
+            use_pipeline = true;
+            forwarding_enabled = false;
+        } else if (strcmp(arg, "--pipeline-cache") == 0) {
+            use_pipeline = true;
+            forwarding_enabled = true;
+            cache_enabled = true;
+        } else if (strncmp(arg, "--bp=", 5) == 0) {
+            if (!parse_bp_mode(arg + 5, &bp_mode)) {
+                printf("Unknown branch predictor mode: %s\n", arg + 5);
+                return 1;
+            }
+            if (bp_mode != BP_MODE_NONE) {
+                use_pipeline = true;
+            }
+        } else if (strcmp(arg, "--bp") == 0 && (i + 1) < argc) {
+            if (!parse_bp_mode(argv[++i], &bp_mode)) {
+                printf("Unknown branch predictor mode: %s\n", argv[i]);
+                return 1;
+            }
+            if (bp_mode != BP_MODE_NONE) {
+                use_pipeline = true;
+            }
+        } else if (arg[0] != '-' && program_path == NULL) {
+            program_path = arg;
+        } else {
+            printf("Usage: diocpu.exe [--cache] [--pipeline|--pipeline-no-fwd|--pipeline-cache] [--bp=<none|btfnt|1bit|2bit|gshare>] <program.asm>\n");
+            return 1;
+        }
+    }
+
+    if (program_path == NULL) {
+        printf("Usage: diocpu.exe [--cache] [--pipeline|--pipeline-no-fwd|--pipeline-cache] [--bp=<none|btfnt|1bit|2bit|gshare>] <program.asm>\n");
         return 1;
     }
 
@@ -264,15 +342,23 @@ int main(int argc, char **argv)
     uint64_t steps = 0;
     CPUStatus cpu_status = CPU_STATUS_OK;
 
+    cpu_set_cache_enabled(&cpu, cache_enabled);
+
     if (use_pipeline) {
         cpu_set_pipeline_forwarding(&cpu, forwarding_enabled);
+        cpu_set_branch_predictor_mode(&cpu, bp_mode);
         cpu_status = cpu_pipeline_run(&cpu, 5000000, &steps);
-        printf("Execution mode: Pipeline (Forwarding: %s)\n",
-               forwarding_enabled ? "ON" : "OFF");
+        printf("Execution mode: Pipeline (Forwarding: %s, Cache: %s, BP: %s)\n",
+               forwarding_enabled ? "ON" : "OFF",
+               cache_enabled ? "ON" : "OFF",
+               bp_mode_name(bp_mode));
         printf("Execution result: %s\n", cpu_status_string(cpu_status));
         printf("Cycles in this run: %llu\n", (unsigned long long)steps);
     } else {
         cpu_status = cpu_run(&cpu, 1000000, &steps);
+        if (cache_enabled) {
+            printf("Execution mode: Single/Micro-op (Cache: ON)\n");
+        }
         printf("Execution result: %s\n", cpu_status_string(cpu_status));
         printf("Steps in this run: %llu\n", (unsigned long long)steps);
     }

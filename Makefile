@@ -14,7 +14,9 @@ CORE_SOURCES = \
 	src/datapath.c \
 	src/microop.c \
 	src/cycle_engine.c \
-	src/pipeline.c
+	src/pipeline.c \
+	src/cache.c \
+	src/branch_predictor.c
 
 all: cli gui test
 
@@ -66,7 +68,13 @@ tests_cycle.exe: tests/tests_cycle.c $(CORE_SOURCES)
 tests_pipeline.exe: tests/tests_pipeline.c $(CORE_SOURCES)
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_datapath.exe tests_microop.exe tests_cycle.exe tests_pipeline.exe tests_gui_integration.exe
+tests_cache.exe: tests/tests_cache.c $(CORE_SOURCES)
+	$(CC) $(CFLAGS) -o $@ $^
+
+tests_branch_predictor.exe: tests/tests_branch_predictor.c $(CORE_SOURCES)
+	$(CC) $(CFLAGS) -o $@ $^
+
+test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_datapath.exe tests_microop.exe tests_cycle.exe tests_pipeline.exe tests_cache.exe tests_branch_predictor.exe tests_gui_integration.exe
 	./tests_cpu.exe
 	./tests_alu.exe
 	./tests_memory.exe
@@ -78,6 +86,8 @@ test: tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder
 	./tests_microop.exe
 	./tests_cycle.exe
 	./tests_pipeline.exe
+	./tests_cache.exe
+	./tests_branch_predictor.exe
 	./tests_gui_integration.exe
 
 cpu-test: tests_cpu.exe
@@ -113,10 +123,16 @@ cycle-test: tests_cycle.exe
 pipeline-test: tests_pipeline.exe
 	./tests_pipeline.exe
 
+cache-test: tests_cache.exe
+	./tests_cache.exe
+
+bp-test: tests_branch_predictor.exe
+	./tests_branch_predictor.exe
+
 gui-test: tests_gui_integration.exe
 	./tests_gui_integration.exe
 
 clean:
-	rm -f diocpu.exe diocpu_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_datapath.exe tests_microop.exe tests_cycle.exe tests_pipeline.exe tests_gui_integration.exe *.o
+	rm -f diocpu.exe diocpu_gui.exe tests_cpu.exe tests_alu.exe tests_memory.exe tests_stack.exe tests_decoder.exe tests_assembler.exe tests_debugger.exe tests_datapath.exe tests_microop.exe tests_cycle.exe tests_pipeline.exe tests_cache.exe tests_branch_predictor.exe tests_gui_integration.exe *.o
 
-.PHONY: all cli gui test clean cpu-test alu-test memory-test stack-test decoder-test assembler-test debugger-test datapath-test microop-test cycle-test pipeline-test gui-test
+.PHONY: all cli gui test clean cpu-test alu-test memory-test stack-test decoder-test assembler-test debugger-test datapath-test microop-test cycle-test pipeline-test cache-test bp-test gui-test

@@ -1,6 +1,7 @@
 #ifndef DIOCPU_PIPELINE_H
 #define DIOCPU_PIPELINE_H
 
+#include "branch_predictor.h"
 #include "control_unit.h"
 #include "decoder.h"
 
@@ -27,6 +28,9 @@ typedef struct {
     uint32_t pc;
     DecodedInstruction ir;
     uint8_t fault;
+    bool predicted_taken;
+    uint32_t predicted_next_pc;
+    uint16_t bp_ghr_snapshot;
 } PipelineIFIDLatch;
 
 typedef struct {
@@ -35,6 +39,9 @@ typedef struct {
     DecodedInstruction ir;
     ControlSignals ctrl;
     uint8_t fault;
+    bool predicted_taken;
+    uint32_t predicted_next_pc;
+    uint16_t bp_ghr_snapshot;
 } PipelineIDEXLatch;
 
 typedef struct {
@@ -88,6 +95,8 @@ typedef struct {
     uint64_t control_stalls;
     uint64_t structural_ex_stalls;
     uint64_t structural_mem_stalls;
+    uint64_t icache_stall_cycles;
+    uint64_t dcache_stall_cycles;
     uint64_t forwards;
     uint64_t bubbles;
 } PipelineStats;
@@ -111,9 +120,16 @@ typedef struct {
     uint32_t fetch_pc;
     uint8_t ex_cycles_remaining;
     uint8_t mem_cycles_remaining;
+    uint8_t if_miss_cycles_remaining;
+    bool mem_cache_accessed;
+    bool mem_pending_redirect;
+    uint32_t mem_pending_redirect_pc;
     uint8_t irq_cycles_remaining;
     uint8_t pending_irq_vector;
     bool irq_entry_active;
+
+    PipelineIFIDLatch if_pending_latch;
+    PipelineMEMWBLatch mem_pending_wb;
 
     PipelineIFIDLatch if_id;
     PipelineIDEXLatch id_ex;
@@ -122,6 +138,7 @@ typedef struct {
 
     PipelineSlotSummary stage_snapshot[PIPE_STAGE_COUNT];
     PipelineStats stats;
+    BranchPredictor bp;
 } PipelineState;
 
 void pipeline_reset(PipelineState *pipe, uint32_t initial_pc);
