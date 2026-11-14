@@ -74,6 +74,8 @@ bool microop_build_irq_sequence(
 
 const char *microop_kind_name(MicroOpKind kind);
 
+uint32_t microop_sequence_total_cycles(const MicroOpSequence *sequence);
+
 size_t microop_format_sequence(
     const MicroOpSequence *sequence,
     char *buffer,

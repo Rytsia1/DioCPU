@@ -174,6 +174,21 @@ const char *microop_kind_name(MicroOpKind kind)
     }
 }
 
+uint32_t microop_sequence_total_cycles(const MicroOpSequence *sequence)
+{
+    if (sequence == NULL) {
+        return 0;
+    }
+
+    uint32_t total = 0;
+    for (uint8_t i = 0; i < sequence->count; i++) {
+        uint8_t lat = sequence->ops[i].latency_cycles;
+        total += (lat > 0u) ? (uint32_t)lat : 1u;
+    }
+
+    return total;
+}
+
 size_t microop_format_sequence(
     const MicroOpSequence *sequence,
     char *buffer,

@@ -1,6 +1,7 @@
 #ifndef DIOCPU_H
 #define DIOCPU_H
 
+#include "cycle_engine.h"
 #include "datapath.h"
 #include "memory.h"
 #include "microop.h"
@@ -63,7 +64,8 @@ typedef enum {
     CPU_STATUS_INVALID_ARGUMENT,
     CPU_STATUS_HALTED,
     CPU_STATUS_FAULTED,
-    CPU_STATUS_STEP_LIMIT_REACHED
+    CPU_STATUS_STEP_LIMIT_REACHED,
+    CPU_STATUS_BREAKPOINT_REACHED
 } CPUStatus;
 
 typedef struct {
@@ -90,6 +92,7 @@ typedef struct {
 
     DatapathState datapath;
     MicroOpContext uop;
+    CycleEngine cycle;
 
     Memory memory;
 
@@ -98,6 +101,14 @@ typedef struct {
 /* Core Lifecycle & Execution Functions */
 CPUStatus cpu_init(DioCPU *cpu);
 CPUStatus cpu_reset(DioCPU *cpu);
+CPUStatus cpu_cycle_step(DioCPU *cpu);
+CPUStatus cpu_run_cycles(
+    DioCPU *cpu,
+    uint64_t max_cycles,
+    uint64_t *cycles_executed
+);
+CPUStatus cpu_set_cycle_breakpoint(DioCPU *cpu, uint64_t target_cycle);
+CPUStatus cpu_clear_cycle_breakpoint(DioCPU *cpu);
 CPUStatus cpu_microop_step(DioCPU *cpu);
 CPUStatus cpu_step(DioCPU *cpu);
 CPUStatus cpu_run(

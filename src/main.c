@@ -2,6 +2,7 @@
 
 #include "assembler.h"
 #include "control_unit.h"
+#include "cycle_engine.h"
 #include "debugger.h"
 #include "microop.h"
 
@@ -91,6 +92,14 @@ static void print_cpu_state(const DioCPU *cpu)
            (unsigned long long)cpu->instructions_executed);
     printf("Micro-ops executed   : %llu\n",
            (unsigned long long)cpu->uop.microops_executed);
+    printf("Clock cycles         : %llu (Stall: %llu, IRQ: %llu)\n",
+           (unsigned long long)cpu->cycle.total_cycles,
+           (unsigned long long)cpu->cycle.busy_stall_cycles,
+           (unsigned long long)cpu->cycle.interrupt_cycles);
+    printf("CPI / IPC            : %.2f / %.2f (Last instr: %llu cyc)\n",
+           cycle_engine_cpi(&cpu->cycle, cpu->instructions_executed),
+           cycle_engine_ipc(&cpu->cycle, cpu->instructions_executed),
+           (unsigned long long)cpu->cycle.last_instruction_cycles);
     printf("Interrupts serviced  : %u\n",
            (unsigned int)cpu->interrupt_count);
 

@@ -2,6 +2,7 @@
 
 #include "alu.h"
 #include "control_unit.h"
+#include "cycle_engine.h"
 #include "datapath.h"
 #include "decoder.h"
 #include "microop.h"
@@ -190,6 +191,8 @@ static CPUStatus raise_fault(DioCPU *cpu, CPUFault fault) {
     cpu->flags = cpu->uop.saved_flags;
     cpu->uop.active = false;
   }
+  cpu->cycle.uop_in_flight = false;
+  cpu->cycle.uop_cycles_remaining = 0u;
 
   uint8_t vec = 0;
 
@@ -285,6 +288,7 @@ CPUStatus cpu_reset(DioCPU *cpu) {
 
   datapath_reset(&cpu->datapath);
   microop_context_reset(&cpu->uop);
+  cycle_engine_reset(&cpu->cycle);
 
   return CPU_STATUS_OK;
 }
@@ -397,41 +401,9 @@ static CPUStatus begin_instruction_or_irq(DioCPU *cpu) {
   return CPU_STATUS_OK;
 }
 
-CPUStatus cpu_microop_step(DioCPU *cpu) {
-  if (cpu == NULL) {
-    return CPU_STATUS_INVALID_ARGUMENT;
-  }
-
-  if (cpu->state == CPU_STATE_HALTED) {
-    return CPU_STATUS_HALTED;
-  }
-
-  if (cpu->state == CPU_STATE_FAULTED) {
-    return CPU_STATUS_FAULTED;
-  }
-
+static CPUStatus execute_single_uop(DioCPU *cpu, MicroOp op) {
   MicroOpContext *uop = &cpu->uop;
   DatapathState *dp = &cpu->datapath;
-
-  if (!uop->active) {
-    CPUStatus st = begin_instruction_or_irq(cpu);
-    if (st != CPU_STATUS_OK) {
-      return st;
-    }
-    /* Normal instruction fetch-decode already consumed step 0. */
-    if (!uop->sequence.is_irq_sequence) {
-      return CPU_STATUS_OK;
-    }
-  }
-
-  if (uop->step_index >= uop->sequence.count) {
-    uop->active = false;
-    return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
-  }
-
-  MicroOp op = uop->sequence.ops[uop->step_index];
-  uop->step_index++;
-
   const ControlSignals *ctrl = &dp->ctrl;
   const DecodedInstruction *instr = &dp->ir;
 
@@ -668,6 +640,257 @@ CPUStatus cpu_microop_step(DioCPU *cpu) {
   return CPU_STATUS_OK;
 }
 
+static CPUStatus finish_uop_on_current_cycle(DioCPU *cpu, uint64_t prev_instrs) {
+  MicroOpContext *uop = &cpu->uop;
+  CycleEngine *ce = &cpu->cycle;
+  bool is_irq = uop->sequence.is_irq_sequence;
+  uint32_t tick_pc = ce->active_pc;
+  MicroOp op = ce->active_uop;
+  uint8_t cyc_idx = ce->uop_cycles_elapsed;
+
+  uop->step_index++;
+  CPUStatus st = execute_single_uop(cpu, op);
+
+  if (st == CPU_STATUS_FAULTED) {
+    ce->current_stage = CYCLE_STAGE_FAULT;
+    ce->current_instruction_cycles = 0u;
+    cycle_engine_record_tick(ce, tick_pc, op, cyc_idx, false, false, false,
+                             is_irq);
+    return CPU_STATUS_FAULTED;
+  }
+
+  if (!uop->active && cpu->instructions_executed == prev_instrs) {
+    /* Micro-op raised a fault that trapped via IVT */
+    ce->current_stage = CYCLE_STAGE_FAULT;
+    ce->last_instruction_cycles = ce->current_instruction_cycles;
+    ce->current_instruction_cycles = 0u;
+    cycle_engine_record_tick(ce, tick_pc, op, cyc_idx, false, false, false,
+                             is_irq);
+    return CPU_STATUS_OK;
+  }
+
+  bool retired_instr = !uop->active;
+  if (retired_instr) {
+    ce->last_instruction_cycles = ce->current_instruction_cycles;
+    ce->current_instruction_cycles = 0u;
+  }
+
+  cycle_engine_record_tick(ce, tick_pc, op, cyc_idx, false, true, retired_instr,
+                           is_irq);
+  return st;
+}
+
+static CPUStatus issue_uop_on_current_cycle(DioCPU *cpu, uint32_t exec_pc,
+                                            uint64_t prev_instrs) {
+  MicroOpContext *uop = &cpu->uop;
+  CycleEngine *ce = &cpu->cycle;
+
+  if (uop->step_index >= uop->sequence.count) {
+    uop->active = false;
+    ce->current_stage = CYCLE_STAGE_FAULT;
+    ce->current_instruction_cycles = 0u;
+    return raise_fault(cpu, CPU_FAULT_INVALID_INSTRUCTION);
+  }
+
+  MicroOp op = uop->sequence.ops[uop->step_index];
+  uint8_t lat = (op.latency_cycles > 0u) ? op.latency_cycles : 1u;
+
+  ce->active_uop = op;
+  ce->active_uop.latency_cycles = lat;
+  ce->active_pc = exec_pc;
+  ce->uop_cycles_elapsed = 1u;
+  ce->uop_cycles_remaining = (uint8_t)(lat - 1u);
+  ce->current_stage = cycle_stage_from_uop(op.kind);
+
+  if (ce->uop_cycles_remaining > 0u) {
+    ce->uop_in_flight = true;
+    ce->busy_stall_cycles++;
+    ce->current_cycle_stalled = true;
+    cycle_engine_record_tick(ce, exec_pc, ce->active_uop, 1u, true, false,
+                             false, uop->sequence.is_irq_sequence);
+    return CPU_STATUS_OK;
+  }
+
+  ce->uop_in_flight = false;
+  ce->current_cycle_stalled = false;
+  return finish_uop_on_current_cycle(cpu, prev_instrs);
+}
+
+CPUStatus cpu_cycle_step(DioCPU *cpu) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (cpu->state == CPU_STATE_HALTED) {
+    return CPU_STATUS_HALTED;
+  }
+
+  if (cpu->state == CPU_STATE_FAULTED) {
+    return CPU_STATUS_FAULTED;
+  }
+
+  MicroOpContext *uop = &cpu->uop;
+  DatapathState *dp = &cpu->datapath;
+  CycleEngine *ce = &cpu->cycle;
+  uint64_t prev_instrs = cpu->instructions_executed;
+
+  ce->total_cycles++;
+  ce->active_cycles++;
+  ce->current_instruction_cycles++;
+  ce->current_cycle_stalled = false;
+
+  if (ce->uop_in_flight) {
+    if (uop->sequence.is_irq_sequence) {
+      ce->interrupt_cycles++;
+    }
+    ce->uop_cycles_elapsed++;
+    ce->uop_cycles_remaining--;
+    ce->current_stage = cycle_stage_from_uop(ce->active_uop.kind);
+
+    if (ce->uop_cycles_remaining > 0u) {
+      ce->busy_stall_cycles++;
+      ce->current_cycle_stalled = true;
+      cycle_engine_record_tick(ce, ce->active_pc, ce->active_uop,
+                               ce->uop_cycles_elapsed, true, false, false,
+                               uop->sequence.is_irq_sequence);
+      return CPU_STATUS_OK;
+    }
+
+    ce->uop_in_flight = false;
+    return finish_uop_on_current_cycle(cpu, prev_instrs);
+  }
+
+  if (!uop->active) {
+    uint32_t start_pc = cpu->pc;
+    CPUStatus st = begin_instruction_or_irq(cpu);
+    if (st != CPU_STATUS_OK) {
+      MicroOp fetch_op = {UOP_FETCH_DECODE, 1u};
+      ce->active_uop = fetch_op;
+      ce->active_pc = start_pc;
+      ce->uop_cycles_elapsed = 1u;
+      ce->uop_cycles_remaining = 0u;
+      ce->current_stage = CYCLE_STAGE_FAULT;
+      ce->current_instruction_cycles = 0u;
+      cycle_engine_record_tick(ce, start_pc, fetch_op, 1u, false, false, false,
+                               false);
+      return st;
+    }
+
+    if (!uop->active) {
+      /* Fetch/decode fault trapped via IVT */
+      MicroOp fetch_op = {UOP_FETCH_DECODE, 1u};
+      ce->active_uop = fetch_op;
+      ce->active_pc = start_pc;
+      ce->uop_cycles_elapsed = 1u;
+      ce->uop_cycles_remaining = 0u;
+      ce->current_stage = CYCLE_STAGE_FAULT;
+      ce->last_instruction_cycles = ce->current_instruction_cycles;
+      ce->current_instruction_cycles = 0u;
+      cycle_engine_record_tick(ce, start_pc, fetch_op, 1u, false, false, false,
+                               false);
+      return CPU_STATUS_OK;
+    }
+
+    if (!uop->sequence.is_irq_sequence) {
+      MicroOp fetch_op = uop->sequence.ops[0];
+      ce->active_uop = fetch_op;
+      ce->active_pc = dp->ir_pc;
+      ce->uop_cycles_elapsed = 1u;
+      ce->uop_cycles_remaining = 0u;
+      ce->uop_in_flight = false;
+      ce->current_stage = CYCLE_STAGE_FETCH;
+      cycle_engine_record_tick(ce, dp->ir_pc, fetch_op, 1u, false, true, false,
+                               false);
+      return CPU_STATUS_OK;
+    }
+
+    ce->interrupt_cycles++;
+    return issue_uop_on_current_cycle(cpu, cpu->pc, prev_instrs);
+  }
+
+  if (uop->sequence.is_irq_sequence) {
+    ce->interrupt_cycles++;
+  }
+  uint32_t exec_pc =
+      (!uop->sequence.is_irq_sequence && dp->valid) ? dp->ir_pc : cpu->pc;
+  return issue_uop_on_current_cycle(cpu, exec_pc, prev_instrs);
+}
+
+CPUStatus cpu_run_cycles(DioCPU *cpu, uint64_t max_cycles,
+                         uint64_t *cycles_executed) {
+  if (cpu == NULL || cycles_executed == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  *cycles_executed = 0u;
+
+  if (cpu->state == CPU_STATE_HALTED) {
+    return CPU_STATUS_HALTED;
+  }
+
+  if (cpu->state == CPU_STATE_FAULTED) {
+    return CPU_STATUS_FAULTED;
+  }
+
+  if (cpu->cycle.cycle_breakpoint_enabled &&
+      cpu->cycle.total_cycles == cpu->cycle.cycle_breakpoint) {
+    return CPU_STATUS_BREAKPOINT_REACHED;
+  }
+
+  uint64_t start_cycles = cpu->cycle.total_cycles;
+
+  for (uint64_t i = 0; i < max_cycles; i++) {
+    CPUStatus st = cpu_cycle_step(cpu);
+    if (st != CPU_STATUS_OK) {
+      *cycles_executed = cpu->cycle.total_cycles - start_cycles;
+      return st;
+    }
+    if (cpu->cycle.cycle_breakpoint_enabled &&
+        cpu->cycle.total_cycles == cpu->cycle.cycle_breakpoint) {
+      *cycles_executed = cpu->cycle.total_cycles - start_cycles;
+      return CPU_STATUS_BREAKPOINT_REACHED;
+    }
+  }
+
+  *cycles_executed = cpu->cycle.total_cycles - start_cycles;
+  return CPU_STATUS_STEP_LIMIT_REACHED;
+}
+
+CPUStatus cpu_set_cycle_breakpoint(DioCPU *cpu, uint64_t target_cycle) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  cpu->cycle.cycle_breakpoint_enabled = true;
+  cpu->cycle.cycle_breakpoint = target_cycle;
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_clear_cycle_breakpoint(DioCPU *cpu) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  cpu->cycle.cycle_breakpoint_enabled = false;
+  cpu->cycle.cycle_breakpoint = 0u;
+  return CPU_STATUS_OK;
+}
+
+CPUStatus cpu_microop_step(DioCPU *cpu) {
+  if (cpu == NULL) {
+    return CPU_STATUS_INVALID_ARGUMENT;
+  }
+
+  do {
+    CPUStatus st = cpu_cycle_step(cpu);
+    if (st != CPU_STATUS_OK) {
+      return st;
+    }
+  } while (cpu->cycle.uop_in_flight);
+
+  return CPU_STATUS_OK;
+}
+
 CPUStatus cpu_step(DioCPU *cpu) {
   if (cpu == NULL) {
     return CPU_STATUS_INVALID_ARGUMENT;
@@ -784,6 +1007,8 @@ const char *cpu_status_string(CPUStatus status) {
     return "FAULTED";
   case CPU_STATUS_STEP_LIMIT_REACHED:
     return "Step limit reached";
+  case CPU_STATUS_BREAKPOINT_REACHED:
+    return "Breakpoint reached";
   default:
     return "Unknown status";
   }
